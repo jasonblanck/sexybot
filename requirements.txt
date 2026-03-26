@@ -1,0 +1,15 @@
+# Polymarket Bot — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Web framework
+fastapi>=0.111.0,<1.0.0
+uvicorn[standard]>=0.29.0,<1.0.0
+
+# Data validation (FastAPI depends on this)
+pydantic>=2.7.0,<3.0.0
+
+# Environment variable management
+python-dotenv>=1.0.1,<2.0.0
+
+# Polymarket CLOB client
+py-clob-client>=0.34.0
