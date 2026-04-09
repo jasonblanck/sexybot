@@ -859,6 +859,10 @@ Rules:
                     active_tids.update(_ids)
                 self._sync_positions(active_tids)
 
+                # Fetch balance once per cycle (not per signal)
+                cycle_cash = self.get_balance(force=True)
+                self._log(f"Cash: ${cycle_cash:.2f}")
+
                 for mkt in markets:
                     if not self.running:
                         break
