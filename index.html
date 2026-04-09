@@ -213,8 +213,8 @@ async function fetchBot(){
     document.getElementById('ntrades').textContent=trades.length;
     document.getElementById('deployed').textContent=fmt$(invested);
     if(d.balance!=null){document.getElementById('cash-balance').textContent=fmt$(d.balance);}
-    document.getElementById('port-val').textContent=fmt$(d.balance||0);
-    document.getElementById('port-sub').textContent=good.length+' positions open';
+    if(d.portfolio_value!=null){document.getElementById('port-val').textContent=fmt$(d.portfolio_value);}
+    document.getElementById('port-sub').textContent='cash '+fmt$(d.balance||0)+' + positions '+fmt$(d.positions_value||0);
     const wr=trades.length>0?Math.round(52+Math.random()*10):0;
     document.getElementById('winrate').textContent=wr+'%';
     document.getElementById('wrfill').style.width=wr+'%';
