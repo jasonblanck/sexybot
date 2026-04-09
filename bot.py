@@ -880,7 +880,7 @@ Rules:
 
                     # ── Stage 2: AI deep analysis (if available & confidence ≥ 30) ──
                     token_id = signal.get("token_id", "")
-                    ob_data = self.get_orderbook_depth(token_id) if token_id else {}
+                    ob_data = await asyncio.to_thread(self.get_orderbook_depth, token_id) if token_id else {}
                     predicted_prob = None  # will be set by AI or estimated below
 
                     if ai_enabled and float(signal.get("confidence", 0)) >= 30:
@@ -889,11 +889,11 @@ Rules:
                         is_legislative = any(x in q_lower for x in ["bill","act","legislation","congress","senate","pass","signed","law","vote","amendment"])
                         research = {
                             "orderbook": ob_data,
-                            "crypto":    self.get_crypto_prices(),
-                            "news":      self.get_news_headlines(question[:60]),
-                            "tavily":    self.get_tavily_research(question[:80]) if TAVILY_API_KEY else "",
-                            "court":     self.get_courtlistener_data(question[:60]) if is_legal else "",
-                            "govtrack":  self.get_govtrack_data(question[:60]) if is_legislative else "",
+                            "crypto":    await asyncio.to_thread(self.get_crypto_prices),
+                            "news":      await asyncio.to_thread(self.get_news_headlines, question[:60]),
+                            "tavily":    await asyncio.to_thread(self.get_tavily_research, question[:80]) if TAVILY_API_KEY else "",
+                            "court":     await asyncio.to_thread(self.get_courtlistener_data, question[:60]) if is_legal else "",
+                            "govtrack":  await asyncio.to_thread(self.get_govtrack_data, question[:60]) if is_legislative else "",
                         }
                         ai = await self.analyze_with_claude(mkt, yes_p, research)
                         if ai:
