@@ -678,7 +678,7 @@ class PolymarketBot:
                 ctx_parts.append(f"MARKET SENTIMENT: SPY {fmp.get('spy_change_pct',0):+.2f}%  {fmp.get('up_count',0)}/{fmp.get('total',0)} stocks up")
             ob = research.get("orderbook", {})
             if ob:
-                ctx_parts.append(f"ORDER BOOK: bid={ob.get('best_bid')} ask={ob.get('best_ask')} spread={ob.get('spread')} liquid={ob.get('liquid')}")
+                ctx_parts.append(f"ORDER BOOK: bid={ob.get('best_bid')} ask={ob.get('best_ask')} spread={ob.get('spread')} liquid={ob.get('liquid')} obi={ob.get('obi',0)} (>0=buy pressure <0=sell pressure)")
             crypto = research.get("crypto", {})
             if crypto and any(k in question.lower() for k in ["bitcoin","btc","ethereum","eth","crypto","blockchain","polygon","matic","solana","sol"]):
                 ctx_parts.append(f"CRYPTO: BTC={crypto.get('BTC',{}).get('price')} ({crypto.get('BTC',{}).get('change_24h',0):+.1f}%)  ETH={crypto.get('ETH',{}).get('price')} ({crypto.get('ETH',{}).get('change_24h',0):+.1f}%)")
