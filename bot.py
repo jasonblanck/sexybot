@@ -47,9 +47,14 @@ DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "500"))
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 API_SECRET_KEY    = os.getenv("API_SECRET_KEY", "sexybot2024")
-FRED_API_KEY      = os.getenv("FRED_API_KEY", "")
+FRED_API_KEY       = os.getenv("FRED_API_KEY", "")
 OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY", "")
 FMP_API_KEY        = os.getenv("FMP_API_KEY", "")
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+TAVILY_API_KEY     = os.getenv("TAVILY_API_KEY", "")
+NEWS_API_KEY       = os.getenv("NEWS_API_KEY", "")
+ALCHEMY_API_KEY    = os.getenv("ALCHEMY_API_KEY", "")
+COINGECKO_API_KEY  = os.getenv("COINGECKO_API_KEY", "")
 
 
 class PolymarketBot:
