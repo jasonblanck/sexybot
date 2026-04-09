@@ -1130,6 +1130,7 @@ Rules:
             "trades": self.trades[-50:],
             "signals": self.signals[-50:],
             "log": self.log_lines[-100:],
+            "brier": self.get_brier_stats(),
         }
 
 
