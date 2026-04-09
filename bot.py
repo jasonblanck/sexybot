@@ -728,6 +728,15 @@ Rules:
                 markets = self.get_markets(limit=30)
                 self._log(f"Scanning {len(markets)} markets…")
 
+                # Sync positions: remove resolved/expired markets from DB
+                import json as _j_sync
+                active_tids = set()
+                for _m in markets:
+                    _raw = _m.get("clobTokenIds", "[]")
+                    _ids = _j_sync.loads(_raw) if isinstance(_raw, str) else _raw
+                    active_tids.update(_ids)
+                self._sync_positions(active_tids)
+
                 for mkt in markets:
                     if not self.running:
                         break
