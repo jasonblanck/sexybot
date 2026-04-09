@@ -242,9 +242,19 @@ async function fetchMarkets(){
   }catch(e){}
 }
 async function fetchFred(){
-  const series=[{id:'FEDFUNDS',cls:'o'},{id:'CPIAUCSL',cls:'r'},{id:'UNRATE',cls:'b'},{id:'GDP',cls:'g'}];
-  const el=document.getElementById('fred-data');const items=el.querySelectorAll('.fred-item');
-  for(let i=0;i<series.length;i++){try{const r=await fetch(`https://api.stlouisfed.org/fred/series/observations?series_id=${series[i].id}&api_key=${FRED_KEY}&sort_order=desc&limit=1&file_type=json`);const d=await r.json();const val=d.observations?.[0]?.value;items[i].innerHTML=`<div class="fred-lbl">${series[i].id}</div><div class="fred-val ${series[i].cls}">${val?parseFloat(val).toFixed(2)+'%':'—'}</div><div class="fred-date">${d.observations?.[0]?.date||''}</div>`;}catch(e){}}
+  const cls=['o','r','b','g'];
+  try{
+    const r=await fetch('/api/macro');
+    const data=await r.json();
+    const el=document.getElementById('fred-data');
+    const items=el.querySelectorAll('.fred-item');
+    data.forEach(function(d,i){
+      if(!items[i])return;
+      const val=d.value?parseFloat(d.value):null;
+      const display=val!==null?(d.unit==='B'?'$'+val.toFixed(0)+'B':val.toFixed(2)+(d.unit||'')):'—';
+      items[i].innerHTML='<div class="fred-lbl">'+d.id+'</div><div class="fred-val '+cls[i]+'">'+display+'</div><div class="fred-date">'+(d.date||'')+'</div>';
+    });
+  }catch(e){}
 }
 async function fetchWeather(){
   try{const r=await fetch(`https://api.open-meteo.com/v1/forecast?latitude=40.7128&longitude=-74.0060&current=temperature_2m,weathercode,windspeed_10m,relative_humidity_2m&apikey=${WEATHER_KEY}&temperature_unit=fahrenheit`);const d=await r.json();const c=d.current;const codes={0:'Clear ☀',1:'Mainly clear',2:'Partly cloudy ⛅',3:'Overcast ☁',45:'Foggy',61:'Rain 🌧',71:'Snow ❄',80:'Showers',95:'Thunderstorm ⛈'};document.getElementById('wtemp').textContent=c.temperature_2m+'°F';document.getElementById('wcond').textContent=codes[c.weathercode]||'Code '+c.weathercode;document.getElementById('wwind').textContent=c.windspeed_10m+' mph';document.getElementById('whumid').textContent=c.relative_humidity_2m+'%';}catch(e){}

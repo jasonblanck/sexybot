@@ -551,6 +551,44 @@ def cancel_all():
     return {"ok": True}
 
 
+@app.get("/market-data")
+def market_data():
+    import urllib.request as _ur, json as _j
+    result = {}
+    # VIX, Oil (WTI), 10Y Treasury via Yahoo Finance
+    try:
+        url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=%5EVIX,CL%3DF,%5ETNX"
+        req = _ur.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+        with _ur.urlopen(req, timeout=8) as r:
+            d = _j.loads(r.read())
+        quotes = d.get("quoteResponse", {}).get("result", [])
+        keys = ["vix", "oil", "t10y"]
+        for i, q in enumerate(quotes):
+            if i < len(keys):
+                result[keys[i]] = {
+                    "price": q.get("regularMarketPrice"),
+                    "change": q.get("regularMarketChangePercent"),
+                }
+    except Exception as e:
+        log.warning(f"market-data yahoo error: {e}")
+    # CNN Fear & Greed
+    try:
+        req2 = _ur.Request(
+            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.cnn.com/"}
+        )
+        with _ur.urlopen(req2, timeout=8) as r:
+            d2 = _j.loads(r.read())
+        fg = d2.get("fear_and_greed", {})
+        result["fear_greed"] = {
+            "score": round(fg.get("score", 0)),
+            "rating": fg.get("rating", "").replace("_", " ").title(),
+        }
+    except Exception as e:
+        log.warning(f"market-data fear/greed error: {e}")
+    return JSONResponse(result)
+
+
 @app.get("/macro")
 def macro_data():
     import urllib.request as _ur, json as _j
