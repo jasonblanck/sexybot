@@ -141,18 +141,29 @@ class PolymarketBot:
                 )
             import os
             funder = os.getenv("POLYMARKET_FUNDER", "")
+            # signature_type=2 (builder/proxy wallet) required when using API creds
+            sig_type = 2 if creds else 0
             self.client = ClobClient(
                 host=CLOB_HOST,
                 chain_id=CHAIN_ID,
                 key=PRIVATE_KEY,
                 creds=creds,
                 funder=funder if funder else None,
-                signature_type=2 if funder else 0,
+                signature_type=sig_type,
             )
             if not creds:
                 self._log("Deriving L2 API credentials from wallet…")
                 derived = self.client.create_or_derive_api_creds()
                 self.client.set_api_creds(derived)
+                # Re-init with sig_type=2 now that we have creds
+                self.client = ClobClient(
+                    host=CLOB_HOST,
+                    chain_id=CHAIN_ID,
+                    key=PRIVATE_KEY,
+                    creds=derived,
+                    funder=funder if funder else None,
+                    signature_type=2,
+                )
                 self._log(f"L2 key: {derived.api_key[:8]}…")
             ok = self.client.get_ok()
             self._log(f"Connected to Polymarket CLOB — {ok}")
