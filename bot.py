@@ -839,15 +839,15 @@ Rules:
         self.running = True
         ai_enabled = bool(ANTHROPIC_API_KEY)
         self._log(f"Bot started — strategy={STRATEGY} dry_run={DRY_RUN} interval={interval}s AI={'ON' if ai_enabled else 'OFF'}")
-        # Pre-warm shared caches
-        self.get_macro_context()
-        self.get_fmp_market()
+        # Pre-warm shared caches in thread executor (non-blocking)
+        await asyncio.to_thread(self.get_macro_context)
+        await asyncio.to_thread(self.get_fmp_market)
         if ai_enabled:
-            self.get_crypto_prices()
+            await asyncio.to_thread(self.get_crypto_prices)
 
         while self.running:
             try:
-                markets = self.get_markets(limit=30)
+                markets = await asyncio.to_thread(self.get_markets, 30)
                 self._log(f"Scanning {len(markets)} markets…")
 
                 # Sync positions: remove resolved/expired markets from DB
