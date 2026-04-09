@@ -532,9 +532,15 @@ class PolymarketBot:
             proxy = os.getenv("POLYMARKET_FUNDER", "") or self.get_proxy_wallet()
             if not proxy:
                 return 0.0
+            import json as _j
             url = f"https://data-api.polymarket.com/value?user={proxy}"
-            with _ureq.urlopen(url, timeout=5) as r:
-                import json as _j
+            req = _ureq.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+                "Origin": "https://polymarket.com",
+                "Referer": "https://polymarket.com/",
+            })
+            with _ureq.urlopen(req, timeout=5) as r:
                 data = _j.loads(r.read())
                 if data and isinstance(data, list):
                     return round(float(data[0].get("value", 0)), 2)
