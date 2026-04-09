@@ -329,7 +329,7 @@ async function fetchMarketData(){
   }catch(e){}
 }
 function connectWS(){
-  const ws=new WebSocket('ws://'+location.hostname+'/ws');
+  const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+'/ws');
   ws.onmessage=function(e){
     try{applyState(JSON.parse(e.data));}catch(err){}
   };
@@ -352,9 +352,9 @@ function applyState(d){
   const sigs=d.signals||[];
   document.getElementById('sig-count').textContent=sigs.length;
   if(sigs.length>0){document.getElementById('sig-feed').innerHTML=sigs.slice(-25).reverse().map(function(s){const isY=s.signal&&s.signal.includes('YES');return'<div class="feed-item"><span class="badge '+(isY?'badge-y':'badge-n')+'">'+(isY?'YES':'NO')+'</span><span class="feed-mkt">'+(s.market||'').slice(0,56)+'</span><span class="feed-conf">'+(s.confidence||0)+'%</span></div>';}).join('');}
-  if(trades.length>0){document.getElementById('tlog').innerHTML=trades.slice(-25).reverse().map(function(t){const isY=t.side==='YES'||t.side==='BUY';return'<div class="tlog-item"><span class="tlog-mkt">'+(t.market||'').slice(0,36)+'...</span><span class="badge '+(isY?'badge-y':'badge-n')+'">'+(t.side||'BUY')+'</span><span class="tlog-amt">'+fmt+'</span></div>';}).join('');}
+  if(trades.length>0){document.getElementById('tlog').innerHTML=trades.slice(-25).reverse().map(function(t){const isY=t.side==='YES'||t.side==='BUY';return'<div class="tlog-item"><span class="tlog-mkt">'+(t.market||'').slice(0,36)+'...</span><span class="badge '+(isY?'badge-y':'badge-n')+'">'+(t.side||'BUY')+'</span><span class="tlog-amt">'+fmt$(t.amount_usdc||t.amount||0)+'</span></div>';}).join('');}
   const logs=d.log||[];
-  if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(function(line){let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return'<div class=+c+>'+line+'</div>';}).join('');}
+  if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(function(line){let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return'<div class="'+c+'">'+line+'</div>';}).join('');}
   updateChart(trades);
 }
 connectWS();fetchBot();fetchIndices();fetchMarketData();

@@ -291,10 +291,14 @@ class PolymarketBot:
         except:
             rate = 4.5
         try:
-            url2 = f"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key={FRED_API_KEY}&sort_order=desc&limit=1&file_type=json"
+            # Fetch 13 months to compute YoY % change
+            url2 = f"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key={FRED_API_KEY}&sort_order=desc&limit=13&file_type=json"
             with urllib.request.urlopen(url2, timeout=5) as r:
                 d2 = _j.loads(r.read())
-                cpi = float(d2["observations"][0]["value"])
+                obs = d2["observations"]
+                cpi_now = float(obs[0]["value"])
+                cpi_yr  = float(obs[12]["value"])
+                cpi = round((cpi_now - cpi_yr) / cpi_yr * 100, 2)  # YoY %
         except:
             cpi = 3.0
         self._macro_cache = {"fed_rate": rate, "cpi": cpi}
