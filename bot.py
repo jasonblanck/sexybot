@@ -526,6 +526,13 @@ class PolymarketBot:
             log.debug(f"get_balance error: {e}")
             return 0.0
 
+    _PM_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Origin": "https://polymarket.com",
+        "Referer": "https://polymarket.com/",
+    }
+
     def get_positions_value(self) -> float:
         """Fetch open positions value from Polymarket data API."""
         try:
@@ -534,12 +541,7 @@ class PolymarketBot:
                 return 0.0
             import json as _j
             url = f"https://data-api.polymarket.com/value?user={proxy}"
-            req = _ureq.Request(url, headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "application/json",
-                "Origin": "https://polymarket.com",
-                "Referer": "https://polymarket.com/",
-            })
+            req = _ureq.Request(url, headers=self._PM_HEADERS)
             with _ureq.urlopen(req, timeout=5) as r:
                 data = _j.loads(r.read())
                 if data and isinstance(data, list):
@@ -547,6 +549,41 @@ class PolymarketBot:
         except Exception as e:
             log.debug(f"get_positions_value error: {e}")
         return 0.0
+
+    def get_pnl_data(self) -> dict:
+        """Fetch positions with P&L breakdown from Polymarket data API."""
+        try:
+            proxy = os.getenv("POLYMARKET_FUNDER", "") or self.get_proxy_wallet()
+            if not proxy:
+                return {}
+            import json as _j
+            url = f"https://data-api.polymarket.com/positions?user={proxy}"
+            req = _ureq.Request(url, headers=self._PM_HEADERS)
+            with _ureq.urlopen(req, timeout=8) as r:
+                positions = _j.loads(r.read())
+            total_pnl = round(sum(float(p.get("cashPnl", 0)) for p in positions), 2)
+            total_invested = round(sum(float(p.get("initialValue", 0)) for p in positions), 2)
+            pct = round(total_pnl / total_invested * 100, 2) if total_invested else 0
+            return {
+                "total_pnl": total_pnl,
+                "pct_pnl": pct,
+                "positions": [
+                    {
+                        "title": p.get("title", "")[:50],
+                        "outcome": p.get("outcome", ""),
+                        "size": round(float(p.get("size", 0)), 4),
+                        "avg_price": round(float(p.get("avgPrice", 0)), 4),
+                        "cur_price": round(float(p.get("curPrice", 0)), 4),
+                        "current_value": round(float(p.get("currentValue", 0)), 2),
+                        "cash_pnl": round(float(p.get("cashPnl", 0)), 2),
+                        "pct_pnl": round(float(p.get("percentPnl", 0)), 2),
+                    }
+                    for p in positions
+                ],
+            }
+        except Exception as e:
+            log.debug(f"get_pnl_data error: {e}")
+        return {}
 
     def get_state(self) -> dict:
         cash = self.get_balance()
