@@ -36,7 +36,12 @@ log = logging.getLogger("polybot")
 
 CLOB_HOST      = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 CHAIN_ID       = int(os.getenv("CHAIN_ID", "137"))
-PRIVATE_KEY    = os.getenv("PRIVATE_KEY", "")
+_pk_raw = os.getenv("PRIVATE_KEY", "")
+if _pk_raw:
+    _pk_hex = _pk_raw[2:] if _pk_raw.startswith("0x") else _pk_raw
+    PRIVATE_KEY = "0x" + _pk_hex.zfill(64)
+else:
+    PRIVATE_KEY = ""
 API_KEY        = os.getenv("POLYMARKET_API_KEY", "")
 API_SECRET     = os.getenv("POLYMARKET_API_SECRET", "")
 API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "")
