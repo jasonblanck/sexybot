@@ -620,6 +620,21 @@ def status():
     return JSONResponse(bot.get_state())
 
 
+@app.get("/portfolio")
+def portfolio():
+    cash = bot.get_balance()
+    positions = bot.get_positions_value()
+    pnl = bot.get_pnl_data()
+    return JSONResponse({
+        "cash": cash,
+        "positions_value": positions,
+        "portfolio_value": round(cash + positions, 2),
+        "total_pnl": pnl.get("total_pnl", 0),
+        "pct_pnl": pnl.get("pct_pnl", 0),
+        "positions": pnl.get("positions", []),
+    })
+
+
 @app.post("/start")
 async def start_bot(interval: float = 30.0):
     global _bot_task
