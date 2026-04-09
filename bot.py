@@ -875,23 +875,31 @@ Rules:
                     yes_p = float(prices[0]) if prices else 0.5
 
                     # ── Stage 2: AI deep analysis (if available & confidence ≥ 30) ──
+                    token_id = signal.get("token_id", "")
+                    ob_data = self.get_orderbook_depth(token_id) if token_id else {}
+                    predicted_prob = None  # will be set by AI or estimated below
+
                     if ai_enabled and float(signal.get("confidence", 0)) >= 30:
-                        token_id = signal.get("token_id", "")
+                        q_lower = question.lower()
+                        is_legal = any(x in q_lower for x in ["indicted","trial","court","lawsuit","ruling","judge","convicted","charged","plea","verdict","sentenced"])
+                        is_legislative = any(x in q_lower for x in ["bill","act","legislation","congress","senate","pass","signed","law","vote","amendment"])
                         research = {
-                            "orderbook": self.get_orderbook_depth(token_id) if token_id else {},
+                            "orderbook": ob_data,
                             "crypto":    self.get_crypto_prices(),
                             "news":      self.get_news_headlines(question[:60]),
                             "tavily":    self.get_tavily_research(question[:80]) if TAVILY_API_KEY else "",
+                            "court":     self.get_courtlistener_data(question[:60]) if is_legal else "",
+                            "govtrack":  self.get_govtrack_data(question[:60]) if is_legislative else "",
                         }
                         ai = await self.analyze_with_claude(mkt, yes_p, research)
                         if ai:
                             if ai.get("action") == "SKIP":
                                 self._log(f"AI SKIP: {question[:50]} — {ai.get('reasoning','')}")
                                 continue
-                            # Merge AI confidence and reasoning into signal
                             signal["confidence"] = ai.get("confidence", signal["confidence"])
                             signal["ai_reasoning"] = ai.get("reasoning", "")
                             signal["ai_risk"] = ai.get("risk", "medium")
+                            predicted_prob = ai.get("probability")  # explicit probability for Kelly
                             # AI can flip the side if it disagrees
                             if ai.get("side") == "YES" and "NO" in signal.get("signal",""):
                                 raw_ids = mkt.get("clobTokenIds", "[]")
@@ -903,7 +911,14 @@ Rules:
                                 ids = _j.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
                                 signal["token_id"] = ids[1] if len(ids) > 1 else token_id
                                 signal["signal"] = "BUY NO"
-                            self._log(f"AI [{ai.get('risk','?').upper()}] conf={ai.get('confidence')}% — {ai.get('reasoning','')[:70]}")
+                            self._log(f"AI [{ai.get('risk','?').upper()}] prob={predicted_prob}% conf={ai.get('confidence')}% — {ai.get('reasoning','')[:70]}")
+
+                    # ── OBI check: skip if order book strongly opposes our direction ──
+                    obi = ob_data.get("obi", 0)
+                    buying_yes = "YES" in signal.get("signal", "")
+                    if (buying_yes and obi < -0.4) or (not buying_yes and obi > 0.4):
+                        self._log(f"OBI SKIP: book pressure opposes trade (obi={obi:.2f}) {question[:40]}")
+                        continue
 
                     self.signals.append({**signal, "time": datetime.utcnow().isoformat()})
                     self._log(f"SIGNAL [{signal['strategy']}] {signal['signal']} | conf={signal.get('confidence','?')}% | {signal['market'][:50]}")
@@ -920,13 +935,41 @@ Rules:
                         self._log(f"SKIP: already have position in {signal['market'][:40]}")
                         continue
 
+                    # ── Kelly Criterion sizing ────────────────────────────────
+                    cash = self.get_balance()
+                    if cash < 1.0:
+                        self._log(f"SKIP: insufficient cash (${cash:.2f})")
+                        continue
+
+                    # Determine entry price for Kelly (price of the side we're buying)
+                    entry_price = yes_p if "YES" in signal.get("signal","") else (1 - yes_p)
+                    # Use AI probability if available, else estimate from confidence
+                    if predicted_prob is not None:
+                        p_true = predicted_prob / 100.0
+                    else:
+                        # Conservative estimate: blend market price with confidence signal
+                        conf_boost = float(signal.get("confidence", 50)) / 100.0 * 0.10
+                        p_true = min(entry_price + conf_boost, 0.99)
+
+                    kelly_f_full = p_true - ((1 - p_true) / ((1 - entry_price) / entry_price)) if entry_price < 1 else 0
+                    amt = self.kelly_size(p_true, entry_price, cash)
+                    if amt < 0.50:
+                        self._log(f"KELLY SKIP: no meaningful edge (p={p_true:.3f} price={entry_price:.3f} kelly_f={kelly_f_full:.3f})")
+                        continue
+
+                    # Log prediction for Brier score calibration
+                    self.log_brier(
+                        market=question, token_id=signal.get("token_id",""),
+                        side="YES" if "YES" in signal.get("signal","") else "NO",
+                        predicted_prob=p_true, market_price=entry_price,
+                        kelly_f=kelly_f_full, kelly_size=amt,
+                        reasoning=signal.get("ai_reasoning","")
+                    )
+                    self._log(f"KELLY: p={p_true:.3f} price={entry_price:.3f} f={kelly_f_full:.3f} → ${amt:.2f}")
+
                     # ── Execute ───────────────────────────────────────────────
                     min_conf = 55 if ai_enabled else 40
                     if float(signal.get("confidence", 0)) >= min_conf and signal.get("token_id"):
-                        # Reduce size for high-risk AI signals
-                        amt = signal["amount"]
-                        if signal.get("ai_risk") == "high":
-                            amt *= 0.5
                         if signal["strategy"] == "arbitrage" and "BUY" in signal["signal"]:
                             self.place_market_order(signal["token_id"], "BUY", amt / 2)
                             if signal.get("no_token_id"):
