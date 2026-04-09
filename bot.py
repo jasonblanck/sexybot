@@ -44,9 +44,11 @@ STRATEGY       = os.getenv("STRATEGY", "momentum")
 MAX_ORDER_SIZE = float(os.getenv("MAX_ORDER_SIZE", "10"))
 DRY_RUN        = os.getenv("DRY_RUN", "true").lower() != "false"
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "500"))
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-API_SECRET_KEY   = os.getenv("API_SECRET_KEY", "sexybot2024")
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
+API_SECRET_KEY    = os.getenv("API_SECRET_KEY", "sexybot2024")
+FRED_API_KEY      = os.getenv("FRED_API_KEY", "")
+OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY", "")
 
 
 class PolymarketBot:
@@ -282,14 +284,14 @@ class PolymarketBot:
         if time.time() - self._macro_cache_time < 3600 and self._macro_cache:
             return self._macro_cache
         try:
-            url = f"https://api.stlouisfed.org/fred/series/observations?series_id=FEDFUNDS&api_key=162f64538bb3db1ba4499a5e45e8580f&sort_order=desc&limit=1&file_type=json"
+            url = f"https://api.stlouisfed.org/fred/series/observations?series_id=FEDFUNDS&api_key={FRED_API_KEY}&sort_order=desc&limit=1&file_type=json"
             with _ureq.urlopen(url, timeout=5) as r:
                 d = _j.loads(r.read())
                 rate = float(d["observations"][0]["value"])
         except:
             rate = 4.5
         try:
-            url2 = f"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key=162f64538bb3db1ba4499a5e45e8580f&sort_order=desc&limit=1&file_type=json"
+            url2 = f"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key={FRED_API_KEY}&sort_order=desc&limit=1&file_type=json"
             with urllib.request.urlopen(url2, timeout=5) as r:
                 d2 = _j.loads(r.read())
                 cpi = float(d2["observations"][0]["value"])
@@ -304,7 +306,7 @@ class PolymarketBot:
         if time.time() - self._weather_cache_time < 3600 and self._weather_cache:
             return self._weather_cache
         try:
-            url = "https://api.open-meteo.com/v1/forecast?latitude=40.7128&longitude=-74.0060&current=weathercode,windspeed_10m&apikey=9VYbq9ve3p9X6tke"
+            url = f"https://api.open-meteo.com/v1/forecast?latitude=40.7128&longitude=-74.0060&current=weathercode,windspeed_10m{f'&apikey={OPEN_METEO_API_KEY}' if OPEN_METEO_API_KEY else ''}"
             with _ureq.urlopen(url, timeout=5) as r:
                 d = _j.loads(r.read())
                 code = d["current"]["weathercode"]
