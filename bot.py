@@ -425,12 +425,15 @@ class PolymarketBot:
             if dev > 0.08:
                 macro = self.get_macro_context()
                 weather = self.get_weather_context()
+                fmp = self.get_fmp_market()
+                sentiment = fmp.get("_sentiment", {})
                 confidence = round(dev * 200, 1)
                 amount = min(MAX_ORDER_SIZE, MAX_ORDER_SIZE * dev * 2)
                 q_lower = question.lower()
                 is_sports = any(x in q_lower for x in ["win","game","match","league","cup","fc","nba","nfl","mlb","nhl"])
                 is_political = any(x in q_lower for x in ["president","election","senate","congress","party","nominee"])
-                is_economic = any(x in q_lower for x in ["fed","rate","inflation","gdp","economy","recession","cpi"])
+                is_economic = any(x in q_lower for x in ["fed","rate","inflation","gdp","economy","recession","cpi","stock","market"])
+                is_tech = any(x in q_lower for x in ["tech","ai","apple","microsoft","nvidia","tesla","amazon","meta","google"])
                 if weather["bad_weather"] and is_sports:
                     confidence *= 0.75
                     self._log(f"WEATHER ADJ: reducing sports confidence (bad weather)")
@@ -440,6 +443,14 @@ class PolymarketBot:
                 if macro["cpi"] > 4.0 and is_political:
                     amount *= 0.8
                     self._log(f"MACRO ADJ: reducing political exposure (high CPI={macro['cpi']})")
+                # FMP market sentiment adjustments
+                if sentiment.get("bullish") and (is_economic or is_tech):
+                    confidence *= 1.10
+                    self._log(f"FMP ADJ: market bullish ({sentiment.get('spy_change_pct',0):+.2f}%), boosting confidence")
+                elif sentiment.get("bearish") and (is_economic or is_tech):
+                    confidence *= 0.85
+                    amount *= 0.8
+                    self._log(f"FMP ADJ: market bearish ({sentiment.get('spy_change_pct',0):+.2f}%), reducing exposure")
                 side_label = "YES" if yes_p > 0.5 else "NO"
                 tid = yes_id if yes_p > 0.5 else no_id
                 return {"strategy": "momentum", "signal": f"BUY {side_label}",
