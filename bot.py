@@ -690,6 +690,12 @@ class PolymarketBot:
             tavily = research.get("tavily", "")
             if tavily:
                 ctx_parts.append(f"WEB RESEARCH: {tavily[:500]}")
+            court = research.get("court", "")
+            if court:
+                ctx_parts.append(f"COURT DOCKETS: {court}")
+            govtrack = research.get("govtrack", "")
+            if govtrack:
+                ctx_parts.append(f"LEGISLATION: {govtrack}")
 
             context = "\n".join(ctx_parts)
 
