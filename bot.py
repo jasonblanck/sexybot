@@ -940,7 +940,7 @@ Rules:
                         continue
 
                     # ── Kelly Criterion sizing ────────────────────────────────
-                    cash = self.get_balance()
+                    cash = cycle_cash
                     if cash < 1.0:
                         self._log(f"SKIP: insufficient cash (${cash:.2f})")
                         continue
