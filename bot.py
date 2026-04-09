@@ -1155,18 +1155,27 @@ def macro_data():
     key = FRED_API_KEY
     series = [
         ("FEDFUNDS", "Fed Funds Rate", "%"),
-        ("CPIAUCSL", "CPI", ""),
-        ("UNRATE",   "Unemployment", "%"),
-        ("GDP",      "GDP", "B"),
+        ("CPIAUCSL", "CPI YoY",        "%"),
+        ("UNRATE",   "Unemployment",   "%"),
+        ("GDP",      "GDP",            "B"),
     ]
     result = []
     for sid, label, unit in series:
         try:
-            url = f"https://api.stlouisfed.org/fred/series/observations?series_id={sid}&api_key={key}&sort_order=desc&limit=1&file_type=json"
+            limit = 13 if sid == "CPIAUCSL" else 1
+            url = f"https://api.stlouisfed.org/fred/series/observations?series_id={sid}&api_key={key}&sort_order=desc&limit={limit}&file_type=json"
             with _ur.urlopen(url, timeout=8) as r:
                 d = _j.loads(r.read())
-            obs = d["observations"][0]
-            result.append({"id": sid, "label": label, "value": obs["value"], "date": obs["date"], "unit": unit})
+            obs = d["observations"]
+            if sid == "CPIAUCSL" and len(obs) >= 13:
+                cpi_now = float(obs[0]["value"])
+                cpi_yr  = float(obs[12]["value"])
+                value = str(round((cpi_now - cpi_yr) / cpi_yr * 100, 2))
+                date  = obs[0]["date"]
+            else:
+                value = obs[0]["value"]
+                date  = obs[0]["date"]
+            result.append({"id": sid, "label": label, "value": value, "date": date, "unit": unit})
         except Exception as e:
             result.append({"id": sid, "label": label, "value": None, "date": None, "unit": unit})
     return JSONResponse(result)
