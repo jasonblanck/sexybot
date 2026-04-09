@@ -338,7 +338,7 @@ class PolymarketBot:
 
         if STRATEGY == "momentum":
             dev = abs(yes_p - 0.5)
-            if dev > 0.05:
+            if dev > 0.15:
                 macro = self.get_macro_context()
                 weather = self.get_weather_context()
                 confidence = round(dev * 200, 1)
