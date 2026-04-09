@@ -304,8 +304,40 @@ async function fetchFred(){
     });
   }catch(e){}
 }
+const WX_CODES={0:'Clear',1:'Mainly clear',2:'Partly cloudy',3:'Overcast',45:'Foggy',48:'Icy fog',51:'Light drizzle',53:'Drizzle',55:'Heavy drizzle',61:'Light rain',63:'Rain',65:'Heavy rain',71:'Light snow',73:'Snow',75:'Heavy snow',80:'Showers',81:'Heavy showers',82:'Violent showers',85:'Snow showers',95:'Thunderstorm',96:'Thunderstorm+hail',99:'Heavy thunderstorm'};
+const WX_ICON={0:'☀',1:'🌤',2:'⛅',3:'☁',45:'🌫',48:'🌫',51:'🌦',53:'🌦',55:'🌧',61:'🌦',63:'🌧',65:'🌧',71:'🌨',73:'❄',75:'❄',80:'🌦',81:'🌧',82:'⛈',95:'⛈',96:'⛈',99:'⛈'};
 async function fetchWeather(){
-  try{const r=await fetch(`https://api.open-meteo.com/v1/forecast?latitude=40.7128&longitude=-74.0060&current=temperature_2m,weathercode,windspeed_10m,relative_humidity_2m&apikey=${WEATHER_KEY}&temperature_unit=fahrenheit`);const d=await r.json();const c=d.current;const codes={0:'Clear ☀',1:'Mainly clear',2:'Partly cloudy ⛅',3:'Overcast ☁',45:'Foggy',61:'Rain 🌧',71:'Snow ❄',80:'Showers',95:'Thunderstorm ⛈'};document.getElementById('wtemp').textContent=c.temperature_2m+'°F';document.getElementById('wcond').textContent=codes[c.weathercode]||'Code '+c.weathercode;document.getElementById('wwind').textContent=c.windspeed_10m+' mph';document.getElementById('whumid').textContent=c.relative_humidity_2m+'%';}catch(e){}
+  try{
+    const r=await fetch(`${BOT}/weather`);
+    const d=await r.json();
+    if(d.error)return;
+    const c=d.current;
+    const code=c.weathercode;
+    document.getElementById('wtemp').textContent=c.temperature_2m+'°F';
+    document.getElementById('wfeels').textContent=c.apparent_temperature+'°F';
+    document.getElementById('wcond').textContent=(WX_ICON[code]||'')+(WX_CODES[code]||'Code '+code);
+    document.getElementById('wwind').textContent=c.windspeed_10m+' mph';
+    document.getElementById('whumid').textContent=c.relative_humidity_2m+'%';
+    document.getElementById('wprec').textContent=c.precipitation+'mm';
+    const uv=c.uv_index||0;const uvcls=uv>=8?'r':uv>=6?'o':uv>=3?'y':'g';
+    document.getElementById('wuv').innerHTML=`<span class="${uvcls}">${uv} ${uv>=8?'Very High':uv>=6?'High':uv>=3?'Moderate':'Low'}</span>`;
+    // 3-day forecast
+    const daily=d.daily||{};
+    if(daily.time&&daily.time.length>=3){
+      const days=['Today','Tomorrow','Day 3'];
+      document.getElementById('wforecast').innerHTML=daily.time.slice(0,3).map((t,i)=>{
+        const dc=daily.weathercode?.[i]||0;
+        const hi=Math.round(daily.temperature_2m_max?.[i]||0);
+        const lo=Math.round(daily.temperature_2m_min?.[i]||0);
+        return`<div style="flex:1;text-align:center;background:#1a1a1a;border-radius:4px;padding:5px 3px">
+          <div style="font-size:9px;color:var(--text2);margin-bottom:2px">${days[i]}</div>
+          <div style="font-size:14px">${WX_ICON[dc]||'🌡'}</div>
+          <div style="font-family:var(--mono);font-size:9px">${hi}°</div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--text2)">${lo}°</div>
+        </div>`;
+      }).join('');
+    }
+  }catch(e){console.error('fetchWeather',e);}
 }
 async function fetchCrypto(){
   try{const r=await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,matic-network,polygon-ecosystem-token&vs_currencies=usd&include_24hr_change=true');const d=await r.json();
