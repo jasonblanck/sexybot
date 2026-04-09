@@ -1104,8 +1104,13 @@ Rules:
             log.debug(f"get_positions_value error: {e}")
         return self._positions_cache
 
-    def get_pnl_data(self) -> dict:
-        """Fetch positions with P&L breakdown from Polymarket data API."""
+    _pnl_cache: dict = {}
+    _pnl_cache_time: float = 0.0
+
+    def get_pnl_data(self, force: bool = False) -> dict:
+        """Fetch positions with P&L breakdown from Polymarket data API. Cached 60s."""
+        if not force and time.time() - self._pnl_cache_time < 60 and self._pnl_cache:
+            return self._pnl_cache
         try:
             proxy = os.getenv("POLYMARKET_FUNDER", "") or self.get_proxy_wallet()
             if not proxy:
