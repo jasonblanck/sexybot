@@ -209,7 +209,7 @@ const WEATHER_KEY='9VYbq9ve3p9X6tke';
 let pnlChart=null,allTrades=[],activeFilter='1D';
 setInterval(()=>{document.getElementById('clock').textContent=new Date().toLocaleTimeString('en-US',{hour12:false});},1000);
 function fmt$(n){return '$'+Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
-function setFilter(f,btn){activeFilter=f;document.querySelectorAll('.cf').forEach(b=>b.classList.remove('on'));btn.classList.add('on');renderChart();}
+function setFilter(f,btn){activeFilter=f;[btn.closest('div').querySelectorAll('.cf')].forEach(grp=>grp.forEach(b=>b.classList.remove('on')));btn.classList.add('on');renderChart();}
 function filterTrades(trades){if(activeFilter==='ALL')return trades;const now=Date.now();const w={'1D':86400000,'1W':604800000,'1M':2592000000};return trades.filter(t=>(now-new Date(t.time||0).getTime())<=(w[activeFilter]||86400000));}
 function initChart(){
   const ctx=document.getElementById('pnl-chart').getContext('2d');
