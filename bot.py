@@ -836,6 +836,11 @@ def weather_data():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.get("/fmp")
+def fmp_data():
+    return JSONResponse(bot.get_fmp_market())
+
+
 @app.get("/macro")
 def macro_data():
     import urllib.request as _ur, json as _j
