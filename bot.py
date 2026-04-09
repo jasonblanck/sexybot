@@ -551,45 +551,43 @@ def cancel_all():
     return {"ok": True}
 
 
+_market_cache: dict = {}
+_market_cache_ts: float = 0
+
 @app.get("/market-data")
 def market_data():
+    global _market_cache, _market_cache_ts
+    if time.time() - _market_cache_ts < 300 and _market_cache:
+        return JSONResponse(_market_cache)
     import urllib.request as _ur, json as _j
-    _headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-    }
     result = {}
-    # VIX via Yahoo Finance v8
-    for sym, key in [("%5EVIX", "vix"), ("CL%3DF", "oil")]:
+    # VIX, Oil (WTI), 10Y via FRED
+    fred_series = [
+        ("VIXCLS",     "vix",  "price"),
+        ("DCOILWTICO", "oil",  "price"),
+        ("DGS10",      "t10y", "price"),
+    ]
+    for sid, key, _ in fred_series:
         try:
-            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=1d"
-            req = _ur.Request(url, headers=_headers)
-            with _ur.urlopen(req, timeout=8) as r:
+            url = f"https://api.stlouisfed.org/fred/series/observations?series_id={sid}&api_key={FRED_API_KEY}&sort_order=desc&limit=2&file_type=json"
+            with _ur.urlopen(url, timeout=8) as r:
                 d = _j.loads(r.read())
-            meta = d["chart"]["result"][0]["meta"]
-            price = meta.get("regularMarketPrice")
-            prev  = meta.get("chartPreviousClose") or meta.get("previousClose")
-            change = round((price - prev) / prev * 100, 2) if price and prev else None
-            result[key] = {"price": price, "change": change}
+            obs = [o for o in d["observations"] if o["value"] != "."]
+            curr = float(obs[0]["value"])
+            prev = float(obs[1]["value"]) if len(obs) > 1 else curr
+            change = round(curr - prev, 3) if key == "t10y" else round((curr - prev) / prev * 100, 2)
+            result[key] = {"price": curr, "change": change, "date": obs[0]["date"]}
         except Exception as e:
             log.warning(f"market-data {key} error: {e}")
-    # 10Y Treasury via FRED
-    try:
-        url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key={FRED_API_KEY}&sort_order=desc&limit=2&file_type=json"
-        with _ur.urlopen(url, timeout=8) as r:
-            d = _j.loads(r.read())
-        obs = d["observations"]
-        curr = float(obs[0]["value"])
-        prev = float(obs[1]["value"])
-        result["t10y"] = {"price": curr, "change": round(curr - prev, 3)}
-    except Exception as e:
-        log.warning(f"market-data t10y error: {e}")
     # CNN Fear & Greed
     try:
-        req = _ur.Request(
-            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
-            headers={**_headers, "Origin": "https://www.cnn.com", "Referer": "https://www.cnn.com/markets/fear-and-greed"},
-        )
+        _h = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Origin": "https://www.cnn.com",
+            "Referer": "https://www.cnn.com/markets/fear-and-greed",
+        }
+        req = _ur.Request("https://production.dataviz.cnn.io/index/fearandgreed/graphdata", headers=_h)
         with _ur.urlopen(req, timeout=8) as r:
             d = _j.loads(r.read())
         fg = d.get("fear_and_greed", {})
@@ -599,6 +597,8 @@ def market_data():
         }
     except Exception as e:
         log.warning(f"market-data fear/greed error: {e}")
+    _market_cache = result
+    _market_cache_ts = time.time()
     return JSONResponse(result)
 
 
