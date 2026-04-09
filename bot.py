@@ -698,49 +698,110 @@ Rules:
 
     async def run_loop(self, interval: float = 30.0):
         self.running = True
-        self._log(f"Bot started — strategy={STRATEGY} dry_run={DRY_RUN} interval={interval}s")
+        ai_enabled = bool(ANTHROPIC_API_KEY)
+        self._log(f"Bot started — strategy={STRATEGY} dry_run={DRY_RUN} interval={interval}s AI={'ON' if ai_enabled else 'OFF'}")
+        # Pre-warm shared caches
+        self.get_macro_context()
+        self.get_fmp_market()
+        if ai_enabled:
+            self.get_crypto_prices()
+
         while self.running:
             try:
                 markets = self.get_markets(limit=30)
                 self._log(f"Scanning {len(markets)} markets…")
+
                 for mkt in markets:
                     if not self.running:
                         break
+
+                    # ── Stage 1: fast rule-based filter ──────────────────────
                     signal = self.analyze(mkt)
                     if not signal:
                         continue
+
+                    question = mkt.get("question", "")
+                    import json as _j
+                    raw_prices = mkt.get("outcomePrices", "[0.5,0.5]")
+                    prices = _j.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+                    yes_p = float(prices[0]) if prices else 0.5
+
+                    # ── Stage 2: AI deep analysis (if available & confidence ≥ 30) ──
+                    if ai_enabled and float(signal.get("confidence", 0)) >= 30:
+                        token_id = signal.get("token_id", "")
+                        research = {
+                            "orderbook": self.get_orderbook_depth(token_id) if token_id else {},
+                            "crypto":    self.get_crypto_prices(),
+                            "news":      self.get_news_headlines(question[:60]),
+                            "tavily":    self.get_tavily_research(question[:80]) if TAVILY_API_KEY else "",
+                        }
+                        ai = await self.analyze_with_claude(mkt, yes_p, research)
+                        if ai:
+                            if ai.get("action") == "SKIP":
+                                self._log(f"AI SKIP: {question[:50]} — {ai.get('reasoning','')}")
+                                continue
+                            # Merge AI confidence and reasoning into signal
+                            signal["confidence"] = ai.get("confidence", signal["confidence"])
+                            signal["ai_reasoning"] = ai.get("reasoning", "")
+                            signal["ai_risk"] = ai.get("risk", "medium")
+                            # AI can flip the side if it disagrees
+                            if ai.get("side") == "YES" and "NO" in signal.get("signal",""):
+                                raw_ids = mkt.get("clobTokenIds", "[]")
+                                ids = _j.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+                                signal["token_id"] = ids[0] if ids else token_id
+                                signal["signal"] = "BUY YES"
+                            elif ai.get("side") == "NO" and "YES" in signal.get("signal",""):
+                                raw_ids = mkt.get("clobTokenIds", "[]")
+                                ids = _j.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+                                signal["token_id"] = ids[1] if len(ids) > 1 else token_id
+                                signal["signal"] = "BUY NO"
+                            self._log(f"AI [{ai.get('risk','?').upper()}] conf={ai.get('confidence')}% — {ai.get('reasoning','')[:70]}")
+
                     self.signals.append({**signal, "time": datetime.utcnow().isoformat()})
                     self._log(f"SIGNAL [{signal['strategy']}] {signal['signal']} | conf={signal.get('confidence','?')}% | {signal['market'][:50]}")
+
+                    # ── Daily loss guard ──────────────────────────────────────
                     daily_loss = self.get_daily_loss()
                     if daily_loss >= DAILY_LOSS_LIMIT:
                         self._log(f"DAILY LOSS LIMIT HIT: ${daily_loss:.2f} — stopping trading", "error")
                         self.send_telegram(f"⚠️ Daily loss limit hit: ${daily_loss:.2f}. Bot stopped trading.")
                         self.running = False
                         break
+
                     if signal.get("token_id") and self.has_position(signal["token_id"]):
                         self._log(f"SKIP: already have position in {signal['market'][:40]}")
                         continue
-                    if float(signal.get("confidence", 0)) >= 40 and signal.get("token_id"):
+
+                    # ── Execute ───────────────────────────────────────────────
+                    min_conf = 55 if ai_enabled else 40
+                    if float(signal.get("confidence", 0)) >= min_conf and signal.get("token_id"):
+                        # Reduce size for high-risk AI signals
+                        amt = signal["amount"]
+                        if signal.get("ai_risk") == "high":
+                            amt *= 0.5
                         if signal["strategy"] == "arbitrage" and "BUY" in signal["signal"]:
-                            self.place_market_order(signal["token_id"], "BUY", signal["amount"] / 2)
+                            self.place_market_order(signal["token_id"], "BUY", amt / 2)
                             if signal.get("no_token_id"):
-                                self.place_market_order(signal["no_token_id"], "BUY", signal["amount"] / 2)
+                                self.place_market_order(signal["no_token_id"], "BUY", amt / 2)
                         elif signal["strategy"] == "marketMaking":
                             if signal.get("bid"):
-                                self.place_limit_order(signal["token_id"], "BUY", signal["bid"], signal["amount"])
+                                self.place_limit_order(signal["token_id"], "BUY", signal["bid"], amt)
                             if signal.get("ask"):
-                                self.place_limit_order(signal["token_id"], "SELL", signal["ask"], signal["amount"])
+                                self.place_limit_order(signal["token_id"], "SELL", signal["ask"], amt)
                         elif "BUY" in signal.get("signal", ""):
-                            self.place_market_order(signal["token_id"], "BUY", signal["amount"])
+                            self.place_market_order(signal["token_id"], "BUY", amt)
+
                     try:
                         await bot._broadcast_state()
                     except Exception:
                         pass
                     await asyncio.sleep(0.5)
+
             except Exception as e:
                 self._log(f"Loop error: {e}", "error")
                 import traceback
                 self._log(traceback.format_exc(), "error")
+
             self._log(f"Cycle complete. Next scan in {interval}s…")
             try:
                 await asyncio.sleep(interval)
