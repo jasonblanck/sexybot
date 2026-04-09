@@ -551,6 +551,29 @@ def cancel_all():
     return {"ok": True}
 
 
+@app.get("/macro")
+def macro_data():
+    import urllib.request as _ur, json as _j
+    key = FRED_API_KEY
+    series = [
+        ("FEDFUNDS", "Fed Funds Rate", "%"),
+        ("CPIAUCSL", "CPI", ""),
+        ("UNRATE",   "Unemployment", "%"),
+        ("GDP",      "GDP", "B"),
+    ]
+    result = []
+    for sid, label, unit in series:
+        try:
+            url = f"https://api.stlouisfed.org/fred/series/observations?series_id={sid}&api_key={key}&sort_order=desc&limit=1&file_type=json"
+            with _ur.urlopen(url, timeout=8) as r:
+                d = _j.loads(r.read())
+            obs = d["observations"][0]
+            result.append({"id": sid, "label": label, "value": obs["value"], "date": obs["date"], "unit": unit})
+        except Exception as e:
+            result.append({"id": sid, "label": label, "value": None, "date": None, "unit": unit})
+    return JSONResponse(result)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
