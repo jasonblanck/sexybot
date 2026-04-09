@@ -1044,19 +1044,28 @@ Rules:
             pass
         return ""
 
-    def get_balance(self) -> float:
-        """Fetch USDC cash balance from Polymarket (sig_type=2 proxy wallet)."""
+    _balance_cache: float = 0.0
+    _balance_cache_time: float = 0.0
+    _positions_cache: float = 0.0
+    _positions_cache_time: float = 0.0
+
+    def get_balance(self, force: bool = False) -> float:
+        """Fetch USDC cash balance from Polymarket (sig_type=2 proxy wallet). Cached 30s."""
+        if not force and time.time() - self._balance_cache_time < 30:
+            return self._balance_cache
         if not self.client:
-            return 0.0
+            return self._balance_cache
         try:
             from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)
             result = self.client.get_balance_allowance(params)
             raw = float(result.get("balance", 0))
-            return round(raw / 1_000_000, 2)  # USDC has 6 decimals
+            self._balance_cache = round(raw / 1_000_000, 2)
+            self._balance_cache_time = time.time()
+            return self._balance_cache
         except Exception as e:
             log.debug(f"get_balance error: {e}")
-            return 0.0
+            return self._balance_cache
 
     _PM_HEADERS = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
