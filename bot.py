@@ -495,8 +495,25 @@ class PolymarketBot:
         for d in dead:
             self.ws_clients.remove(d)
 
+    _proxy_wallet: str = ""
+
+    def get_proxy_wallet(self) -> str:
+        """Derive proxy wallet address from trade maker_address."""
+        if self._proxy_wallet:
+            return self._proxy_wallet
+        try:
+            trades = self.client.get_trades()
+            if trades:
+                addr = trades[0].get("maker_address", "")
+                if addr:
+                    self._proxy_wallet = addr
+                    return addr
+        except Exception:
+            pass
+        return ""
+
     def get_balance(self) -> float:
-        """Fetch USDC balance from Polymarket (sig_type=2 proxy wallet)."""
+        """Fetch USDC cash balance from Polymarket (sig_type=2 proxy wallet)."""
         if not self.client:
             return 0.0
         try:
@@ -509,12 +526,32 @@ class PolymarketBot:
             log.debug(f"get_balance error: {e}")
             return 0.0
 
+    def get_positions_value(self) -> float:
+        """Fetch open positions value from Polymarket data API."""
+        try:
+            proxy = self.get_proxy_wallet()
+            if not proxy:
+                return 0.0
+            url = f"https://data-api.polymarket.com/value?user={proxy}"
+            with _ureq.urlopen(url, timeout=5) as r:
+                import json as _j
+                data = _j.loads(r.read())
+                if data and isinstance(data, list):
+                    return round(float(data[0].get("value", 0)), 2)
+        except Exception as e:
+            log.debug(f"get_positions_value error: {e}")
+        return 0.0
+
     def get_state(self) -> dict:
+        cash = self.get_balance()
+        positions = self.get_positions_value()
         return {
             "running": self.running,
             "strategy": STRATEGY,
             "dry_run": DRY_RUN,
-            "balance": self.get_balance(),
+            "balance": cash,
+            "positions_value": positions,
+            "portfolio_value": round(cash + positions, 2),
             "trades": self.trades[-50:],
             "signals": self.signals[-50:],
             "log": self.log_lines[-100:],
