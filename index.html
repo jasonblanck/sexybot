@@ -71,10 +71,9 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 <header class="hdr">
   <div class="hdr-logo">SEXY<span>BOT</span></div>
   <div class="hdr-mid">
-    <div class="hdr-ticker"><span class="hdr-ticker-sym">BTC</span><span class="hdr-ticker-val" id="hbtc">—</span></div>
-    <div class="hdr-ticker"><span class="hdr-ticker-sym">ETH</span><span class="hdr-ticker-val" id="heth">—</span></div>
-    <div class="hdr-ticker"><span class="hdr-ticker-sym">SOL</span><span class="hdr-ticker-val" id="hsol">—</span></div>
-    <div class="hdr-ticker"><span class="hdr-ticker-sym">POL</span><span class="hdr-ticker-val" id="hpol">—</span></div>
+    <div class="hdr-ticker"><span class="hdr-ticker-sym">DOW</span><span class="hdr-ticker-val" id="hdow">—</span></div>
+    <div class="hdr-ticker"><span class="hdr-ticker-sym">S&amp;P</span><span class="hdr-ticker-val" id="hspx">—</span></div>
+    <div class="hdr-ticker"><span class="hdr-ticker-sym">NDQ</span><span class="hdr-ticker-val" id="hndq">—</span></div>
   </div>
   <div class="hdr-right">
     <span id="clock">—</span>
@@ -162,7 +161,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
 const BOT=`http://${location.hostname}:8000`;
-const FRED_KEY='162f64538bb3db1ba4499a5e45e8580f';
+const FRED_KEY='a7a711149313765fd1e93c1b81acb004';
 const WEATHER_KEY='9VYbq9ve3p9X6tke';
 let pnlChart=null,allTrades=[],activeFilter='1D';
 setInterval(()=>{document.getElementById('clock').textContent=new Date().toLocaleTimeString('en-US',{hour12:false});},1000);
@@ -254,16 +253,49 @@ async function fetchCrypto(){
   try{const r=await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,matic-network,polygon-ecosystem-token&vs_currencies=usd&include_24hr_change=true');const d=await r.json();
   const fmt=n=>'$'+Number(n).toLocaleString('en-US',{maximumFractionDigits:2});
   const chg=n=>{const c=parseFloat(n||0).toFixed(2);return`<span class="${c>=0?'g':'r'}">${c>=0?'+':''}${c}%</span>`;};
-  if(d.bitcoin){document.getElementById('cbtc').textContent=fmt(d.bitcoin.usd);document.getElementById('cbtcc').innerHTML=chg(d.bitcoin.usd_24h_change);document.getElementById('hbtc').textContent=fmt(d.bitcoin.usd);}
-  if(d.ethereum){document.getElementById('ceth').textContent=fmt(d.ethereum.usd);document.getElementById('cethc').innerHTML=chg(d.ethereum.usd_24h_change);document.getElementById('heth').textContent=fmt(d.ethereum.usd);}
-  if(d.solana){document.getElementById('csol').textContent=fmt(d.solana.usd);document.getElementById('csolc').innerHTML=chg(d.solana.usd_24h_change);document.getElementById('hsol').textContent=fmt(d.solana.usd);}
+  if(d.bitcoin){document.getElementById('cbtc').textContent=fmt(d.bitcoin.usd);document.getElementById('cbtcc').innerHTML=chg(d.bitcoin.usd_24h_change);}
+  if(d.ethereum){document.getElementById('ceth').textContent=fmt(d.ethereum.usd);document.getElementById('cethc').innerHTML=chg(d.ethereum.usd_24h_change);}
+  if(d.solana){document.getElementById('csol').textContent=fmt(d.solana.usd);document.getElementById('csolc').innerHTML=chg(d.solana.usd_24h_change);}
   const pol=d['polygon-ecosystem-token']||d['matic-network'];
-  if(pol&&!isNaN(pol.usd)){document.getElementById('cpol').textContent=fmt(pol.usd);document.getElementById('cpolc').innerHTML=chg(pol.usd_24h_change);document.getElementById('hpol').textContent=fmt(pol.usd);}
+  if(pol&&!isNaN(pol.usd)){document.getElementById('cpol').textContent=fmt(pol.usd);document.getElementById('cpolc').innerHTML=chg(pol.usd_24h_change);}
   }catch(e){}
 }
 initChart();fetchBot();fetchMarkets();fetchFred();fetchWeather();fetchCrypto();
-setInterval(fetchMarkets,60000);setInterval(fetchCrypto,30000);setInterval(fetchFred,300000);setInterval(fetchWeather,600000);
+setInterval(fetchMarkets,60000);setInterval(fetchCrypto,30000);setInterval(fetchIndices,60000);setInterval(fetchFred,300000);setInterval(fetchWeather,600000);
 // WebSocket for real-time updates
+
+function isMarketOpen(){
+  const now=new Date();
+  const et=new Date(now.toLocaleString('en-US',{timeZone:'America/New_York'}));
+  const day=et.getDay();
+  if(day===0||day===6)return false;
+  const h=et.getHours(),m=et.getMinutes();
+  const mins=h*60+m;
+  return mins>=570&&mins<960; // 9:30am–4:00pm ET
+}
+async function fetchIndices(){
+  try{
+    const live=isMarketOpen();
+    const syms=live?'%5EDJI,%5EGSPC,%5EIXIC':'YM%3DF,ES%3DF,NQ%3DF';
+    const labels=live?['DOW','S&P','NDQ']:['DOW F','S&P F','NDQ F'];
+    const ids=['hdow','hspx','hndq'];
+    const symEls=[document.querySelector('#hdow').closest('.hdr-ticker').querySelector('.hdr-ticker-sym'),
+                  document.querySelector('#hspx').closest('.hdr-ticker').querySelector('.hdr-ticker-sym'),
+                  document.querySelector('#hndq').closest('.hdr-ticker').querySelector('.hdr-ticker-sym')];
+    labels.forEach(function(l,i){if(symEls[i])symEls[i].innerHTML=l;});
+    const r=await fetch('https://query1.finance.yahoo.com/v7/finance/quote?symbols='+syms,{headers:{'Accept':'application/json'}});
+    const d=await r.json();
+    const quotes=(d.quoteResponse&&d.quoteResponse.result)||[];
+    const fmtI=function(n){return n>=10000?Number(n).toLocaleString('en-US',{maximumFractionDigits:0}):Number(n).toLocaleString('en-US',{maximumFractionDigits:2});};
+    quotes.forEach(function(q,i){
+      const el=document.getElementById(ids[i]);if(!el)return;
+      const c=parseFloat(q.regularMarketChangePercent||0);
+      const col=c>=0?'#00cc66':'#ff3355';
+      const sign=c>=0?'+':'';
+      el.innerHTML='<span style="color:'+col+'">'+fmtI(q.regularMarketPrice)+'<span style="font-size:9px;margin-left:3px;">'+sign+c.toFixed(2)+'%</span></span>';
+    });
+  }catch(e){}
+}
 function connectWS(){
   const ws=new WebSocket('ws://'+location.hostname+'/ws');
   ws.onmessage=function(e){
@@ -293,7 +325,7 @@ function applyState(d){
   if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(function(line){let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return'<div class=+c+>'+line+'</div>';}).join('');}
   updateChart(trades);
 }
-connectWS();fetchBot();
+connectWS();fetchBot();fetchIndices();
 </script>
 <div id="kill-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:500;align-items:center;justify-content:center;">
   <div style="background:#111;border:1px solid #2a2a2a;border-radius:8px;padding:28px;width:340px;text-align:center;">
