@@ -135,9 +135,12 @@ class PolymarketBot:
             return False
 
     def _sync_positions(self, active_token_ids: set):
-        """Remove positions for markets no longer active (resolved/expired)."""
+        """Remove positions for markets no longer active (resolved/expired).
+        Only removes positions older than 7 days to guard against the 30-market fetch window."""
         try:
-            cur = self.db.execute("SELECT token_id FROM positions")
+            from datetime import timedelta
+            cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+            cur = self.db.execute("SELECT token_id FROM positions WHERE time < ?", (cutoff,))
             stored = [row[0] for row in cur.fetchall()]
             removed = 0
             for tid in stored:
