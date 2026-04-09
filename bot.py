@@ -1098,6 +1098,31 @@ def fmp_data():
     return JSONResponse(bot.get_fmp_market())
 
 
+@app.get("/research")
+async def research_market(q: str = ""):
+    """Debug endpoint: shows all research data + AI decision for a market question."""
+    if not q:
+        return JSONResponse({"error": "Pass ?q=market+question"})
+    import json as _j
+    # Find matching market
+    markets = bot.get_markets(limit=30)
+    mkt = next((m for m in markets if q.lower() in m.get("question","").lower()), None)
+    yes_p = 0.5
+    if mkt:
+        raw = mkt.get("outcomePrices","[0.5,0.5]")
+        prices = _j.loads(raw) if isinstance(raw, str) else raw
+        yes_p = float(prices[0]) if prices else 0.5
+    research = {
+        "news":   bot.get_news_headlines(q[:60]),
+        "tavily": bot.get_tavily_research(q[:80]) if TAVILY_API_KEY else "no Tavily key",
+        "crypto": bot.get_crypto_prices(),
+        "fmp":    bot.get_fmp_market().get("_sentiment"),
+        "macro":  bot.get_macro_context(),
+    }
+    ai = await bot.analyze_with_claude(mkt or {"question": q}, yes_p, research) if ANTHROPIC_API_KEY else None
+    return JSONResponse({"question": q, "yes_p": yes_p, "research": research, "ai_decision": ai})
+
+
 @app.get("/macro")
 def macro_data():
     import urllib.request as _ur, json as _j
