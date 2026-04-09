@@ -129,6 +129,34 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
     </div>
   </div>
   <div class="col">
+    <div style="display:flex;gap:1px;background:var(--border)">
+      <div class="panel" style="flex:1;background:var(--panel)">
+        <div style="font-size:11px;color:var(--text2);margin-bottom:6px;display:flex;align-items:center;justify-content:space-between;">
+          <span>Portfolio</span>
+          <span style="font-size:11px;color:var(--text2)">Available to trade <span class="g" id="pc-avail" style="font-family:var(--mono);font-weight:600">—</span></span>
+        </div>
+        <div style="font-family:var(--mono);font-size:28px;font-weight:500;letter-spacing:-1px;margin-bottom:4px" id="pc-total">$—</div>
+        <div style="font-size:11px;margin-bottom:14px" id="pc-pnl-day">—</div>
+        <div style="display:flex;gap:8px">
+          <a href="https://polymarket.com/wallet" target="_blank" style="flex:1;background:#3b82f6;color:#fff;border:none;border-radius:6px;padding:9px 0;font-size:12px;font-weight:700;cursor:pointer;text-align:center;text-decoration:none;display:block;">↓ Deposit</a>
+          <a href="https://polymarket.com/wallet" target="_blank" style="flex:1;background:#1a1a1a;color:var(--text);border:1px solid var(--border2);border-radius:6px;padding:9px 0;font-size:12px;font-weight:700;cursor:pointer;text-align:center;text-decoration:none;display:block;">↑ Withdraw</a>
+        </div>
+      </div>
+      <div class="panel" style="flex:1;background:var(--panel)">
+        <div style="font-size:11px;color:var(--text2);margin-bottom:6px;display:flex;align-items:center;justify-content:space-between;">
+          <span style="display:flex;align-items:center;gap:5px"><span class="g">▲</span> Profit/Loss</span>
+          <span style="display:flex;gap:6px">
+            <button class="cf on" onclick="setPnlFilter('1D',this)" id="pf-1d">1D</button>
+            <button class="cf" onclick="setPnlFilter('1W',this)" id="pf-1w">1W</button>
+            <button class="cf" onclick="setPnlFilter('1M',this)" id="pf-1m">1M</button>
+            <button class="cf" onclick="setPnlFilter('ALL',this)" id="pf-all">ALL</button>
+          </span>
+        </div>
+        <div style="font-family:var(--mono);font-size:28px;font-weight:500;letter-spacing:-1px;margin-bottom:2px" id="pc-pnl">$—</div>
+        <div style="font-size:10px;color:var(--text2);margin-bottom:8px" id="pc-pnl-label">All time</div>
+        <div style="position:relative;height:60px"><canvas id="mini-pnl-chart"></canvas></div>
+      </div>
+    </div>
     <div class="panel">
       <div class="panel-title">P&amp;L OVER TIME
         <div style="display:flex;gap:6px">
