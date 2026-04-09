@@ -271,11 +271,19 @@ if(trades.length>0){document.getElementById('tlog').innerHTML=trades.slice(-25).
 }
 async function fetchMarkets(){
   try{
-    const r=await fetch('https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=10&order=volume24hr&ascending=false');
-    const d=await r.json();const markets=Array.isArray(d)?d:[];
-    if(!markets.length)return;
-    document.getElementById('mkt-body').innerHTML=markets.slice(0,8).map(m=>{const prices=JSON.parse(m.outcomePrices||'[0.5,0.5]');const yes=(parseFloat(prices[0])*100).toFixed(0);const no=(parseFloat(prices[1]||1-prices[0])*100).toFixed(0);const vol=parseFloat(m.volume24hr||0);const vs=vol>1e6?'$'+(vol/1e6).toFixed(1)+'M':vol>1000?'$'+(vol/1000).toFixed(0)+'K':'$'+vol.toFixed(0);return`<tr><td><a class="mkt-link" href="https://polymarket.com/event/${m.slug||''}" target="_blank">${(m.question||'').slice(0,42)}${(m.question||'').length>42?'…':''}</a></td><td class="g">${yes}¢</td><td class="r">${no}¢</td><td class="y">${vs}</td></tr>`;}).join('');
-  }catch(e){}
+    const r=await fetch(`${BOT}/markets`);
+    const markets=await r.json();
+    if(!Array.isArray(markets)||!markets.length)return;
+    document.getElementById('mkt-body').innerHTML=markets.slice(0,10).map(m=>{
+      let prices;try{prices=JSON.parse(m.outcomePrices||'[0.5,0.5]');}catch{prices=[0.5,0.5];}
+      const yes=(parseFloat(prices[0])*100).toFixed(0);
+      const no=(parseFloat(prices[1]!=null?prices[1]:1-prices[0])*100).toFixed(0);
+      const vol=parseFloat(m.volume24hr||0);
+      const vs=vol>=1e6?'$'+(vol/1e6).toFixed(1)+'M':vol>=1000?'$'+(vol/1000).toFixed(0)+'K':'$'+vol.toFixed(0);
+      const slug=(m.question||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,60);
+      return`<tr><td><a class="mkt-link" href="https://polymarket.com/event/${slug}" target="_blank">${(m.question||'').slice(0,42)}${(m.question||'').length>42?'…':''}</a></td><td class="g">${yes}¢</td><td class="r">${no}¢</td><td class="y">${vs}</td></tr>`;
+    }).join('');
+  }catch(e){console.error('fetchMarkets',e);}
 }
 async function fetchFred(){
   const cls=['o','r','b','g'];
