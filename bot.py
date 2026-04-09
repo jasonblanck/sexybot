@@ -350,7 +350,7 @@ class PolymarketBot:
                 if weather["bad_weather"] and is_sports:
                     confidence *= 0.75
                     self._log(f"WEATHER ADJ: reducing sports confidence (bad weather)")
-                if macro["fed_rate"] > 5.0 and is_economic:
+                if macro["fed_rate"] > 4.5 and is_economic:
                     confidence *= 1.15
                     self._log(f"MACRO ADJ: boosting economic market confidence (rate={macro['fed_rate']})")
                 if macro["cpi"] > 4.0 and is_political:
