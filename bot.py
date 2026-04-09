@@ -218,7 +218,7 @@ class PolymarketBot:
             self._log(f"[DRY RUN] {side} ${amount_usdc:.2f} @ {price:.4f} — token {token_id[:16]}…")
         else:
             try:
-                order_args = MarketOrderArgs(token_id=token_id, amount=amount_usdc, side="BUY")
+                order_args = MarketOrderArgs(token_id=token_id, amount=amount_usdc, side=side)
                 signed = self.client.create_market_order(order_args)
                 resp = self.client.post_order(signed, OrderType.FOK)
                 result["status"] = resp.get("status", "unknown")

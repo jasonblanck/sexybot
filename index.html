@@ -105,6 +105,12 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
         <div class="fred-item"><div class="fred-lbl">UNRATE</div><div class="fred-val b">—</div></div>
         <div class="fred-item"><div class="fred-lbl">GDP</div><div class="fred-val g">—</div></div>
       </div>
+      <div style="margin-top:12px;border-top:1px solid var(--border2);padding-top:10px;">
+        <div class="stat-row"><span class="stat-lbl">VIX</span><span class="stat-val" id="mkt-vix">—</span></div>
+        <div class="stat-row"><span class="stat-lbl">OIL (WTI)</span><span class="stat-val" id="mkt-oil">—</span></div>
+        <div class="stat-row"><span class="stat-lbl">10Y TREASURY</span><span class="stat-val" id="mkt-t10y">—</span></div>
+        <div class="stat-row"><span class="stat-lbl">FEAR &amp; GREED</span><span class="stat-val" id="mkt-fg">—</span></div>
+      </div>
     </div>
     <div class="panel">
       <div class="panel-title">WEATHER · NYC</div>
@@ -271,7 +277,7 @@ async function fetchCrypto(){
   }catch(e){}
 }
 initChart();fetchBot();fetchMarkets();fetchFred();fetchWeather();fetchCrypto();
-setInterval(fetchMarkets,60000);setInterval(fetchCrypto,30000);setInterval(fetchIndices,60000);setInterval(fetchFred,300000);setInterval(fetchWeather,600000);
+setInterval(fetchMarkets,60000);setInterval(fetchCrypto,30000);setInterval(fetchIndices,60000);setInterval(fetchMarketData,60000);setInterval(fetchFred,300000);setInterval(fetchWeather,600000);
 // WebSocket for real-time updates
 
 function isMarketOpen(){
@@ -306,6 +312,22 @@ async function fetchIndices(){
     });
   }catch(e){}
 }
+async function fetchMarketData(){
+  try{
+    const r=await fetch('/api/market-data');
+    const d=await r.json();
+    const fmtChg=function(c){if(c==null)return '';const s=parseFloat(c).toFixed(2);return ' <span style="font-size:10px;color:'+(c>=0?'#00cc66':'#ff3355')+'">'+(c>=0?'+':'')+s+'%</span>';};
+    if(d.vix){const v=d.vix;document.getElementById('mkt-vix').innerHTML=parseFloat(v.price).toFixed(2)+fmtChg(v.change);}
+    if(d.oil){const o=d.oil;document.getElementById('mkt-oil').innerHTML='$'+parseFloat(o.price).toFixed(2)+fmtChg(o.change);}
+    if(d.t10y){const t=d.t10y;document.getElementById('mkt-t10y').innerHTML=parseFloat(t.price).toFixed(3)+'%'+fmtChg(t.change);}
+    if(d.fear_greed){
+      const fg=d.fear_greed;
+      const score=fg.score;
+      const col=score<=25?'#ff3355':score<=45?'#ff9900':score<=55?'#ffcc00':score<=75?'#99cc00':'#00cc66';
+      document.getElementById('mkt-fg').innerHTML='<span style="color:'+col+'">'+score+' — '+fg.rating+'</span>';
+    }
+  }catch(e){}
+}
 function connectWS(){
   const ws=new WebSocket('ws://'+location.hostname+'/ws');
   ws.onmessage=function(e){
@@ -335,7 +357,7 @@ function applyState(d){
   if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(function(line){let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return'<div class=+c+>'+line+'</div>';}).join('');}
   updateChart(trades);
 }
-connectWS();fetchBot();fetchIndices();
+connectWS();fetchBot();fetchIndices();fetchMarketData();
 </script>
 <div id="kill-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:500;align-items:center;justify-content:center;">
   <div style="background:#111;border:1px solid #2a2a2a;border-radius:8px;padding:28px;width:340px;text-align:center;">
