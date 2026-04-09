@@ -389,7 +389,35 @@ function applyState(d){
   if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(function(line){let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return'<div class="'+c+'">'+line+'</div>';}).join('');}
   updateChart(trades);
 }
-connectWS();fetchBot();fetchIndices();fetchMarketData();
+let miniPnlChart=null;
+let _pnlHistory=[];
+let _activePnlFilter='ALL';
+function setPnlFilter(f,btn){_activePnlFilter=f;document.querySelectorAll('#pf-1d,#pf-1w,#pf-1m,#pf-all').forEach(b=>b.classList.remove('on'));btn.classList.add('on');const labels={'1D':'Past Day','1W':'Past Week','1M':'Past Month','ALL':'All time'};document.getElementById('pc-pnl-label').textContent=labels[f]||'All time';}
+async function fetchPortfolio(){
+  try{
+    const r=await fetch(`${BOT}/portfolio`);
+    const d=await r.json();
+    document.getElementById('pc-total').textContent=fmt$(d.portfolio_value||0);
+    document.getElementById('pc-avail').textContent=fmt$(d.cash||0);
+    const pnl=d.total_pnl||0;
+    const pct=d.pct_pnl||0;
+    const sign=pnl>=0?'+':'';
+    const cls=pnl>=0?'g':'r';
+    document.getElementById('pc-pnl').textContent=sign+fmt$(pnl);
+    document.getElementById('pc-pnl').className=cls;
+    document.getElementById('pc-pnl-day').innerHTML=`<span class="${cls}">${sign}${fmt$(pnl)} (${sign}${pct.toFixed(2)}%)</span> all time`;
+    // mini sparkline from positions current values
+    const positions=d.positions||[];
+    if(positions.length>0){
+      const vals=positions.map(p=>p.current_value);
+      const ctx=document.getElementById('mini-pnl-chart').getContext('2d');
+      if(miniPnlChart)miniPnlChart.destroy();
+      miniPnlChart=new Chart(ctx,{type:'line',data:{labels:positions.map((_,i)=>i),datasets:[{data:vals,borderColor:pnl>=0?'#00cc66':'#ff3355',borderWidth:2,pointRadius:0,fill:true,backgroundColor:pnl>=0?'rgba(0,204,102,0.08)':'rgba(255,51,85,0.08)',tension:0.4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{enabled:false}},scales:{x:{display:false},y:{display:false}}}});
+    }
+  }catch(e){}
+}
+connectWS();fetchBot();fetchIndices();fetchMarketData();fetchPortfolio();
+setInterval(fetchPortfolio,30000);
 </script>
 <div id="kill-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:500;align-items:center;justify-content:center;">
   <div style="background:#111;border:1px solid #2a2a2a;border-radius:8px;padding:28px;width:340px;text-align:center;">
