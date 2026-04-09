@@ -91,6 +91,16 @@ class PolymarketBot:
             token_id TEXT PRIMARY KEY, market TEXT,
             side TEXT, shares REAL, cost REAL, time TEXT
         )""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS brier_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            market TEXT, token_id TEXT, side TEXT,
+            predicted_prob REAL, market_price REAL,
+            kelly_fraction REAL, kelly_size REAL,
+            ai_reasoning TEXT, time TEXT,
+            resolved INTEGER DEFAULT 0,
+            actual_outcome INTEGER DEFAULT NULL,
+            brier_score REAL DEFAULT NULL
+        )""")
         self.db.commit()
 
     def save_trade(self, trade: dict):
