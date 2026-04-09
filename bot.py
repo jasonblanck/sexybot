@@ -753,6 +753,27 @@ def market_data():
     return JSONResponse(result)
 
 
+@app.get("/weather")
+def weather_data():
+    import json as _j
+    try:
+        base = "https://customer-api.open-meteo.com" if OPEN_METEO_API_KEY else "https://api.open-meteo.com"
+        key_param = f"&apikey={OPEN_METEO_API_KEY}" if OPEN_METEO_API_KEY else ""
+        url = (
+            f"{base}/v1/forecast?latitude=40.7128&longitude=-74.0060"
+            f"&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
+            f"weathercode,windspeed_10m,precipitation,uv_index,is_day,surface_pressure"
+            f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,"
+            f"windspeed_10m_max,weathercode,sunrise,sunset"
+            f"&temperature_unit=fahrenheit&windspeed_unit=mph&forecast_days=3"
+            f"{key_param}"
+        )
+        with _ureq.urlopen(url, timeout=8) as r:
+            return JSONResponse(_j.loads(r.read()))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/macro")
 def macro_data():
     import urllib.request as _ur, json as _j
