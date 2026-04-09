@@ -411,6 +411,197 @@ class PolymarketBot:
         self._weather_cache_time = time.time()
         return self._weather_cache
 
+    # ── Intelligence Layer ────────────────────────────────────────────────────
+
+    _crypto_cache: dict = {}
+    _crypto_cache_time: float = 0
+
+    def get_crypto_prices(self) -> dict:
+        """CoinGecko free API — BTC, ETH, MATIC prices for crypto markets."""
+        if time.time() - self._crypto_cache_time < 120 and self._crypto_cache:
+            return self._crypto_cache
+        try:
+            import json as _j
+            headers = {"accept": "application/json"}
+            if COINGECKO_API_KEY:
+                headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
+            url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,matic-network,solana&vs_currencies=usd&include_24hr_change=true"
+            req = _ureq.Request(url, headers=headers)
+            with _ureq.urlopen(req, timeout=5) as r:
+                data = _j.loads(r.read())
+            result = {}
+            mapping = {"bitcoin": "BTC", "ethereum": "ETH", "matic-network": "MATIC", "solana": "SOL"}
+            for cg_id, sym in mapping.items():
+                if cg_id in data:
+                    result[sym] = {
+                        "price": data[cg_id].get("usd"),
+                        "change_24h": round(data[cg_id].get("usd_24h_change", 0), 2),
+                    }
+            self._crypto_cache = result
+            self._crypto_cache_time = time.time()
+            return result
+        except Exception as e:
+            log.debug(f"CoinGecko error: {e}")
+            return {}
+
+    def get_onchain_balance(self) -> float:
+        """Check USDC balance on Polygon via Alchemy RPC. Falls back to CLOB balance."""
+        if not ALCHEMY_API_KEY or not PRIVATE_KEY:
+            return self.get_balance()
+        try:
+            from web3 import Web3
+            from eth_account import Account
+            rpc = f"https://polygon-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 8}))
+            acct = Account.from_key(PRIVATE_KEY)
+            # USDC on Polygon: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+            usdc = w3.eth.contract(
+                address=Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+                abi=[{"inputs":[{"name":"account","type":"address"}],"name":"balanceOf",
+                      "outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+            )
+            raw = usdc.functions.balanceOf(acct.address).call()
+            return round(raw / 1_000_000, 2)
+        except Exception as e:
+            log.debug(f"Alchemy RPC error: {e}")
+            return self.get_balance()
+
+    def get_news_headlines(self, query: str, limit: int = 5) -> list:
+        """Fetch relevant news headlines via NewsAPI."""
+        if not NEWS_API_KEY:
+            return []
+        try:
+            import json as _j, urllib.parse
+            q = urllib.parse.quote(query[:80])
+            url = f"https://newsapi.org/v2/everything?q={q}&sortBy=publishedAt&pageSize={limit}&apiKey={NEWS_API_KEY}"
+            with _ureq.urlopen(url, timeout=6) as r:
+                data = _j.loads(r.read())
+            return [
+                {"title": a.get("title",""), "source": a.get("source",{}).get("name",""),
+                 "published": a.get("publishedAt","")[:10]}
+                for a in data.get("articles", [])[:limit]
+            ]
+        except Exception as e:
+            log.debug(f"NewsAPI error: {e}")
+            return []
+
+    def get_tavily_research(self, query: str) -> str:
+        """Deep AI-optimized web research via Tavily."""
+        if not TAVILY_API_KEY:
+            return ""
+        try:
+            from tavily import TavilyClient
+            client = TavilyClient(api_key=TAVILY_API_KEY)
+            result = client.search(query=query, search_depth="basic", max_results=3)
+            snippets = [r.get("content","")[:300] for r in result.get("results", [])]
+            return " | ".join(snippets)
+        except Exception as e:
+            log.debug(f"Tavily error: {e}")
+            return ""
+
+    def get_orderbook_depth(self, token_id: str) -> dict:
+        """Fetch order book depth and compute bid/ask spread + liquidity score."""
+        try:
+            book = self.get_orderbook(token_id)
+            if not book:
+                return {}
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            best_bid = float(bids[0]["price"]) if bids else 0
+            best_ask = float(asks[0]["price"]) if asks else 1
+            spread = round(best_ask - best_bid, 4)
+            bid_depth = sum(float(b.get("size", 0)) for b in bids[:5])
+            ask_depth = sum(float(a.get("size", 0)) for a in asks[:5])
+            return {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread": spread,
+                "bid_depth": round(bid_depth, 2),
+                "ask_depth": round(ask_depth, 2),
+                "liquid": (bid_depth + ask_depth) > 50,
+            }
+        except Exception as e:
+            log.debug(f"Orderbook depth error: {e}")
+            return {}
+
+    async def analyze_with_claude(self, market: dict, yes_p: float, research: dict) -> Optional[dict]:
+        """
+        Use Claude claude-haiku-4-5 to intelligently score a market using all available context.
+        Returns enhanced signal dict or None to skip.
+        """
+        if not ANTHROPIC_API_KEY:
+            return None
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            question = market.get("question", "")
+            no_p = round(1 - yes_p, 4)
+
+            # Build context block
+            ctx_parts = [
+                f"MARKET: {question}",
+                f"CURRENT PRICES: YES={yes_p:.3f} ({yes_p*100:.1f}¢)  NO={no_p:.3f} ({no_p*100:.1f}¢)",
+                f"VOLUME 24H: ${float(market.get('volume24hr',0)):,.0f}",
+            ]
+            macro = self._macro_cache
+            if macro:
+                ctx_parts.append(f"MACRO: Fed Rate={macro.get('fed_rate')}%  CPI YoY={macro.get('cpi')}%")
+            fmp = self._fmp_cache.get("_sentiment", {})
+            if fmp:
+                ctx_parts.append(f"MARKET SENTIMENT: SPY {fmp.get('spy_change_pct',0):+.2f}%  {fmp.get('up_count',0)}/{fmp.get('total',0)} stocks up")
+            ob = research.get("orderbook", {})
+            if ob:
+                ctx_parts.append(f"ORDER BOOK: bid={ob.get('best_bid')} ask={ob.get('best_ask')} spread={ob.get('spread')} liquid={ob.get('liquid')}")
+            crypto = research.get("crypto", {})
+            if crypto and any(k in question.lower() for k in ["bitcoin","btc","ethereum","eth","crypto","blockchain","polygon","matic","solana","sol"]):
+                ctx_parts.append(f"CRYPTO: BTC={crypto.get('BTC',{}).get('price')} ({crypto.get('BTC',{}).get('change_24h',0):+.1f}%)  ETH={crypto.get('ETH',{}).get('price')} ({crypto.get('ETH',{}).get('change_24h',0):+.1f}%)")
+            news = research.get("news", [])
+            if news:
+                ctx_parts.append("RECENT NEWS:")
+                for n in news[:3]:
+                    ctx_parts.append(f"  - [{n.get('published','')}] {n.get('title','')}")
+            tavily = research.get("tavily", "")
+            if tavily:
+                ctx_parts.append(f"WEB RESEARCH: {tavily[:500]}")
+
+            context = "\n".join(ctx_parts)
+
+            prompt = f"""You are a Polymarket prediction market trader. Analyze this market and decide whether to trade.
+
+{context}
+
+Respond in JSON only with this exact structure:
+{{
+  "action": "BUY" or "SKIP",
+  "side": "YES" or "NO",
+  "confidence": <integer 0-100>,
+  "reasoning": "<one sentence>",
+  "risk": "low" or "medium" or "high"
+}}
+
+Rules:
+- Only BUY if you have genuine edge based on the data above
+- Consider liquidity (spread, depth) before buying
+- SKIP if the market is already near-resolved (price > 0.95 or < 0.05) with no edge
+- SKIP if news/research contradicts the current price direction
+- confidence > 70 = strong conviction, 50-70 = moderate, < 50 = weak"""
+
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=200,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            import json as _j
+            text = msg.content[0].text.strip()
+            # Extract JSON even if wrapped in markdown
+            if "```" in text:
+                text = text.split("```")[1].replace("json","").strip()
+            decision = _j.loads(text)
+            return decision
+        except Exception as e:
+            log.debug(f"Claude analysis error: {e}")
+            return None
+
     def analyze(self, market: dict) -> Optional[dict]:
         import json as _j
         raw_prices = market.get("outcomePrices", "[0.5,0.5]")
