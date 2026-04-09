@@ -421,7 +421,7 @@ class PolymarketBot:
         self._log(f"Bot started — strategy={STRATEGY} dry_run={DRY_RUN} interval={interval}s")
         while self.running:
             try:
-                markets = self.get_markets(limit=20)
+                markets = self.get_markets(limit=30)
                 self._log(f"Scanning {len(markets)} markets…")
                 for mkt in markets:
                     if not self.running:
