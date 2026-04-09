@@ -527,7 +527,7 @@ class PolymarketBot:
             return ""
 
     def get_orderbook_depth(self, token_id: str) -> dict:
-        """Fetch order book depth and compute bid/ask spread + liquidity score."""
+        """Fetch order book depth, spread, liquidity, and OBI."""
         try:
             book = self.get_orderbook(token_id)
             if not book:
@@ -539,17 +539,117 @@ class PolymarketBot:
             spread = round(best_ask - best_bid, 4)
             bid_depth = sum(float(b.get("size", 0)) for b in bids[:5])
             ask_depth = sum(float(a.get("size", 0)) for a in asks[:5])
+            total_depth = bid_depth + ask_depth
+            obi = round((bid_depth - ask_depth) / total_depth, 3) if total_depth > 0 else 0
             return {
                 "best_bid": best_bid,
                 "best_ask": best_ask,
                 "spread": spread,
                 "bid_depth": round(bid_depth, 2),
                 "ask_depth": round(ask_depth, 2),
-                "liquid": (bid_depth + ask_depth) > 50,
+                "liquid": total_depth > 50,
+                "obi": obi,  # >0 = buy pressure, <0 = sell pressure
             }
         except Exception as e:
             log.debug(f"Orderbook depth error: {e}")
             return {}
+
+    def kelly_size(self, prob: float, price: float, bankroll: float, fraction: float = 0.25) -> float:
+        """
+        Fractional Kelly Criterion position sizing.
+        prob: true probability of winning (0-1)
+        price: cost per share (0-1)
+        bankroll: available cash
+        fraction: Kelly multiplier (0.25 = quarter Kelly, protects vs LLM overconfidence)
+        Returns dollar amount to wager, capped at MAX_ORDER_SIZE.
+        """
+        if price <= 0 or price >= 1 or prob <= 0:
+            return 0.0
+        b = (1 - price) / price   # profit ratio per dollar wagered
+        q = 1 - prob
+        kelly_f = prob - (q / b)  # full Kelly fraction
+        if kelly_f <= 0.01:       # no meaningful edge
+            return 0.0
+        size = bankroll * kelly_f * fraction
+        return round(min(size, MAX_ORDER_SIZE, bankroll * 0.20), 2)  # never risk >20% of bankroll
+
+    def log_brier(self, market: str, token_id: str, side: str,
+                  predicted_prob: float, market_price: float,
+                  kelly_f: float, kelly_size: float, reasoning: str):
+        """Log a prediction for Brier score calibration tracking."""
+        try:
+            self.db.execute("""INSERT INTO brier_scores
+                (market, token_id, side, predicted_prob, market_price,
+                 kelly_fraction, kelly_size, ai_reasoning, time)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (market[:100], token_id, side, predicted_prob, market_price,
+                 kelly_f, kelly_size, reasoning[:200],
+                 datetime.utcnow().isoformat()))
+            self.db.commit()
+        except Exception as e:
+            log.debug(f"brier log error: {e}")
+
+    def get_brier_stats(self) -> dict:
+        """Return calibration stats from resolved predictions."""
+        try:
+            cur = self.db.execute(
+                "SELECT COUNT(*), AVG(brier_score) FROM brier_scores WHERE resolved=1 AND brier_score IS NOT NULL")
+            row = cur.fetchone()
+            total_cur = self.db.execute("SELECT COUNT(*) FROM brier_scores").fetchone()
+            return {
+                "total_predictions": total_cur[0] if total_cur else 0,
+                "resolved": row[0] if row else 0,
+                "avg_brier_score": round(row[1], 4) if row and row[1] else None,
+            }
+        except:
+            return {}
+
+    def get_courtlistener_data(self, query: str) -> str:
+        """Search CourtListener for relevant court dockets/opinions (free API)."""
+        try:
+            import json as _j, urllib.parse
+            q = urllib.parse.quote(query[:60])
+            url = f"https://www.courtlistener.com/api/rest/v4/search/?q={q}&type=o&order_by=score+desc&stat_Precedential=on"
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0", "Accept": "application/json"})
+            with _ureq.urlopen(req, timeout=6) as r:
+                data = _j.loads(r.read())
+            results = data.get("results", [])[:3]
+            if not results:
+                return ""
+            snippets = []
+            for res in results:
+                court = res.get("court_id", "")
+                date = res.get("dateFiled", "")[:10]
+                case = res.get("caseName", "")[:60]
+                snippet = res.get("snippet", "")[:150].replace("<mark>","").replace("</mark>","")
+                snippets.append(f"[{date}] {case} ({court}): {snippet}")
+            return " | ".join(snippets)
+        except Exception as e:
+            log.debug(f"CourtListener error: {e}")
+            return ""
+
+    def get_govtrack_data(self, query: str) -> str:
+        """Search GovTrack for relevant bills/legislation (free API)."""
+        try:
+            import json as _j, urllib.parse
+            q = urllib.parse.quote(query[:60])
+            url = f"https://www.govtrack.us/api/v2/bill?q={q}&limit=3&order=relevant"
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0", "Accept": "application/json"})
+            with _ureq.urlopen(req, timeout=6) as r:
+                data = _j.loads(r.read())
+            bills = data.get("objects", [])[:3]
+            if not bills:
+                return ""
+            snippets = []
+            for b in bills:
+                title = b.get("title_without_number", b.get("title",""))[:80]
+                status = b.get("current_status_description", "")[:60]
+                congress = b.get("congress", "")
+                snippets.append(f"[{congress}th Congress] {title} — {status}")
+            return " | ".join(snippets)
+        except Exception as e:
+            log.debug(f"GovTrack error: {e}")
+            return ""
 
     async def analyze_with_claude(self, market: dict, yes_p: float, research: dict) -> Optional[dict]:
         """
