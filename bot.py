@@ -974,18 +974,22 @@ Rules:
 
                     # ── Execute ───────────────────────────────────────────────
                     min_conf = 55 if ai_enabled else 40
+                    mkt_name = signal.get("market", question)
                     if float(signal.get("confidence", 0)) >= min_conf and signal.get("token_id"):
                         if signal["strategy"] == "arbitrage" and "BUY" in signal["signal"]:
-                            self.place_market_order(signal["token_id"], "BUY", amt / 2)
+                            self.place_market_order(signal["token_id"], "BUY", amt / 2, mkt_name)
                             if signal.get("no_token_id"):
-                                self.place_market_order(signal["no_token_id"], "BUY", amt / 2)
+                                self.place_market_order(signal["no_token_id"], "BUY", amt / 2, mkt_name)
+                            cycle_cash -= amt  # update cycle cash after trade
                         elif signal["strategy"] == "marketMaking":
                             if signal.get("bid"):
                                 self.place_limit_order(signal["token_id"], "BUY", signal["bid"], amt)
                             if signal.get("ask"):
                                 self.place_limit_order(signal["token_id"], "SELL", signal["ask"], amt)
+                            cycle_cash -= amt
                         elif "BUY" in signal.get("signal", ""):
-                            self.place_market_order(signal["token_id"], "BUY", amt)
+                            self.place_market_order(signal["token_id"], "BUY", amt, mkt_name)
+                            cycle_cash -= amt  # prevent over-trading in same cycle
 
                     try:
                         await bot._broadcast_state()
