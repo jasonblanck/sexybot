@@ -495,11 +495,26 @@ class PolymarketBot:
         for d in dead:
             self.ws_clients.remove(d)
 
+    def get_balance(self) -> float:
+        """Fetch USDC balance from Polymarket (sig_type=2 proxy wallet)."""
+        if not self.client:
+            return 0.0
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)
+            result = self.client.get_balance_allowance(params)
+            raw = float(result.get("balance", 0))
+            return round(raw / 1_000_000, 2)  # USDC has 6 decimals
+        except Exception as e:
+            log.debug(f"get_balance error: {e}")
+            return 0.0
+
     def get_state(self) -> dict:
         return {
             "running": self.running,
             "strategy": STRATEGY,
             "dry_run": DRY_RUN,
+            "balance": self.get_balance(),
             "trades": self.trades[-50:],
             "signals": self.signals[-50:],
             "log": self.log_lines[-100:],
