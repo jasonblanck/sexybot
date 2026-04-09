@@ -290,6 +290,56 @@ class PolymarketBot:
     _macro_cache_time = 0
     _weather_cache = {}
     _weather_cache_time = 0
+    _fmp_cache = {}
+    _fmp_cache_time = 0
+
+    # Key tickers: SPY (S&P proxy), plus individual mega-caps relevant to predictions
+    FMP_TICKERS = ["SPY", "AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN"]
+
+    def get_fmp_market(self) -> dict:
+        """Fetch stock quotes from FMP and compute market sentiment score."""
+        import json as _j
+        if not FMP_API_KEY:
+            return {}
+        if time.time() - self._fmp_cache_time < 300 and self._fmp_cache:
+            return self._fmp_cache
+        results = {}
+        for sym in self.FMP_TICKERS:
+            try:
+                url = f"https://financialmodelingprep.com/stable/quote?symbol={sym}&apikey={FMP_API_KEY}"
+                with _ureq.urlopen(url, timeout=5) as r:
+                    data = _j.loads(r.read())
+                if data:
+                    q = data[0]
+                    results[sym] = {
+                        "price": q.get("price"),
+                        "change": round(q.get("change", 0), 2),
+                        "change_pct": round(q.get("changePercentage", 0), 2),
+                        "volume": q.get("volume"),
+                        "day_high": q.get("dayHigh"),
+                        "day_low": q.get("dayLow"),
+                        "prev_close": q.get("previousClose"),
+                        "mktcap": q.get("marketCap"),
+                    }
+            except Exception as e:
+                log.debug(f"FMP quote {sym} error: {e}")
+        if results:
+            # Market sentiment: % of tickers up, weighted by magnitude
+            changes = [v["change_pct"] for v in results.values()]
+            up = sum(1 for c in changes if c > 0)
+            avg_chg = round(sum(changes) / len(changes), 2)
+            spy_chg = results.get("SPY", {}).get("change_pct", 0)
+            results["_sentiment"] = {
+                "up_count": up,
+                "total": len(changes),
+                "avg_change_pct": avg_chg,
+                "spy_change_pct": spy_chg,
+                "bullish": spy_chg > 0.5,
+                "bearish": spy_chg < -0.5,
+            }
+            self._fmp_cache = results
+            self._fmp_cache_time = time.time()
+        return results
 
     def get_macro_context(self) -> dict:
         import urllib.request, json as _j
