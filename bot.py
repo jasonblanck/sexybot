@@ -1074,22 +1074,26 @@ Rules:
         "Referer": "https://polymarket.com/",
     }
 
-    def get_positions_value(self) -> float:
-        """Fetch open positions value from Polymarket data API."""
+    def get_positions_value(self, force: bool = False) -> float:
+        """Fetch open positions value from Polymarket data API. Cached 60s."""
+        if not force and time.time() - self._positions_cache_time < 60:
+            return self._positions_cache
         try:
             proxy = os.getenv("POLYMARKET_FUNDER", "") or self.get_proxy_wallet()
             if not proxy:
-                return 0.0
+                return self._positions_cache
             import json as _j
             url = f"https://data-api.polymarket.com/value?user={proxy}"
             req = _ureq.Request(url, headers=self._PM_HEADERS)
             with _ureq.urlopen(req, timeout=5) as r:
                 data = _j.loads(r.read())
                 if data and isinstance(data, list):
-                    return round(float(data[0].get("value", 0)), 2)
+                    self._positions_cache = round(float(data[0].get("value", 0)), 2)
+                    self._positions_cache_time = time.time()
+                    return self._positions_cache
         except Exception as e:
             log.debug(f"get_positions_value error: {e}")
-        return 0.0
+        return self._positions_cache
 
     def get_pnl_data(self) -> dict:
         """Fetch positions with P&L breakdown from Polymarket data API."""
