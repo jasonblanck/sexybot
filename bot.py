@@ -726,7 +726,7 @@ Rules:
 - risk = "high" if outcome is binary/volatile, "low" if near-certain resolution"""
 
             msg = client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="claude-haiku-4-5",
                 max_tokens=200,
                 messages=[{"role": "user", "content": prompt}]
             )
