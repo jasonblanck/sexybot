@@ -859,8 +859,8 @@ Rules:
                     active_tids.update(_ids)
                 self._sync_positions(active_tids)
 
-                # Fetch balance once per cycle (not per signal)
-                cycle_cash = self.get_balance(force=True)
+                # Fetch balance once per cycle (non-blocking)
+                cycle_cash = await asyncio.to_thread(self.get_balance, True)
                 self._log(f"Cash: ${cycle_cash:.2f}")
 
                 for mkt in markets:
