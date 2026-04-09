@@ -124,6 +124,22 @@ class PolymarketBot:
         except:
             return False
 
+    def _sync_positions(self, active_token_ids: set):
+        """Remove positions for markets no longer active (resolved/expired)."""
+        try:
+            cur = self.db.execute("SELECT token_id FROM positions")
+            stored = [row[0] for row in cur.fetchall()]
+            removed = 0
+            for tid in stored:
+                if tid not in active_token_ids:
+                    self.db.execute("DELETE FROM positions WHERE token_id=?", (tid,))
+                    removed += 1
+            if removed:
+                self.db.commit()
+                self._log(f"Cleared {removed} resolved position(s) from DB")
+        except Exception as e:
+            log.debug(f"sync_positions error: {e}")
+
     def add_position(self, token_id: str, market: str, side: str, shares: float, cost: float):
         try:
             self.db.execute("""INSERT OR REPLACE INTO positions
