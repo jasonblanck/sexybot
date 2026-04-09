@@ -351,7 +351,8 @@ function applyState(d){
   const invested=good.reduce(function(s,t){return s+(t.amount_usdc||t.amount||0);},0);
   document.getElementById('ntrades').textContent=trades.length;
   document.getElementById('deployed').textContent=fmt$(invested);
-  if(d.balance!=null){document.getElementById('cash-balance').textContent=fmt$(d.balance);document.getElementById('port-val').textContent=fmt$(d.balance);}
+  if(d.balance!=null){document.getElementById('cash-balance').textContent=fmt$(d.balance);}
+  if(d.portfolio_value!=null){document.getElementById('port-val').textContent=fmt$(d.portfolio_value);document.getElementById('port-sub').textContent='cash '+fmt$(d.balance||0)+' + positions '+fmt$(d.positions_value||0);}
   const sigs=d.signals||[];
   document.getElementById('sig-count').textContent=sigs.length;
   if(sigs.length>0){document.getElementById('sig-feed').innerHTML=sigs.slice(-25).reverse().map(function(s){const isY=s.signal&&s.signal.includes('YES');return'<div class="feed-item"><span class="badge '+(isY?'badge-y':'badge-n')+'">'+(isY?'YES':'NO')+'</span><span class="feed-mkt">'+(s.market||'').slice(0,56)+'</span><span class="feed-conf">'+(s.confidence||0)+'%</span></div>';}).join('');}
