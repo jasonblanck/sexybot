@@ -242,11 +242,12 @@ class PolymarketBot:
 
     # ── Orders ────────────────────────────────────────────────────────────────
 
-    def place_market_order(self, token_id: str, side: str, amount_usdc: float) -> dict:
+    def place_market_order(self, token_id: str, side: str, amount_usdc: float, market: str = "") -> dict:
         price = self.get_midpoint(token_id) or 0.5
         result = {
             "token_id": token_id,
             "side": side,
+            "market": market,
             "amount_usdc": amount_usdc,
             "price": price,
             "shares": round(amount_usdc / price, 4) if price else 0,
