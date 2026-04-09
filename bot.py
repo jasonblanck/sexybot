@@ -429,7 +429,7 @@ class PolymarketBot:
                     if signal.get("token_id") and self.has_position(signal["token_id"]):
                         self._log(f"SKIP: already have position in {signal['market'][:40]}")
                         continue
-                    if float(signal.get("confidence", 0)) >= 50 and signal.get("token_id"):
+                    if float(signal.get("confidence", 0)) >= 60 and signal.get("token_id"):
                         if signal["strategy"] == "arbitrage" and "BUY" in signal["signal"]:
                             self.place_market_order(signal["token_id"], "BUY", signal["amount"] / 2)
                             if signal.get("no_token_id"):
