@@ -529,7 +529,7 @@ class PolymarketBot:
     def get_positions_value(self) -> float:
         """Fetch open positions value from Polymarket data API."""
         try:
-            proxy = self.get_proxy_wallet()
+            proxy = os.getenv("POLYMARKET_FUNDER", "") or self.get_proxy_wallet()
             if not proxy:
                 return 0.0
             url = f"https://data-api.polymarket.com/value?user={proxy}"
