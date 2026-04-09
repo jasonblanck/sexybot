@@ -262,7 +262,8 @@ class PolymarketBot:
                 self._log(f"Order failed: {e}", "error")
         self.trades.append(result)
         self.save_trade(result)
-        if result.get("status") and "error" not in str(result.get("status","")).lower():
+        status_str = str(result.get("status", "")).lower()
+        if result.get("status") and "error" not in status_str and status_str not in ("unmatched", "canceled", "cancelled", "no_match"):
             self.add_position(token_id, result.get("market",""), side, result.get("shares",0), amount_usdc)
         return result
 
