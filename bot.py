@@ -699,7 +699,7 @@ class PolymarketBot:
 
             context = "\n".join(ctx_parts)
 
-            prompt = f"""You are a Polymarket prediction market trader. Analyze this market and decide whether to trade.
+            prompt = f"""You are a Polymarket prediction market trader using Kelly Criterion sizing. Analyze this market and decide whether to trade.
 
 {context}
 
@@ -707,17 +707,23 @@ Respond in JSON only with this exact structure:
 {{
   "action": "BUY" or "SKIP",
   "side": "YES" or "NO",
+  "probability": <integer 0-100>,
   "confidence": <integer 0-100>,
   "reasoning": "<one sentence>",
   "risk": "low" or "medium" or "high"
 }}
 
+Definitions:
+- "probability": YOUR estimated true probability (0-100) that the chosen side resolves correctly. This is used for Kelly Criterion sizing. Be calibrated — if the market price already reflects fair value, say so.
+- "confidence": how certain you are in your probability estimate (0-100). Lower if limited data.
+- "action": BUY only if your probability gives positive Kelly edge over the market price. SKIP if no edge.
+
 Rules:
-- Only BUY if you have genuine edge based on the data above
-- Consider liquidity (spread, depth) before buying
-- SKIP if the market is already near-resolved (price > 0.95 or < 0.05) with no edge
-- SKIP if news/research contradicts the current price direction
-- confidence > 70 = strong conviction, 50-70 = moderate, < 50 = weak"""
+- Only BUY if your estimated probability meaningfully exceeds the market's implied probability
+- SKIP if the market price already reflects fair value (your probability ≈ market price)
+- Consider court/legal data, legislation status, and news for political/legal markets
+- Consider order book imbalance — if OBI strongly opposes your side, SKIP
+- risk = "high" if outcome is binary/volatile, "low" if near-certain resolution"""
 
             msg = client.messages.create(
                 model="claude-haiku-4-5-20251001",
