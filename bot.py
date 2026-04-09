@@ -1123,7 +1123,7 @@ Rules:
             total_pnl = round(sum(float(p.get("cashPnl", 0)) for p in positions), 2)
             total_invested = round(sum(float(p.get("initialValue", 0)) for p in positions), 2)
             pct = round(total_pnl / total_invested * 100, 2) if total_invested else 0
-            return {
+            self._pnl_cache = {
                 "total_pnl": total_pnl,
                 "pct_pnl": pct,
                 "positions": [
@@ -1140,9 +1140,11 @@ Rules:
                     for p in positions
                 ],
             }
+            self._pnl_cache_time = time.time()
+            return self._pnl_cache
         except Exception as e:
             log.debug(f"get_pnl_data error: {e}")
-        return {}
+        return self._pnl_cache
 
     def get_state(self) -> dict:
         cash = self.get_balance()
