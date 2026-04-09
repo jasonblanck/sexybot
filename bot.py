@@ -49,6 +49,7 @@ TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 API_SECRET_KEY    = os.getenv("API_SECRET_KEY", "sexybot2024")
 FRED_API_KEY      = os.getenv("FRED_API_KEY", "")
 OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY", "")
+FMP_API_KEY        = os.getenv("FMP_API_KEY", "")
 
 
 class PolymarketBot:
