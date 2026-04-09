@@ -611,7 +611,11 @@ _bot_task: Optional[asyncio.Task] = None
 
 @app.on_event("startup")
 async def startup():
-    if not bot.connect():
+    if bot.connect():
+        global _bot_task
+        _bot_task = asyncio.create_task(bot.run_loop(interval=30.0))
+        log.info("Bot auto-started on startup")
+    else:
         log.warning("Could not connect — check .env credentials")
 
 
