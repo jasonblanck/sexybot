@@ -317,19 +317,41 @@ class PolymarketBot:
         return self._macro_cache
 
     def get_weather_context(self) -> dict:
-        import urllib.request, json as _j
+        import json as _j
         if time.time() - self._weather_cache_time < 3600 and self._weather_cache:
             return self._weather_cache
         try:
-            url = f"https://api.open-meteo.com/v1/forecast?latitude=40.7128&longitude=-74.0060&current=weathercode,windspeed_10m{f'&apikey={OPEN_METEO_API_KEY}' if OPEN_METEO_API_KEY else ''}"
-            with _ureq.urlopen(url, timeout=5) as r:
+            base = "https://customer-api.open-meteo.com" if OPEN_METEO_API_KEY else "https://api.open-meteo.com"
+            key_param = f"&apikey={OPEN_METEO_API_KEY}" if OPEN_METEO_API_KEY else ""
+            url = (
+                f"{base}/v1/forecast?latitude=40.7128&longitude=-74.0060"
+                f"&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
+                f"weathercode,windspeed_10m,precipitation,uv_index,is_day"
+                f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max"
+                f"&temperature_unit=fahrenheit&windspeed_unit=mph&forecast_days=3"
+                f"{key_param}"
+            )
+            with _ureq.urlopen(url, timeout=8) as r:
                 d = _j.loads(r.read())
-                code = d["current"]["weathercode"]
-                wind = d["current"]["windspeed_10m"]
-                bad_weather = code in [61,63,65,71,73,75,80,81,82,95,96,99] or wind > 20
-        except:
-            bad_weather = False
-        self._weather_cache = {"bad_weather": bad_weather}
+            cur = d.get("current", {})
+            code = cur.get("weathercode", 0)
+            wind = cur.get("windspeed_10m", 0)
+            bad_weather = code in [51,53,55,61,63,65,71,73,75,77,80,81,82,85,86,95,96,99] or wind > 20
+            self._weather_cache = {
+                "bad_weather": bad_weather,
+                "temp": cur.get("temperature_2m"),
+                "feels_like": cur.get("apparent_temperature"),
+                "humidity": cur.get("relative_humidity_2m"),
+                "weathercode": code,
+                "wind": wind,
+                "precipitation": cur.get("precipitation", 0),
+                "uv_index": cur.get("uv_index", 0),
+                "is_day": cur.get("is_day", 1),
+                "daily": d.get("daily", {}),
+            }
+        except Exception as e:
+            log.debug(f"weather fetch error: {e}")
+            self._weather_cache = {"bad_weather": False}
         self._weather_cache_time = time.time()
         return self._weather_cache
 
