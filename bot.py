@@ -554,32 +554,45 @@ def cancel_all():
 @app.get("/market-data")
 def market_data():
     import urllib.request as _ur, json as _j
+    _headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
     result = {}
-    # VIX, Oil (WTI), 10Y Treasury via Yahoo Finance
+    # VIX via Yahoo Finance v8
+    for sym, key in [("%5EVIX", "vix"), ("CL%3DF", "oil")]:
+        try:
+            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=1d"
+            req = _ur.Request(url, headers=_headers)
+            with _ur.urlopen(req, timeout=8) as r:
+                d = _j.loads(r.read())
+            meta = d["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice")
+            prev  = meta.get("chartPreviousClose") or meta.get("previousClose")
+            change = round((price - prev) / prev * 100, 2) if price and prev else None
+            result[key] = {"price": price, "change": change}
+        except Exception as e:
+            log.warning(f"market-data {key} error: {e}")
+    # 10Y Treasury via FRED
     try:
-        url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=%5EVIX,CL%3DF,%5ETNX"
-        req = _ur.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
-        with _ur.urlopen(req, timeout=8) as r:
+        url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key={FRED_API_KEY}&sort_order=desc&limit=2&file_type=json"
+        with _ur.urlopen(url, timeout=8) as r:
             d = _j.loads(r.read())
-        quotes = d.get("quoteResponse", {}).get("result", [])
-        keys = ["vix", "oil", "t10y"]
-        for i, q in enumerate(quotes):
-            if i < len(keys):
-                result[keys[i]] = {
-                    "price": q.get("regularMarketPrice"),
-                    "change": q.get("regularMarketChangePercent"),
-                }
+        obs = d["observations"]
+        curr = float(obs[0]["value"])
+        prev = float(obs[1]["value"])
+        result["t10y"] = {"price": curr, "change": round(curr - prev, 3)}
     except Exception as e:
-        log.warning(f"market-data yahoo error: {e}")
+        log.warning(f"market-data t10y error: {e}")
     # CNN Fear & Greed
     try:
-        req2 = _ur.Request(
+        req = _ur.Request(
             "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.cnn.com/"}
+            headers={**_headers, "Origin": "https://www.cnn.com", "Referer": "https://www.cnn.com/markets/fear-and-greed"},
         )
-        with _ur.urlopen(req2, timeout=8) as r:
-            d2 = _j.loads(r.read())
-        fg = d2.get("fear_and_greed", {})
+        with _ur.urlopen(req, timeout=8) as r:
+            d = _j.loads(r.read())
+        fg = d.get("fear_and_greed", {})
         result["fear_greed"] = {
             "score": round(fg.get("score", 0)),
             "rating": fg.get("rating", "").replace("_", " ").title(),
