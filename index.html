@@ -314,8 +314,8 @@ async function fetchCrypto(){
   if(pol&&!isNaN(pol.usd)){document.getElementById('cpol').textContent=fmt(pol.usd);document.getElementById('cpolc').innerHTML=chg(pol.usd_24h_change);}
   }catch(e){}
 }
-initChart();fetchBot();fetchMarkets();fetchFred();fetchWeather();fetchCrypto();
-setInterval(fetchMarkets,60000);setInterval(fetchCrypto,30000);setInterval(fetchIndices,60000);setInterval(fetchMarketData,60000);setInterval(fetchFred,300000);setInterval(fetchWeather,600000);
+initChart();fetchFred();fetchWeather();fetchCrypto();
+setInterval(fetchCrypto,30000);setInterval(fetchIndices,60000);setInterval(fetchMarketData,60000);setInterval(fetchFred,300000);setInterval(fetchWeather,600000);
 // WebSocket for real-time updates
 
 function isMarketOpen(){
