@@ -414,15 +414,33 @@ async function fetchPortfolio(){
     document.getElementById('pc-pnl').textContent=sign+fmt$(pnl);
     document.getElementById('pc-pnl').className=cls;
     document.getElementById('pc-pnl-day').innerHTML=`<span class="${cls}">${sign}${fmt$(pnl)} (${sign}${pct.toFixed(2)}%)</span> all time`;
-    // mini sparkline from positions current values
+    // Open Positions panel
     const positions=d.positions||[];
+    document.getElementById('pos-count').textContent=positions.length;
     if(positions.length>0){
+      document.getElementById('positions-list').innerHTML=positions.map(p=>{
+        const pc=p.cash_pnl>=0?'g':'r';
+        const ps=p.cash_pnl>=0?'+':'';
+        return`<div style="padding:6px 0;border-bottom:1px solid #1a1a1a;display:flex;flex-direction:column;gap:2px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span style="font-size:11px;color:var(--text);max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.title}</span>
+            <span class="badge ${p.outcome==='Yes'?'badge-y':'badge-n'}" style="font-size:9px">${p.outcome||'YES'}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--text2)">
+            <span>${p.size.toFixed(2)} shares @ ${(p.avg_price*100).toFixed(0)}¢</span>
+            <span class="${pc}">${ps}${fmt$(p.cash_pnl)}</span>
+          </div>
+        </div>`;
+      }).join('');
+      // mini sparkline
       const vals=positions.map(p=>p.current_value);
       const ctx=document.getElementById('mini-pnl-chart').getContext('2d');
       if(miniPnlChart)miniPnlChart.destroy();
       miniPnlChart=new Chart(ctx,{type:'line',data:{labels:positions.map((_,i)=>i),datasets:[{data:vals,borderColor:pnl>=0?'#00cc66':'#ff3355',borderWidth:2,pointRadius:0,fill:true,backgroundColor:pnl>=0?'rgba(0,204,102,0.08)':'rgba(255,51,85,0.08)',tension:0.4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{enabled:false}},scales:{x:{display:false},y:{display:false}}}});
+    }else{
+      document.getElementById('positions-list').innerHTML='<div style="color:var(--text3);font-size:11px;padding:8px 0">no open positions</div>';
     }
-  }catch(e){}
+  }catch(e){console.error('fetchPortfolio',e);}
 }
 connectWS();fetchBot();fetchIndices();fetchMarketData();fetchPortfolio();
 setInterval(fetchPortfolio,30000);
