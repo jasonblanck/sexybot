@@ -212,7 +212,8 @@ async function fetchBot(){
     const invested=good.reduce((s,t)=>s+(t.amount_usdc||t.amount||0),0);
     document.getElementById('ntrades').textContent=trades.length;
     document.getElementById('deployed').textContent=fmt$(invested);
-    document.getElementById('port-val').textContent=fmt$(40.79);
+    if(d.balance!=null){document.getElementById('cash-balance').textContent=fmt$(d.balance);}
+    document.getElementById('port-val').textContent=fmt$(d.balance||0);
     document.getElementById('port-sub').textContent=good.length+' positions open';
     const wr=trades.length>0?Math.round(52+Math.random()*10):0;
     document.getElementById('winrate').textContent=wr+'%';
