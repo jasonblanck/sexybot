@@ -274,8 +274,8 @@ if(positions.length > 0){
     const isY=t.side==='YES'||t.side==='BUY';
     const slug=(t.market||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,60);
     return`<div class="tlog-item">
-      <span class="tlog-mkt"><a href="https://polymarket.com/event/${slug}" target="_blank" style="color:var(--text2);text-decoration:none">${(t.market||'').slice(0,36)}…</a></span>
-      <span class="badge ${isY?'badge-y':'badge-n'}">${t.side||'BUY'}</span>
+      <span class="tlog-mkt"><a href="https://polymarket.com/event/${slug}" target="_blank" style="color:var(--text2);text-decoration:none">${safeHtml((t.market||'').slice(0,36))}…</a></span>
+      <span class="badge ${isY?'badge-y':'badge-n'}">${safeHtml(t.side||'BUY')}</span>
       <span class="tlog-amt">${fmt$(t.amount_usdc||t.amount||0)}</span>
     </div>`;
   }).join('');
@@ -297,7 +297,8 @@ async function fetchMarkets(){
       const vol=parseFloat(m.volume24hr||0);
       const vs=vol>=1e6?'$'+(vol/1e6).toFixed(1)+'M':vol>=1000?'$'+(vol/1000).toFixed(0)+'K':'$'+vol.toFixed(0);
       const slug=(m.question||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,60);
-      return`<tr><td><a class="mkt-link" href="https://polymarket.com/event/${slug}" target="_blank">${(m.question||'').slice(0,42)}${(m.question||'').length>42?'…':''}</a></td><td class="g">${yes}¢</td><td class="r">${no}¢</td><td class="y">${vs}</td></tr>`;
+      const qSafe=safeHtml((m.question||'').slice(0,42));const qFull=safeHtml(m.question||'');
+      return`<tr><td><a class="mkt-link" href="https://polymarket.com/event/${slug}" target="_blank">${qSafe}${qFull.length>42?'…':''}</a></td><td class="g">${yes}¢</td><td class="r">${no}¢</td><td class="y">${vs}</td></tr>`;
     }).join('');
   }catch(e){console.error('fetchMarkets',e);}
 }
@@ -312,7 +313,7 @@ async function fetchFred(){
       if(!items[i])return;
       const val=d.value?parseFloat(d.value):null;
       const display=val!==null?(d.unit==='B'?'$'+val.toFixed(0)+'B':val.toFixed(2)+(d.unit||'')):'—';
-      items[i].innerHTML='<div class="fred-lbl">'+d.id+'</div><div class="fred-val '+cls[i]+'">'+display+'</div><div class="fred-date">'+(d.date||'')+'</div>';
+      items[i].innerHTML='<div class="fred-lbl">'+safeHtml(d.id)+'</div><div class="fred-val '+cls[i]+'">'+display+'</div><div class="fred-date">'+safeHtml(d.date||'')+'</div>';
     });
   }catch(e){}
 }
@@ -410,7 +411,7 @@ async function fetchMarketData(){
       const fg=d.fear_greed;
       const score=fg.score;
       const col=score<=25?'#ff3355':score<=45?'#ff9900':score<=55?'#ffcc00':score<=75?'#99cc00':'#00cc66';
-      document.getElementById('mkt-fg').innerHTML='<span style="color:'+col+'">'+score+' — '+fg.rating+'</span>';
+      document.getElementById('mkt-fg').innerHTML='<span style="color:'+col+'">'+score+' — '+safeHtml(fg.rating)+'</span>';
     }
   }catch(e){}
 }
@@ -444,7 +445,7 @@ function applyState(d){
   if(d.gas&&d.gas.gwei!=null){const g=d.gas;const gc=g.multiplier>=4?'r':g.multiplier>=2.5?'o':g.multiplier>=1.5?'y':'g';document.getElementById('gas-state').innerHTML=`<span class="${gc}">${g.gwei} gwei · ${g.multiplier}x</span>`;}
   const sigs=d.signals||[];
   document.getElementById('sig-count').textContent=sigs.length;
-  if(sigs.length>0){document.getElementById('sig-feed').innerHTML=sigs.slice(-25).reverse().map(function(s){const isY=s.signal&&s.signal.includes('YES');return'<div class="feed-item"><span class="badge '+(isY?'badge-y':'badge-n')+'">'+(isY?'YES':'NO')+'</span><span class="feed-mkt">'+(s.market||'').slice(0,56)+'</span><span class="feed-conf">'+(s.confidence||0)+'%</span></div>';}).join('');}
+  if(sigs.length>0){document.getElementById('sig-feed').innerHTML=sigs.slice(-25).reverse().map(function(s){const isY=s.signal&&s.signal.includes('YES');return'<div class="feed-item"><span class="badge '+(isY?'badge-y':'badge-n')+'">'+(isY?'YES':'NO')+'</span><span class="feed-mkt">'+safeHtml((s.market||'').slice(0,56))+'</span><span class="feed-conf">'+(parseFloat(s.confidence||0)||0)+'%</span></div>';}).join('');}
   if(trades.length>0){document.getElementById('tlog').innerHTML=trades.slice(-25).reverse().map(function(t){const isY=t.side==='YES'||t.side==='BUY';return'<div class="tlog-item"><span class="tlog-mkt">'+safeHtml((t.market||'').slice(0,36))+'...</span><span class="badge '+(isY?'badge-y':'badge-n')+'">'+safeHtml(t.side||'BUY')+'</span><span class="tlog-amt">'+fmt$(t.amount_usdc||t.amount||0)+'</span></div>';}).join('');}
   const logs=d.log||[];
   if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(function(line){let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return'<div class="'+c+'">'+safeHtml(line)+'</div>';}).join('');}
