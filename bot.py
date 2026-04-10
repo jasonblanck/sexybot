@@ -87,40 +87,75 @@ class PolymarketBot:
     def init_db(self):
         db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades.db")
         self.db = sqlite3.connect(db_path, check_same_thread=False)
-        self.db.execute("""CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            market TEXT, side TEXT, amount REAL, price REAL,
-            shares REAL, order_type TEXT, status TEXT,
-            order_id TEXT, dry_run INTEGER, time TEXT
-        )""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS positions (
-            token_id TEXT PRIMARY KEY, market TEXT,
-            side TEXT, shares REAL, cost REAL, time TEXT
-        )""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS brier_scores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            market TEXT, token_id TEXT, side TEXT,
-            predicted_prob REAL, market_price REAL,
-            kelly_fraction REAL, kelly_size REAL,
-            ai_reasoning TEXT, time TEXT,
-            resolved INTEGER DEFAULT 0,
-            actual_outcome INTEGER DEFAULT NULL,
-            brier_score REAL DEFAULT NULL
-        )""")
-        self.db.commit()
+        # WAL mode: concurrent readers don't block writers; safe with asyncio.to_thread
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")  # safe under WAL, faster than FULL
+        with self.db:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market TEXT, side TEXT, amount REAL, price REAL,
+                shares REAL, order_type TEXT, status TEXT,
+                order_id TEXT, dry_run INTEGER, time TEXT
+            )""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS positions (
+                token_id TEXT PRIMARY KEY, market TEXT,
+                side TEXT, shares REAL, cost REAL, time TEXT
+            )""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS brier_scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market TEXT, token_id TEXT, side TEXT,
+                predicted_prob REAL, market_price REAL,
+                kelly_fraction REAL, kelly_size REAL,
+                ai_reasoning TEXT, time TEXT,
+                resolved INTEGER DEFAULT 0,
+                actual_outcome INTEGER DEFAULT NULL,
+                brier_score REAL DEFAULT NULL
+            )""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS idempotency_keys (
+                key TEXT PRIMARY KEY,
+                response TEXT NOT NULL,
+                created TEXT NOT NULL
+            )""")
+            # Purge idempotency keys older than 24h on startup
+            self.db.execute(
+                "DELETE FROM idempotency_keys WHERE datetime(created) < datetime('now', '-24 hours')"
+            )
 
     def save_trade(self, trade: dict):
         try:
-            self.db.execute("""INSERT INTO trades
-                (market,side,amount,price,shares,order_type,status,order_id,dry_run,time)
-                VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (trade.get("market",""), trade.get("side",""), trade.get("amount_usdc",trade.get("amount",0)),
-                 trade.get("price",0), trade.get("shares",0), trade.get("type","market"),
-                 trade.get("status",""), trade.get("order_id",""),
-                 1 if trade.get("dry_run") else 0, trade.get("time","")))
-            self.db.commit()
+            with self.db:
+                self.db.execute("""INSERT INTO trades
+                    (market,side,amount,price,shares,order_type,status,order_id,dry_run,time)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (trade.get("market",""), trade.get("side",""), trade.get("amount_usdc",trade.get("amount",0)),
+                     trade.get("price",0), trade.get("shares",0), trade.get("type","market"),
+                     trade.get("status",""), trade.get("order_id",""),
+                     1 if trade.get("dry_run") else 0, trade.get("time","")))
         except Exception as e:
             log.warning(f"DB save failed: {e}")
+
+    def _save_trade_and_position(self, trade: dict, position_args: Optional[tuple] = None):
+        """Atomically write trade record + optional position in one ACID transaction.
+        position_args: (token_id, market, side, shares, cost) or None to skip position write.
+        A crash between the two writes can no longer leave them out of sync."""
+        try:
+            with self.db:
+                self.db.execute("""INSERT INTO trades
+                    (market,side,amount,price,shares,order_type,status,order_id,dry_run,time)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (trade.get("market",""), trade.get("side",""),
+                     trade.get("amount_usdc", trade.get("amount",0)),
+                     trade.get("price",0), trade.get("shares",0),
+                     trade.get("type","market"), trade.get("status",""),
+                     trade.get("order_id",""), 1 if trade.get("dry_run") else 0,
+                     trade.get("time","")))
+                if position_args:
+                    tid, market, side, shares, cost = position_args
+                    self.db.execute("""INSERT OR REPLACE INTO positions
+                        (token_id, market, side, shares, cost, time) VALUES (?,?,?,?,?,?)""",
+                        (tid, market, side, shares, cost, datetime.utcnow().isoformat()))
+        except Exception as e:
+            log.warning(f"DB transaction failed: {e}")
 
     def get_daily_loss(self) -> float:
         try:
@@ -147,24 +182,21 @@ class PolymarketBot:
             from datetime import timedelta
             cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
             cur = self.db.execute("SELECT token_id FROM positions WHERE time < ?", (cutoff,))
-            stored = [row[0] for row in cur.fetchall()]
-            removed = 0
-            for tid in stored:
-                if tid not in active_token_ids:
-                    self.db.execute("DELETE FROM positions WHERE token_id=?", (tid,))
-                    removed += 1
-            if removed:
-                self.db.commit()
-                self._log(f"Cleared {removed} resolved position(s) from DB")
+            to_remove = [row[0] for row in cur.fetchall() if row[0] not in active_token_ids]
+            if to_remove:
+                with self.db:  # all deletes commit atomically or all roll back
+                    for tid in to_remove:
+                        self.db.execute("DELETE FROM positions WHERE token_id=?", (tid,))
+                self._log(f"Cleared {len(to_remove)} resolved position(s) from DB")
         except Exception as e:
             log.debug(f"sync_positions error: {e}")
 
     def add_position(self, token_id: str, market: str, side: str, shares: float, cost: float):
         try:
-            self.db.execute("""INSERT OR REPLACE INTO positions
-                (token_id, market, side, shares, cost, time) VALUES (?,?,?,?,?,?)""",
-                (token_id, market, side, shares, cost, datetime.utcnow().isoformat()))
-            self.db.commit()
+            with self.db:
+                self.db.execute("""INSERT OR REPLACE INTO positions
+                    (token_id, market, side, shares, cost, time) VALUES (?,?,?,?,?,?)""",
+                    (token_id, market, side, shares, cost, datetime.utcnow().isoformat()))
         except Exception as e:
             log.warning(f"Position save failed: {e}")
 
@@ -281,10 +313,11 @@ class PolymarketBot:
                 result["status"] = f"error: {e}"
                 self._log(f"Order failed: {e}", "error")
         self.trades.append(result)
-        self.save_trade(result)
         status_str = str(result.get("status", "")).lower()
+        pos_args = None
         if result.get("status") and "error" not in status_str and status_str not in ("unmatched", "canceled", "cancelled", "no_match"):
-            self.add_position(token_id, result.get("market",""), side, result.get("shares",0), amount_usdc)
+            pos_args = (token_id, result.get("market",""), side, result.get("shares",0), amount_usdc)
+        self._save_trade_and_position(result, pos_args)
         return result
 
     def place_limit_order(self, token_id: str, side: str, price: float, size: float) -> dict:
@@ -314,6 +347,7 @@ class PolymarketBot:
                 result["status"] = f"error: {e}"
                 self._log(f"Limit order failed: {e}", "error")
         self.trades.append(result)
+        self.save_trade(result)  # persist limit orders — was missing, lost on restart
         return result
 
     def cancel_all_orders(self):
@@ -718,14 +752,14 @@ class PolymarketBot:
                   kelly_f: float, kelly_size: float, reasoning: str):
         """Log a prediction for Brier score calibration tracking."""
         try:
-            self.db.execute("""INSERT INTO brier_scores
-                (market, token_id, side, predicted_prob, market_price,
-                 kelly_fraction, kelly_size, ai_reasoning, time)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
-                (market[:100], token_id, side, predicted_prob, market_price,
-                 kelly_f, kelly_size, reasoning[:200],
-                 datetime.utcnow().isoformat()))
-            self.db.commit()
+            with self.db:
+                self.db.execute("""INSERT INTO brier_scores
+                    (market, token_id, side, predicted_prob, market_price,
+                     kelly_fraction, kelly_size, ai_reasoning, time)
+                    VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (market[:100], token_id, side, predicted_prob, market_price,
+                     kelly_f, kelly_size, reasoning[:200],
+                     datetime.utcnow().isoformat()))
         except Exception as e:
             log.debug(f"brier log error: {e}")
 
@@ -1446,7 +1480,12 @@ def orderbook(token_id: str):
 _VALID_SIDES = {"BUY", "SELL", "YES", "NO"}
 
 @app.post("/trade", dependencies=[Depends(require_api_key)])
-async def manual_trade(token_id: str, side: str, amount: float, order_type: str = "market", price: float = 0.0):
+async def manual_trade(
+    token_id: str, side: str, amount: float,
+    order_type: str = "market", price: float = 0.0,
+    x_idempotency_key: Optional[str] = None,
+):
+    from fastapi import Request
     import re
     if not re.fullmatch(r"[0-9a-fA-F]{1,80}", token_id):
         raise HTTPException(status_code=400, detail="Invalid token_id")
@@ -1456,12 +1495,39 @@ async def manual_trade(token_id: str, side: str, amount: float, order_type: str 
         raise HTTPException(status_code=400, detail=f"amount must be between $0.01 and ${MAX_ORDER_SIZE*2}")
     if order_type not in ("market", "limit"):
         raise HTTPException(status_code=400, detail="order_type must be 'market' or 'limit'")
+    if order_type == "limit" and not (0.001 <= price <= 0.999):
+        raise HTTPException(status_code=400, detail="limit price must be between 0.001 and 0.999")
+
+    # Idempotency: return cached response if key was seen in the last 24h
+    if x_idempotency_key:
+        if not re.fullmatch(r"[A-Za-z0-9\-_]{1,64}", x_idempotency_key):
+            raise HTTPException(status_code=400, detail="X-Idempotency-Key: 1-64 alphanumeric/dash/underscore chars")
+        try:
+            row = bot.db.execute(
+                "SELECT response FROM idempotency_keys WHERE key=? AND datetime(created) > datetime('now', '-24 hours')",
+                (x_idempotency_key,)
+            ).fetchone()
+            if row:
+                return JSONResponse(json.loads(row[0]))
+        except Exception as e:
+            log.debug(f"idempotency lookup failed: {e}")
+
     if order_type == "limit":
-        if not (0.001 <= price <= 0.999):
-            raise HTTPException(status_code=400, detail="limit price must be between 0.001 and 0.999")
         result = bot.place_limit_order(token_id, side.upper(), price, amount)
     else:
         result = bot.place_market_order(token_id, side.upper(), amount)
+
+    # Persist idempotency key so retries within 24h return the same result
+    if x_idempotency_key:
+        try:
+            with bot.db:
+                bot.db.execute(
+                    "INSERT OR REPLACE INTO idempotency_keys (key, response, created) VALUES (?,?,?)",
+                    (x_idempotency_key, json.dumps(result), datetime.utcnow().isoformat())
+                )
+        except Exception as e:
+            log.debug(f"idempotency key store failed: {e}")
+
     await bot._broadcast_state()
     return JSONResponse(result)
 
