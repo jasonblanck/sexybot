@@ -313,6 +313,8 @@ class PolymarketBot:
                 result["status"] = f"error: {e}"
                 self._log(f"Order failed: {e}", "error")
         self.trades.append(result)
+        if len(self.trades) > 1000:
+            self.trades = self.trades[-1000:]
         status_str = str(result.get("status", "")).lower()
         pos_args = None
         if result.get("status") and "error" not in status_str and status_str not in ("unmatched", "canceled", "cancelled", "no_match"):
@@ -347,6 +349,8 @@ class PolymarketBot:
                 result["status"] = f"error: {e}"
                 self._log(f"Limit order failed: {e}", "error")
         self.trades.append(result)
+        if len(self.trades) > 1000:
+            self.trades = self.trades[-1000:]
         self.save_trade(result)  # persist limit orders — was missing, lost on restart
         return result
 
@@ -1128,6 +1132,8 @@ Rules:
                         continue
 
                     self.signals.append({**signal, "time": datetime.utcnow().isoformat()})
+                    if len(self.signals) > 1000:
+                        self.signals = self.signals[-1000:]
                     self._log(f"SIGNAL [{signal['strategy']}] {signal['signal']} | conf={signal.get('confidence','?')}% | {signal['market'][:50]}")
 
                     # ── Daily loss guard ──────────────────────────────────────
@@ -1382,6 +1388,51 @@ Rules:
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 
 from contextlib import asynccontextmanager
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as _SRequest
+from starlette.responses import Response as _SResponse
+
+# ── Resource limits ───────────────────────────────────────────────────────────
+MAX_WS_CONNECTIONS = 10        # max simultaneous WebSocket clients
+MAX_WS_MSG_BYTES   = 512       # largest valid WS command ~100 bytes; 512 is generous
+MAX_BODY_BYTES     = 16_384    # 16 KB; all inputs are query params so body is irrelevant
+_RATE_WINDOW       = 60        # seconds per rate-limit window
+_RATE_MAX_PUBLIC   = 120       # req/window for unauthenticated endpoints
+_RATE_MAX_AUTHED   = 300       # req/window for authenticated endpoints
+_rate_buckets: dict = {}       # ip -> [count, window_start_ts]
+
+class _ResourceMiddleware(BaseHTTPMiddleware):
+    """Enforce request body size cap and per-IP rate limiting."""
+    async def dispatch(self, request: _SRequest, call_next):
+        # 1. Body size cap (guards future JSON-body endpoints too)
+        cl = request.headers.get("content-length")
+        if cl and int(cl) > MAX_BODY_BYTES:
+            return _SResponse("Request body too large", status_code=413)
+
+        # 2. Per-IP rate limit
+        ip = (request.client.host if request.client else "unknown")
+        now = time.time()
+        bucket = _rate_buckets.get(ip)
+        if bucket is None or now - bucket[1] > _RATE_WINDOW:
+            _rate_buckets[ip] = [1, now]
+        else:
+            bucket[0] += 1
+            # Authenticated endpoints get a higher ceiling
+            is_authed = bool(request.headers.get("x-api-key"))
+            limit = _RATE_MAX_AUTHED if is_authed else _RATE_MAX_PUBLIC
+            if bucket[0] > limit:
+                return _SResponse("Rate limit exceeded", status_code=429,
+                                  headers={"Retry-After": str(_RATE_WINDOW)})
+
+        # 3. Prune stale buckets to prevent unbounded dict growth
+        if len(_rate_buckets) > 5000:
+            cutoff = now - _RATE_WINDOW
+            stale = [k for k, v in _rate_buckets.items() if v[1] < cutoff]
+            for k in stale:
+                del _rate_buckets[k]
+
+        return await call_next(request)
+
 
 bot = PolymarketBot()
 _bot_task: Optional[asyncio.Task] = None
@@ -1401,6 +1452,7 @@ async def lifespan(app_: FastAPI):
         _bot_task.cancel()
 
 app = FastAPI(title="Polymarket Bot", lifespan=lifespan)
+app.add_middleware(_ResourceMiddleware)
 
 # Restrict CORS to same-host origins only (nginx serves the frontend)
 _ALLOWED_ORIGINS = [
@@ -1680,6 +1732,10 @@ def macro_data():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    # Reject if at connection limit — prevents broadcast amplification
+    if len(bot.ws_clients) >= MAX_WS_CONNECTIONS:
+        await websocket.close(code=1008, reason="Too many connections")
+        return
     await websocket.accept()
     # Require auth key in the first message before allowing write commands
     _ws_authed = False
@@ -1688,6 +1744,10 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.send_text(json.dumps(bot.get_state()))
         while True:
             msg = await websocket.receive_text()
+            # Guard against oversized messages before any parsing
+            if len(msg) > MAX_WS_MSG_BYTES:
+                await websocket.send_text(json.dumps({"error": "message too large"}))
+                continue
             try:
                 data = json.loads(msg)
             except (json.JSONDecodeError, ValueError):
