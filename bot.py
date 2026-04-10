@@ -674,8 +674,10 @@ class PolymarketBot:
         try:
             import json as _j, urllib.parse
             q = urllib.parse.quote(query[:80])
-            url = f"https://newsapi.org/v2/everything?q={q}&sortBy=publishedAt&pageSize={limit}&apiKey={NEWS_API_KEY}"
-            with _ureq.urlopen(url, timeout=6) as r:
+            # API key in header (X-Api-Key) rather than URL query param — keeps key out of server access logs
+            url = f"https://newsapi.org/v2/everything?q={q}&sortBy=publishedAt&pageSize={limit}"
+            req = _ureq.Request(url, headers={"X-Api-Key": NEWS_API_KEY, "User-Agent": "polybot/1.0"})
+            with _ureq.urlopen(req, timeout=6) as r:
                 data = _j.loads(r.read())
             return [
                 {"title": a.get("title",""), "source": a.get("source",{}).get("name",""),
