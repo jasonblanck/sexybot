@@ -21,9 +21,10 @@ except ImportError as e:
 
 try:
     import uvicorn
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
+    from fastapi.security import APIKeyHeader
 except ImportError as e:
     raise SystemExit(f"Missing dependency: {e}\nRun: pip install fastapi uvicorn")
 
@@ -46,7 +47,11 @@ DRY_RUN        = os.getenv("DRY_RUN", "true").lower() != "false"
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "500"))
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
-API_SECRET_KEY    = os.getenv("API_SECRET_KEY", "sexybot2024")
+API_SECRET_KEY    = os.getenv("API_SECRET_KEY", "")
+if not API_SECRET_KEY:
+    import secrets as _sec
+    API_SECRET_KEY = _sec.token_hex(24)
+    log.warning(f"API_SECRET_KEY not set — generated ephemeral key (set in .env to persist): {API_SECRET_KEY}")
 FRED_API_KEY       = os.getenv("FRED_API_KEY", "")
 OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY", "")
 FMP_API_KEY        = os.getenv("FMP_API_KEY", "")
@@ -80,7 +85,8 @@ class PolymarketBot:
             log.warning(f"Telegram failed: {e}")
 
     def init_db(self):
-        self.db = sqlite3.connect("/root/polybot/trades.db", check_same_thread=False)
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades.db")
+        self.db = sqlite3.connect(db_path, check_same_thread=False)
         self.db.execute("""CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             market TEXT, side TEXT, amount REAL, price REAL,
@@ -399,7 +405,18 @@ class PolymarketBot:
                 cpi = round((cpi_now - cpi_yr) / cpi_yr * 100, 2)  # YoY %
         except:
             cpi = 3.0
-        self._macro_cache = {"fed_rate": rate, "cpi": cpi}
+        # VIX (updated daily by FRED — good enough for volatility scoring)
+        vix = None
+        try:
+            url3 = f"https://api.stlouisfed.org/fred/series/observations?series_id=VIXCLS&api_key={FRED_API_KEY}&sort_order=desc&limit=1&file_type=json"
+            with _ureq.urlopen(url3, timeout=5) as r:
+                d3 = _j.loads(r.read())
+                obs3 = [o for o in d3["observations"] if o["value"] != "."]
+                if obs3:
+                    vix = float(obs3[0]["value"])
+        except:
+            pass
+        self._macro_cache = {"fed_rate": rate, "cpi": cpi, "vix": vix}
         self._macro_cache_time = time.time()
         return self._macro_cache
 
@@ -441,6 +458,125 @@ class PolymarketBot:
             self._weather_cache = {"bad_weather": False}
         self._weather_cache_time = time.time()
         return self._weather_cache
+
+    # ── Volatility & Gas ─────────────────────────────────────────────────────
+
+    _gas_cache: dict = {}
+    _gas_cache_time: float = 0
+    _vol_state: str = "normal"          # "normal" | "elevated" | "high" | "extreme"
+    _vol_state_time: float = 0
+    _price_snapshots: dict = {}         # token_id → (ts, price) for velocity tracking
+
+    def get_gas_multiplier(self) -> float:
+        """
+        Check Polygon network congestion via Alchemy and return a gas multiplier.
+        Returns 1.0 (normal), 1.5 (elevated), 2.5 (high), 4.0 (extreme congestion).
+        Cached 15s — fast-changing during volatile events.
+        Applies to any direct on-chain transactions; also used as a proxy for
+        CLOB execution aggressiveness (higher = more urgent fills needed).
+        """
+        if time.time() - self._gas_cache_time < 15 and self._gas_cache:
+            return self._gas_cache.get("multiplier", 1.0)
+        if not ALCHEMY_API_KEY:
+            return 1.0
+        try:
+            import json as _j
+            rpc = f"https://polygon-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+            payload = json.dumps({"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":1}).encode()
+            req = _ureq.Request(rpc, data=payload, headers={"Content-Type":"application/json"})
+            with _ureq.urlopen(req, timeout=4) as r:
+                d = _j.loads(r.read())
+            gwei = int(d["result"], 16) / 1e9
+            # Polygon baseline ~30 gwei; spikes to 200+ during congestion
+            if gwei > 300:   mult = 4.0; level = "extreme"
+            elif gwei > 150: mult = 2.5; level = "high"
+            elif gwei > 80:  mult = 1.5; level = "elevated"
+            else:            mult = 1.0; level = "normal"
+            self._gas_cache = {"multiplier": mult, "gwei": round(gwei, 1), "level": level}
+            self._gas_cache_time = time.time()
+            log.debug(f"Gas: {gwei:.1f} gwei → multiplier {mult}x ({level})")
+            return mult
+        except Exception as e:
+            log.debug(f"gas_multiplier error: {e}")
+            return 1.0
+
+    def get_gas_info(self) -> dict:
+        """Return cached gas state (for /status endpoint)."""
+        self.get_gas_multiplier()  # refresh if stale
+        return self._gas_cache
+
+    def update_volatility_state(self, markets: list) -> str:
+        """
+        Score current market-wide volatility from two signals:
+          1. VIX level (from macro cache)
+          2. Polygon gas price (proxy for on-chain activity)
+          3. Rapid price velocity: detect if >3 scanned markets moved >4% since last cycle
+
+        Updates self._vol_state and returns it: "normal" | "elevated" | "high" | "extreme"
+        """
+        score = 0
+
+        # Signal 1: VIX
+        vix = self._macro_cache.get("vix")
+        if vix is None:
+            # try fmp cache
+            vix_data = self._fmp_cache.get("VIX", {})
+            vix = vix_data.get("price") if vix_data else None
+        if vix is not None:
+            v = float(vix)
+            if v > 40:   score += 3
+            elif v > 30: score += 2
+            elif v > 20: score += 1
+
+        # Signal 2: Gas multiplier
+        gas_mult = self._gas_cache.get("multiplier", 1.0)
+        if gas_mult >= 4.0:   score += 3
+        elif gas_mult >= 2.5: score += 2
+        elif gas_mult >= 1.5: score += 1
+
+        # Signal 3: Price velocity across scanned markets
+        import json as _j
+        now = time.time()
+        fast_movers = 0
+        for mkt in markets[:30]:
+            raw = mkt.get("clobTokenIds","[]")
+            ids = _j.loads(raw) if isinstance(raw, str) else raw
+            tid = ids[0] if ids else ""
+            if not tid:
+                continue
+            raw_p = mkt.get("outcomePrices","[0.5,0.5]")
+            prices = _j.loads(raw_p) if isinstance(raw_p, str) else raw_p
+            cur_p = float(prices[0]) if prices else 0.5
+            prev = self._price_snapshots.get(tid)
+            if prev:
+                prev_ts, prev_p = prev
+                elapsed = now - prev_ts
+                if 10 < elapsed < 120:  # compare only within last 2 minutes
+                    move = abs(cur_p - prev_p)
+                    if move > 0.04:
+                        fast_movers += 1
+            self._price_snapshots[tid] = (now, cur_p)
+
+        # Trim snapshot dict to avoid unbounded growth
+        if len(self._price_snapshots) > 500:
+            oldest = sorted(self._price_snapshots.items(), key=lambda x: x[1][0])
+            for k, _ in oldest[:200]:
+                del self._price_snapshots[k]
+
+        if fast_movers >= 5:   score += 3
+        elif fast_movers >= 3: score += 2
+        elif fast_movers >= 1: score += 1
+
+        if score >= 7:   state = "extreme"
+        elif score >= 4: state = "high"
+        elif score >= 2: state = "elevated"
+        else:            state = "normal"
+
+        if state != self._vol_state:
+            self._log(f"VOLATILITY: {self._vol_state.upper()} → {state.upper()} (score={score} vix={vix} gas={gas_mult}x fast_movers={fast_movers})", "warning" if score >= 4 else "info")
+        self._vol_state = state
+        self._vol_state_time = now
+        return state
 
     # ── Intelligence Layer ────────────────────────────────────────────────────
 
@@ -738,7 +874,10 @@ Rules:
             text = msg.content[0].text.strip()
             # Extract JSON even if wrapped in markdown
             if "```" in text:
-                text = text.split("```")[1].replace("json","").strip()
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
             decision = _j.loads(text)
             return decision
         except Exception as e:
@@ -863,6 +1002,25 @@ Rules:
                     active_tids.update(_ids)
                 self._sync_positions(active_tids)
 
+                # ── Volatility & gas check (non-blocking) ────────────────────
+                await asyncio.to_thread(self.get_gas_multiplier)
+                vol_state = await asyncio.to_thread(self.update_volatility_state, markets)
+                gas_mult  = self._gas_cache.get("multiplier", 1.0)
+
+                # Volatility-driven parameter adjustments:
+                #   normal    → standard Kelly fraction (0.25), min edge 0%
+                #   elevated  → tighten slightly (0.20), require 3% edge
+                #   high      → defensive (0.15), require 6% edge
+                #   extreme   → near-freeze (0.10), require 10% edge
+                _vol_kelly = {"normal": 0.25, "elevated": 0.20, "high": 0.15, "extreme": 0.10}
+                _vol_edge  = {"normal": 0.00, "elevated": 0.03, "high": 0.06, "extreme": 0.10}
+                vol_kelly_fraction = _vol_kelly.get(vol_state, 0.25)
+                vol_min_edge       = _vol_edge.get(vol_state, 0.00)
+
+                if vol_state != "normal":
+                    gwei = self._gas_cache.get("gwei", "?")
+                    self._log(f"⚡ VOL={vol_state.upper()} gas={gwei} gwei ({gas_mult}x) → kelly={vol_kelly_fraction} min_edge={vol_min_edge:.0%}")
+
                 # Fetch balance once per cycle (non-blocking)
                 cycle_cash = await asyncio.to_thread(self.get_balance, True)
                 self._log(f"Cash: ${cycle_cash:.2f}")
@@ -935,7 +1093,7 @@ Rules:
                     daily_loss = self.get_daily_loss()
                     if daily_loss >= DAILY_LOSS_LIMIT:
                         self._log(f"DAILY LOSS LIMIT HIT: ${daily_loss:.2f} — stopping trading", "error")
-                        self.send_telegram(f"⚠️ Daily loss limit hit: ${daily_loss:.2f}. Bot stopped trading.")
+                        asyncio.create_task(asyncio.to_thread(self.send_telegram, f"⚠️ Daily loss limit hit: ${daily_loss:.2f}. Bot stopped trading."))
                         self.running = False
                         break
 
@@ -959,8 +1117,15 @@ Rules:
                         conf_boost = float(signal.get("confidence", 50)) / 100.0 * 0.10
                         p_true = min(entry_price + conf_boost, 0.99)
 
+                    # ── Minimum edge gate (volatility-adjusted) ──────────────
+                    raw_edge = p_true - entry_price
+                    if raw_edge < vol_min_edge:
+                        self._log(f"EDGE SKIP: edge={raw_edge:.3f} < min={vol_min_edge:.2f} (vol={vol_state}) {question[:40]}")
+                        continue
+
                     kelly_f_full = p_true - ((1 - p_true) / ((1 - entry_price) / entry_price)) if entry_price < 1 else 0
-                    amt = self.kelly_size(p_true, entry_price, cash)
+                    # Use volatility-adjusted Kelly fraction (smaller during hot markets)
+                    amt = self.kelly_size(p_true, entry_price, cash, fraction=vol_kelly_fraction)
                     if amt < 0.50:
                         self._log(f"KELLY SKIP: no meaningful edge (p={p_true:.3f} price={entry_price:.3f} kelly_f={kelly_f_full:.3f})")
                         continue
@@ -1011,7 +1176,7 @@ Rules:
             except Exception:
                 pass
         self._log("Bot stopped.")
-        self.send_telegram("Bot stopped.")
+        await asyncio.to_thread(self.send_telegram, "Bot stopped.")
 
     def stop(self):
         self.running = False
@@ -1163,25 +1328,60 @@ Rules:
             "signals": self.signals[-50:],
             "log": self.log_lines[-100:],
             "brier": self.get_brier_stats(),
+            "volatility": self._vol_state,
+            "gas": self._gas_cache,
         }
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 
+from contextlib import asynccontextmanager
+
 bot = PolymarketBot()
-app = FastAPI(title="Polymarket Bot")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 _bot_task: Optional[asyncio.Task] = None
 
-
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app_: FastAPI):
+    global _bot_task
     if bot.connect():
-        global _bot_task
         _bot_task = asyncio.create_task(bot.run_loop(interval=30.0))
         log.info("Bot auto-started on startup")
     else:
         log.warning("Could not connect — check .env credentials")
+    yield
+    # shutdown
+    bot.running = False
+    if _bot_task and not _bot_task.done():
+        _bot_task.cancel()
+
+app = FastAPI(title="Polymarket Bot", lifespan=lifespan)
+
+# Restrict CORS to same-host origins only (nginx serves the frontend)
+_ALLOWED_ORIGINS = [
+    "http://localhost",
+    "http://localhost:80",
+    "http://localhost:8000",
+    f"http://{os.getenv('SERVER_HOST', '159.65.201.165')}",
+    f"https://{os.getenv('SERVER_HOST', '159.65.201.165')}",
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+# ── API key auth (protects all write endpoints) ───────────────────────────────
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def require_api_key(key: str = Depends(_api_key_header)):
+    if not key or not _sec_compare(key, API_SECRET_KEY):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key")
+
+def _sec_compare(a: str, b: str) -> bool:
+    """Constant-time comparison to prevent timing attacks."""
+    import hmac
+    return hmac.compare_digest(a.encode(), b.encode())
 
 
 @app.get("/status")
@@ -1204,16 +1404,17 @@ def portfolio():
     })
 
 
-@app.post("/start")
+@app.post("/start", dependencies=[Depends(require_api_key)])
 async def start_bot(interval: float = 30.0):
     global _bot_task
     if bot.running:
         return {"ok": False, "message": "Already running"}
+    interval = max(10.0, min(interval, 300.0))  # clamp to [10s, 5min]
     _bot_task = asyncio.create_task(bot.run_loop(interval=interval))
     return {"ok": True, "message": "Bot started"}
 
 
-@app.post("/stop")
+@app.post("/stop", dependencies=[Depends(require_api_key)])
 def stop_bot():
     bot.stop()
     return {"ok": True, "message": "Bot stopped"}
@@ -1226,20 +1427,36 @@ def markets():
 
 @app.get("/orderbook/{token_id}")
 def orderbook(token_id: str):
+    import re
+    if not re.fullmatch(r"[0-9a-fA-F]{1,80}", token_id):
+        raise HTTPException(status_code=400, detail="Invalid token_id")
     return JSONResponse(bot.get_orderbook(token_id) or {})
 
 
-@app.post("/trade")
+_VALID_SIDES = {"BUY", "SELL", "YES", "NO"}
+
+@app.post("/trade", dependencies=[Depends(require_api_key)])
 async def manual_trade(token_id: str, side: str, amount: float, order_type: str = "market", price: float = 0.0):
-    if order_type == "limit" and price > 0:
-        result = bot.place_limit_order(token_id, side, price, amount)
+    import re
+    if not re.fullmatch(r"[0-9a-fA-F]{1,80}", token_id):
+        raise HTTPException(status_code=400, detail="Invalid token_id")
+    if side.upper() not in _VALID_SIDES:
+        raise HTTPException(status_code=400, detail="side must be BUY or SELL")
+    if not (0.01 <= amount <= MAX_ORDER_SIZE * 2):
+        raise HTTPException(status_code=400, detail=f"amount must be between $0.01 and ${MAX_ORDER_SIZE*2}")
+    if order_type not in ("market", "limit"):
+        raise HTTPException(status_code=400, detail="order_type must be 'market' or 'limit'")
+    if order_type == "limit":
+        if not (0.001 <= price <= 0.999):
+            raise HTTPException(status_code=400, detail="limit price must be between 0.001 and 0.999")
+        result = bot.place_limit_order(token_id, side.upper(), price, amount)
     else:
-        result = bot.place_market_order(token_id, side, amount)
+        result = bot.place_market_order(token_id, side.upper(), amount)
     await bot._broadcast_state()
     return JSONResponse(result)
 
 
-@app.post("/cancel")
+@app.post("/cancel", dependencies=[Depends(require_api_key)])
 def cancel_all():
     bot.cancel_all_orders()
     return {"ok": True}
@@ -1382,13 +1599,34 @@ def macro_data():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    # Require auth key in the first message before allowing write commands
+    _ws_authed = False
     bot.ws_clients.append(websocket)
     try:
         await websocket.send_text(json.dumps(bot.get_state()))
         while True:
             msg = await websocket.receive_text()
-            data = json.loads(msg)
-            cmd = data.get("cmd")
+            try:
+                data = json.loads(msg)
+            except (json.JSONDecodeError, ValueError):
+                await websocket.send_text(json.dumps({"error": "invalid JSON"}))
+                continue
+            cmd = data.get("cmd", "")
+
+            # Auth handshake: client sends {"cmd":"auth","key":"..."}
+            if cmd == "auth":
+                if _sec_compare(str(data.get("key", "")), API_SECRET_KEY):
+                    _ws_authed = True
+                    await websocket.send_text(json.dumps({"ok": True, "authed": True}))
+                else:
+                    await websocket.send_text(json.dumps({"error": "unauthorized"}))
+                continue
+
+            # All state-changing commands require auth
+            if cmd in ("start", "stop", "trade") and not _ws_authed:
+                await websocket.send_text(json.dumps({"error": "unauthorized — send auth first"}))
+                continue
+
             if cmd == "start":
                 global _bot_task
                 if not bot.running:
@@ -1396,8 +1634,22 @@ async def websocket_endpoint(websocket: WebSocket):
             elif cmd == "stop":
                 bot.stop()
             elif cmd == "trade":
-                bot.place_market_order(data["token_id"], data["side"], data["amount"])
+                import re
+                tid  = str(data.get("token_id", ""))
+                side = str(data.get("side", "")).upper()
+                try:
+                    amt = float(data.get("amount", 0))
+                except (TypeError, ValueError):
+                    amt = 0
+                if (re.fullmatch(r"[0-9a-fA-F]{1,80}", tid)
+                        and side in _VALID_SIDES
+                        and 0.01 <= amt <= MAX_ORDER_SIZE * 2):
+                    await asyncio.to_thread(bot.place_market_order, tid, side, amt)
+                else:
+                    await websocket.send_text(json.dumps({"error": "invalid trade params"}))
     except WebSocketDisconnect:
+        pass
+    finally:
         if websocket in bot.ws_clients:
             bot.ws_clients.remove(websocket)
 

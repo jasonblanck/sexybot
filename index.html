@@ -96,6 +96,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
         <div class="stat-row" style="margin-top:8px"><span class="stat-lbl">Strategy</span><span class="stat-val o" id="strat">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Mode</span><span class="stat-val" id="mode">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Status</span><span class="stat-val" id="bstatus">—</span></div>
+        <div class="stat-row"><span class="stat-lbl">Volatility</span><span class="stat-val" id="vol-state">—</span></div>
+        <div class="stat-row"><span class="stat-lbl">Gas (Polygon)</span><span class="stat-val" id="gas-state">—</span></div>
       </div>
     </div>
     <div class="panel">
@@ -207,6 +209,8 @@ const BOT=`http://${location.hostname}:8000`;
 const FRED_KEY='a7a711149313765fd1e93c1b81acb004';
 const WEATHER_KEY='9VYbq9ve3p9X6tke';
 let pnlChart=null,allTrades=[],activeFilter='1D';
+// XSS sanitizer — escapes all user-origin strings before innerHTML injection
+function safeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 setInterval(()=>{document.getElementById('clock').textContent=new Date().toLocaleTimeString('en-US',{hour12:false});},1000);
 function fmt$(n){return '$'+Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
 function setFilter(f,btn){activeFilter=f;[btn.closest('div').querySelectorAll('.cf')].forEach(grp=>grp.forEach(b=>b.classList.remove('on')));btn.classList.add('on');renderChart();}
@@ -251,6 +255,9 @@ async function fetchBot(){
     if(d.balance!=null){document.getElementById('cash-balance').textContent=fmt$(d.balance);}
     if(d.portfolio_value!=null){document.getElementById('port-val').textContent=fmt$(d.portfolio_value);}
     document.getElementById('port-sub').textContent='cash '+fmt$(d.balance||0)+' + positions '+fmt$(d.positions_value||0);
+    // Volatility & gas
+    if(d.volatility){const vc={'normal':'g','elevated':'y','high':'o','extreme':'r'};const vl=d.volatility;document.getElementById('vol-state').innerHTML=`<span class="${vc[vl]||'y'}">⚡ ${vl.toUpperCase()}</span>`;}
+    if(d.gas&&d.gas.gwei!=null){const g=d.gas;const gc=g.multiplier>=4?'r':g.multiplier>=2.5?'o':g.multiplier>=1.5?'y':'g';document.getElementById('gas-state').innerHTML=`<span class="${gc}">${g.gwei} gwei · ${g.multiplier}x</span>`;}
     const filled=trades.filter(t=>t.status==='matched'||t.status==='simulated');
     const wr=trades.length>0?Math.round(filled.length/trades.length*100):0;
     document.getElementById('winrate').textContent=wr+'%';
@@ -258,7 +265,7 @@ async function fetchBot(){
     updateChart(trades);
     const sigs=d.signals||[];
     document.getElementById('sig-count').textContent=sigs.length;
-    if(sigs.length>0){document.getElementById('sig-feed').innerHTML=sigs.slice(-25).reverse().map(s=>{const isY=s.signal&&s.signal.includes('YES');const slug=(s.market||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,60);return`<div class="feed-item"><span class="badge ${isY?'badge-y':'badge-n'}">${isY?'YES':'NO'}</span><span class="feed-mkt"><a href="https://polymarket.com/event/${slug}" target="_blank" style="color:inherit;text-decoration:none">${(s.market||'').slice(0,56)}${(s.market||'').length>56?'…':''}</a></span><span class="feed-conf">${s.confidence||0}%</span></div>`;}).join('');}
+    if(sigs.length>0){document.getElementById('sig-feed').innerHTML=sigs.slice(-25).reverse().map(s=>{const isY=s.signal&&s.signal.includes('YES');const slug=(s.market||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,60);const mkt=safeHtml(s.market||'');return`<div class="feed-item"><span class="badge ${isY?'badge-y':'badge-n'}">${isY?'YES':'NO'}</span><span class="feed-mkt"><a href="https://polymarket.com/event/${safeHtml(slug)}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:none">${mkt.slice(0,56)}${mkt.length>56?'…':''}</a></span><span class="feed-conf">${safeHtml(String(s.confidence||0))}%</span></div>`;}).join('');}
     // Update open positions
 const positions = good.slice(0,10);
 document.getElementById('pos-count').textContent = positions.length;
@@ -273,9 +280,9 @@ if(positions.length > 0){
     </div>`;
   }).join('');
 }
-if(trades.length>0){document.getElementById('tlog').innerHTML=trades.slice(-25).reverse().map(t=>{const isY=t.side==='YES'||t.side==='BUY';return`<div class="tlog-item"><span class="tlog-mkt">${(t.market||'').slice(0,36)}…</span><span class="badge ${isY?'badge-y':'badge-n'}">${t.side||'BUY'}</span><span class="tlog-amt">${fmt$(t.amount_usdc||t.amount||0)}</span></div>`;}).join('');}
+if(trades.length>0){document.getElementById('tlog').innerHTML=trades.slice(-25).reverse().map(t=>{const isY=t.side==='YES'||t.side==='BUY';return`<div class="tlog-item"><span class="tlog-mkt">${safeHtml((t.market||'').slice(0,36))}…</span><span class="badge ${isY?'badge-y':'badge-n'}">${safeHtml(t.side||'BUY')}</span><span class="tlog-amt">${fmt$(t.amount_usdc||t.amount||0)}</span></div>`;}).join('');}
     const logs=d.log||[];
-    if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(line=>{let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return`<div class="${c}">${line}</div>`;}).join('');}
+    if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(line=>{let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return`<div class="${c}">${safeHtml(line)}</div>`;}).join('');}
   }catch(e){document.getElementById('sdot').className='dot off';document.getElementById('stext').textContent='offline';}
 }
 async function fetchMarkets(){
@@ -407,12 +414,15 @@ async function fetchMarketData(){
     }
   }catch(e){}
 }
+const WS_API_KEY=sessionStorage.getItem('sb_key')||'';
 function connectWS(){
   const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+'/ws');
   ws.onmessage=function(e){
-    try{applyState(JSON.parse(e.data));}catch(err){}
+    try{const d=JSON.parse(e.data);if(d.error&&!d.authed)return;applyState(d);}catch(err){}
   };
-  ws.onopen=function(){console.log('WS connected');};
+  ws.onopen=function(){
+    if(WS_API_KEY)ws.send(JSON.stringify({cmd:'auth',key:WS_API_KEY}));
+  };
   ws.onclose=function(){setTimeout(connectWS,3000);};
   ws.onerror=function(){ws.close();};
 }
@@ -430,12 +440,14 @@ function applyState(d){
   document.getElementById('deployed').textContent=fmt$(invested);
   if(d.balance!=null){document.getElementById('cash-balance').textContent=fmt$(d.balance);}
   if(d.portfolio_value!=null){document.getElementById('port-val').textContent=fmt$(d.portfolio_value);document.getElementById('port-sub').textContent='cash '+fmt$(d.balance||0)+' + positions '+fmt$(d.positions_value||0);}
+  if(d.volatility){const vc={'normal':'g','elevated':'y','high':'o','extreme':'r'};const vl=d.volatility;document.getElementById('vol-state').innerHTML=`<span class="${vc[vl]||'y'}">⚡ ${vl.toUpperCase()}</span>`;}
+  if(d.gas&&d.gas.gwei!=null){const g=d.gas;const gc=g.multiplier>=4?'r':g.multiplier>=2.5?'o':g.multiplier>=1.5?'y':'g';document.getElementById('gas-state').innerHTML=`<span class="${gc}">${g.gwei} gwei · ${g.multiplier}x</span>`;}
   const sigs=d.signals||[];
   document.getElementById('sig-count').textContent=sigs.length;
   if(sigs.length>0){document.getElementById('sig-feed').innerHTML=sigs.slice(-25).reverse().map(function(s){const isY=s.signal&&s.signal.includes('YES');return'<div class="feed-item"><span class="badge '+(isY?'badge-y':'badge-n')+'">'+(isY?'YES':'NO')+'</span><span class="feed-mkt">'+(s.market||'').slice(0,56)+'</span><span class="feed-conf">'+(s.confidence||0)+'%</span></div>';}).join('');}
-  if(trades.length>0){document.getElementById('tlog').innerHTML=trades.slice(-25).reverse().map(function(t){const isY=t.side==='YES'||t.side==='BUY';return'<div class="tlog-item"><span class="tlog-mkt">'+(t.market||'').slice(0,36)+'...</span><span class="badge '+(isY?'badge-y':'badge-n')+'">'+(t.side||'BUY')+'</span><span class="tlog-amt">'+fmt$(t.amount_usdc||t.amount||0)+'</span></div>';}).join('');}
+  if(trades.length>0){document.getElementById('tlog').innerHTML=trades.slice(-25).reverse().map(function(t){const isY=t.side==='YES'||t.side==='BUY';return'<div class="tlog-item"><span class="tlog-mkt">'+safeHtml((t.market||'').slice(0,36))+'...</span><span class="badge '+(isY?'badge-y':'badge-n')+'">'+safeHtml(t.side||'BUY')+'</span><span class="tlog-amt">'+fmt$(t.amount_usdc||t.amount||0)+'</span></div>';}).join('');}
   const logs=d.log||[];
-  if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(function(line){let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return'<div class="'+c+'">'+line+'</div>';}).join('');}
+  if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(function(line){let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return'<div class="'+c+'">'+safeHtml(line)+'</div>';}).join('');}
   updateChart(trades);
 }
 let miniPnlChart=null;
@@ -506,6 +518,130 @@ async function fetchFMP(){
 connectWS();fetchBot();fetchIndices();fetchMarketData();fetchPortfolio();fetchMarkets();fetchFMP();
 setInterval(fetchPortfolio,30000);setInterval(fetchMarkets,60000);setInterval(fetchFMP,300000);
 </script>
+<!-- ── POSITION SIZER ───────────────────────────────────────────────── -->
+<div style="background:var(--panel);border-top:1px solid var(--border2);padding:20px 24px 24px;">
+  <div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+    <div>
+      <div style="font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--accent);margin-bottom:4px;">POSITION SIZER</div>
+      <div style="font-size:11px;color:var(--text2)" id="ps-verdict">Enter values below to size a trade.</div>
+    </div>
+    <div style="display:flex;gap:28px;align-items:center;">
+      <div style="text-align:center">
+        <div style="font-family:var(--mono);font-size:9px;letter-spacing:1px;color:var(--text3);margin-bottom:3px;">EDGE</div>
+        <div style="font-family:var(--mono);font-size:18px;font-weight:500;" id="ps-edge">—</div>
+      </div>
+      <div style="text-align:center">
+        <div style="font-family:var(--mono);font-size:9px;letter-spacing:1px;color:var(--text3);margin-bottom:3px;">EV/SHARE</div>
+        <div style="font-family:var(--mono);font-size:18px;font-weight:500;" id="ps-ev">—</div>
+      </div>
+      <div style="text-align:center">
+        <div style="font-family:var(--mono);font-size:9px;letter-spacing:1px;color:var(--text3);margin-bottom:3px;">RAW KELLY</div>
+        <div style="font-family:var(--mono);font-size:18px;font-weight:500;" id="ps-kelly-raw">—</div>
+      </div>
+      <div style="text-align:center">
+        <div style="font-family:var(--mono);font-size:9px;letter-spacing:1px;color:var(--text3);margin-bottom:3px;">REC. BET</div>
+        <div style="font-family:var(--mono);font-size:22px;font-weight:500;color:var(--accent);" id="ps-rec">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bar visualization -->
+  <div style="background:#0a0a0a;border:1px solid var(--border2);border-radius:6px;padding:20px 20px 14px;margin-bottom:16px;">
+    <div style="font-family:var(--mono);font-size:11px;font-weight:500;text-align:center;margin-bottom:16px;letter-spacing:1px;">RECOMMENDED ALLOCATION</div>
+    <div style="position:relative;height:48px;margin-bottom:8px;">
+      <!-- label bubble -->
+      <div id="ps-label-bubble" style="position:absolute;top:0;transform:translateX(-50%);left:0%;transition:left 0.3s ease;">
+        <div style="background:transparent;border:1px solid var(--text3);border-radius:20px;padding:2px 8px;font-family:var(--mono);font-size:9px;color:var(--text2);white-space:nowrap;" id="ps-pct-label">0% OF BANKROLL</div>
+        <div style="width:1px;height:8px;background:var(--text3);margin:0 auto;"></div>
+      </div>
+      <!-- bar track -->
+      <div style="position:absolute;bottom:0;left:0;right:0;height:28px;background:#1a1a1a;border-radius:4px;overflow:hidden;">
+        <div id="ps-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#3b82f6,#60a5fa);border-radius:4px;transition:width 0.3s ease;"></div>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--text3);margin-bottom:16px;">
+      <span>$0</span><span id="ps-bankroll-label">$10,000</span>
+    </div>
+    <div style="text-align:center;">
+      <div style="font-size:11px;color:var(--text3);margin-bottom:4px;">⬡ recommended bet</div>
+      <div style="font-family:var(--mono);font-size:32px;font-weight:500;letter-spacing:-1px;" id="ps-rec-big">$—</div>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px 24px;align-items:center;">
+    <div style="display:flex;align-items:center;gap:10px;">
+      <label style="font-size:11px;color:var(--text2);white-space:nowrap;min-width:130px;">Total Bankroll ($)</label>
+      <input id="ps-bankroll" type="number" value="10000" min="1" step="100"
+        style="flex:1;background:#1a1a1a;border:1px solid var(--border2);color:var(--text);font-family:var(--mono);font-size:12px;padding:6px 10px;border-radius:4px;outline:none;"
+        oninput="psCalc()">
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <label style="font-size:11px;color:var(--text2);white-space:nowrap;min-width:110px;">Market Price</label>
+      <input id="ps-price-slider" type="range" min="0.01" max="0.99" step="0.01" value="0.40"
+        style="flex:1;accent-color:#3b82f6;cursor:pointer;" oninput="psCalc()">
+      <div style="background:#1a1a1a;border:1px solid var(--border2);border-radius:4px;padding:5px 8px;font-family:var(--mono);font-size:12px;min-width:42px;text-align:center;" id="ps-price-val">0.40</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <label style="font-size:11px;color:var(--text2);white-space:nowrap;min-width:130px;">LLM Confidence</label>
+      <input id="ps-conf-slider" type="range" min="0.01" max="0.99" step="0.01" value="0.55"
+        style="flex:1;accent-color:#3b82f6;cursor:pointer;" oninput="psCalc()">
+      <div style="background:#1a1a1a;border:1px solid var(--border2);border-radius:4px;padding:5px 8px;font-family:var(--mono);font-size:12px;min-width:42px;text-align:center;" id="ps-conf-val">0.55</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <label style="font-size:11px;color:var(--text2);white-space:nowrap;min-width:110px;">Kelly Multiplier</label>
+      <input id="ps-mult" type="number" value="0.25" min="0.05" max="1" step="0.05"
+        style="flex:1;background:#1a1a1a;border:1px solid var(--border2);color:var(--text);font-family:var(--mono);font-size:12px;padding:6px 10px;border-radius:4px;outline:none;"
+        oninput="psCalc()">
+    </div>
+  </div>
+</div>
+
+<script>
+function psCalc(){
+  const bankroll = parseFloat(document.getElementById('ps-bankroll').value)||10000;
+  const price    = parseFloat(document.getElementById('ps-price-slider').value)||0.4;
+  const conf     = parseFloat(document.getElementById('ps-conf-slider').value)||0.55;
+  const mult     = parseFloat(document.getElementById('ps-mult').value)||0.25;
+  document.getElementById('ps-price-val').textContent = price.toFixed(2);
+  document.getElementById('ps-conf-val').textContent  = conf.toFixed(2);
+  document.getElementById('ps-bankroll-label').textContent = '$'+Number(bankroll).toLocaleString();
+
+  const edge    = conf - price;
+  const evShare = edge; // EV = p*1 - price = conf - price
+  const b       = (1 - price) / price;  // profit ratio per $1 wagered
+  const q       = 1 - conf;
+  const kellyF  = conf - (q / b);       // raw Kelly fraction
+  const frac    = kellyF * mult;        // fractional Kelly
+  const recBet  = kellyF > 0.01 ? Math.min(bankroll * frac, bankroll * 0.20) : 0;
+  const pctOfBankroll = bankroll > 0 ? (recBet / bankroll * 100) : 0;
+  const barPct  = Math.min(pctOfBankroll, 100);
+
+  // Update stats row
+  const edgeCls  = edge>0?'color:#00cc66':edge<0?'color:#ff3355':'color:#999';
+  document.getElementById('ps-edge').innerHTML    = `<span style="${edgeCls}">${(edge*100).toFixed(1)}%</span>`;
+  document.getElementById('ps-ev').innerHTML      = `<span style="${edgeCls}">\$${evShare.toFixed(2)}</span>`;
+  document.getElementById('ps-kelly-raw').textContent = (kellyF*100).toFixed(1)+'%';
+  const recFmt = '$'+recBet.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  document.getElementById('ps-rec').textContent  = kellyF>0.01?recFmt:'$0.00';
+  document.getElementById('ps-rec-big').textContent = kellyF>0.01?'$'+Math.round(recBet).toLocaleString():'$0';
+
+  // Bar
+  document.getElementById('ps-bar').style.width = barPct+'%';
+  document.getElementById('ps-label-bubble').style.left = Math.min(barPct,95)+'%';
+  document.getElementById('ps-pct-label').textContent = pctOfBankroll.toFixed(2)+'% OF BANKROLL';
+
+  // Verdict
+  let verdict, vcls;
+  if(kellyF<=0.01)      { verdict='No edge — skip this trade.';       vcls='color:#ff3355'; }
+  else if(edge>=0.15)   { verdict='Strong edge — trade looks great.'; vcls='color:#00cc66'; }
+  else if(edge>=0.08)   { verdict='Decent edge — trade looks favorable.'; vcls='color:#99cc00'; }
+  else                  { verdict='Marginal edge — proceed with caution.'; vcls='color:#ff9900'; }
+  document.getElementById('ps-verdict').innerHTML=`<span style="${vcls}">${verdict}</span>`;
+}
+psCalc();
+</script>
+
 <div id="kill-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:500;align-items:center;justify-content:center;">
   <div style="background:#111;border:1px solid #2a2a2a;border-radius:8px;padding:28px;width:340px;text-align:center;">
     <div style="font-size:24px;margin-bottom:10px;">☠</div>
