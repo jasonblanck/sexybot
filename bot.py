@@ -205,7 +205,9 @@ class PolymarketBot:
 
     def has_position(self, token_id: str) -> bool:
         try:
-            cur = self.db.execute("SELECT 1 FROM positions WHERE token_id=?", (token_id,))
+            # In paper mode check paper_positions; in live mode check live positions
+            table = "paper_positions" if (PAPER_MODE and self.paper) else "positions"
+            cur = self.db.execute(f"SELECT 1 FROM {table} WHERE token_id=?", (token_id,))
             return cur.fetchone() is not None
         except Exception as e:
             log.warning(f"has_position DB error (token_id={token_id[:16]}…): {e}")
@@ -1659,10 +1661,11 @@ async def manual_trade(
         except Exception as e:
             log.debug(f"idempotency lookup failed: {e}")
 
-    if order_type == "limit":
-        result = bot.place_limit_order(token_id, side.upper(), price, amount)
-    else:
-        result = bot.place_market_order(token_id, side.upper(), amount)
+    # Route through _execute_order so PAPER_MODE is respected even for manual trades
+    result = await bot._execute_order(
+        token_id, side.upper(), amount, "",
+        order_type, price, amount
+    )
 
     # Persist idempotency key so retries within 24h return the same result
     if x_idempotency_key:
@@ -1883,7 +1886,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if (_TOKEN_ID_RE.fullmatch(tid)
                         and side in _VALID_SIDES
                         and 0.01 <= amt <= MAX_ORDER_SIZE * 2):
-                    await asyncio.to_thread(bot.place_market_order, tid, side, amt)
+                    await bot._execute_order(tid, side, amt)
                 else:
                     await websocket.send_text(json.dumps({"error": "invalid trade params"}))
     except WebSocketDisconnect:
