@@ -99,11 +99,11 @@ class PolymarketPaperHandler:
         return float(row[0]) if row else 0.0
 
     def _adjust_balance(self, delta: float):
-        current = self.get_balance()
+        # Single atomic SQL UPDATE — avoids read-modify-write race if called concurrently
         with self.db:
             self.db.execute(
-                "INSERT OR REPLACE INTO paper_settings (key, value) VALUES ('balance', ?)",
-                (str(round(current + delta, 6)),)
+                "UPDATE paper_settings SET value = CAST(ROUND(CAST(value AS REAL) + ?, 6) AS TEXT) WHERE key='balance'",
+                (delta,)
             )
 
     # ── CLOB data ─────────────────────────────────────────────────────────────

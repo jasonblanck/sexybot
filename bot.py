@@ -1609,6 +1609,13 @@ async def start_bot(interval: float = 30.0):
     interval = max(10.0, min(interval, 300.0))  # clamp to [10s, 5min]
     bot.running = True  # set before task creation to prevent double-start race
     _bot_task = asyncio.create_task(bot.run_loop(interval=interval))
+    if PAPER_MODE and _PAPER_AVAILABLE:
+        # Lazy-init paper handler if connect() never ran (e.g. bot started via API after startup failure)
+        if not bot.paper and hasattr(bot, 'db'):
+            bot.paper = PolymarketPaperHandler(bot.db, PAPER_BALANCE)
+        if bot.paper:
+            asyncio.create_task(_paper_oracle(bot.paper))
+            log.info("[PAPER] Resolution oracle restarted")
     return {"ok": True, "message": "Bot started"}
 
 
@@ -1874,6 +1881,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not bot.running:
                     bot.running = True  # set before task creation to prevent double-start race
                     _bot_task = asyncio.create_task(bot.run_loop())
+                    if PAPER_MODE and _PAPER_AVAILABLE and bot.paper:
+                        asyncio.create_task(_paper_oracle(bot.paper))
             elif cmd == "stop":
                 bot.stop()
             elif cmd == "trade":
