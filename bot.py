@@ -119,6 +119,21 @@ class PolymarketBot:
             self.db.execute(
                 "DELETE FROM idempotency_keys WHERE datetime(created) < datetime('now', '-24 hours')"
             )
+        # Restore recent trade history into memory so the dashboard shows history after restart
+        try:
+            rows = self.db.execute(
+                "SELECT market,side,amount,price,shares,order_type,status,order_id,dry_run,time "
+                "FROM trades ORDER BY id DESC LIMIT 1000"
+            ).fetchall()
+            self.trades = [
+                {"market": r[0], "side": r[1], "amount_usdc": r[2], "price": r[3],
+                 "shares": r[4], "type": r[5], "status": r[6], "order_id": r[7],
+                 "dry_run": bool(r[8]), "time": r[9]}
+                for r in reversed(rows)
+            ]
+            log.info(f"Loaded {len(self.trades)} trades from DB into memory")
+        except Exception as e:
+            log.warning(f"Could not restore trades from DB: {e}")
 
     def _trade_row(self, trade: dict) -> tuple:
         """Return the values tuple for a trades INSERT. Single source of truth for column order."""

@@ -516,7 +516,7 @@ async function fetchFMP(){
   }catch(e){console.error('fetchFMP',e);}
 }
 connectWS();fetchBot();fetchIndices();fetchMarketData();fetchPortfolio();fetchMarkets();fetchFMP();
-setInterval(fetchPortfolio,30000);setInterval(fetchMarkets,60000);setInterval(fetchFMP,300000);
+setInterval(fetchBot,15000);setInterval(fetchPortfolio,30000);setInterval(fetchMarkets,60000);setInterval(fetchFMP,300000);
 </script>
 <!-- ── POSITION SIZER ───────────────────────────────────────────────── -->
 <div style="background:var(--panel);border-top:1px solid var(--border2);padding:20px 24px 24px;">
