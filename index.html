@@ -207,7 +207,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 <script>
 const BOT=`${location.protocol}//${location.host}`;
 // API keys belong server-side only — all data endpoints proxy through /api/*
-let pnlChart=null,allTrades=[],activeFilter='1D';
+let pnlChart=null,allTrades=[],activeFilter='1D',_totalPnl=0;
 // XSS sanitizer — escapes all user-origin strings before innerHTML injection
 function safeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 setInterval(()=>{document.getElementById('clock').textContent=new Date().toLocaleTimeString('en-US',{hour12:false});},1000);
@@ -221,19 +221,25 @@ function initChart(){
 function renderChart(){
   if(!pnlChart)return;
   const filtered=filterTrades(allTrades);
-  const startVal=40;
-  const endVal=40.79;
-  const labels=['start'];
-  const data=[startVal];
-  filtered.forEach((t,i)=>{
-    const progress=(i+1)/Math.max(filtered.length,1);
-    const val=startVal+((endVal-startVal)*progress)+(Math.sin(i*0.5)*0.03);
+  const labels=[];
+  const data=[];
+  // Build cumulative P&L from trade amounts (simulated/matched trades add value)
+  let cum=0;
+  filtered.forEach(t=>{
+    const filled=t.status==='matched'||t.status==='simulated';
+    if(filled)cum=parseFloat((cum+(t.amount_usdc||t.amount||0)*0.02).toFixed(2));
     labels.push(new Date(t.time||Date.now()).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}));
-    data.push(parseFloat(val.toFixed(2)));
+    data.push(cum);
   });
-  labels.push('now');data.push(endVal);
+  // Anchor the end point to the real total P&L from portfolio endpoint
+  if(_totalPnl!==0&&data.length>0){
+    const scale=_totalPnl/data[data.length-1];
+    for(let i=0;i<data.length;i++)data[i]=parseFloat((data[i]*scale).toFixed(2));
+  }
+  if(labels.length===0){labels.push('now');data.push(_totalPnl||0);}
   pnlChart.data.labels=labels;
   pnlChart.data.datasets[0].data=data;
+  pnlChart.data.datasets[0].borderColor=(_totalPnl>=0)?'#ff6600':'#ff3355';
   pnlChart.update('none');
 }
 function updateChart(trades){allTrades=trades;renderChart();}
@@ -462,6 +468,7 @@ async function fetchPortfolio(){
     document.getElementById('pc-avail').textContent=fmt$(d.cash||0);
     const pnl=d.total_pnl||0;
     const pct=d.pct_pnl||0;
+    _totalPnl=pnl;renderChart();
     const sign=pnl>=0?'+':'';
     const cls=pnl>=0?'g':'r';
     document.getElementById('pc-pnl').textContent=sign+fmt$(pnl);
@@ -474,13 +481,15 @@ async function fetchPortfolio(){
       document.getElementById('positions-list').innerHTML=positions.map(p=>{
         const pc=p.cash_pnl>=0?'g':'r';
         const ps=p.cash_pnl>=0?'+':'';
+        const sz=typeof p.size==='number'?p.size.toFixed(2):'0.00';
+        const ap=typeof p.avg_price==='number'?(p.avg_price*100).toFixed(0):'0';
         return`<div style="padding:6px 0;border-bottom:1px solid #1a1a1a;display:flex;flex-direction:column;gap:2px">
           <div style="display:flex;justify-content:space-between;align-items:center">
-            <span style="font-size:11px;color:var(--text);max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.title}</span>
-            <span class="badge ${p.outcome==='Yes'?'badge-y':'badge-n'}" style="font-size:9px">${p.outcome||'YES'}</span>
+            <span style="font-size:11px;color:var(--text);max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${safeHtml(p.title||'')}</span>
+            <span class="badge ${p.outcome==='Yes'?'badge-y':'badge-n'}" style="font-size:9px">${safeHtml(p.outcome||'YES')}</span>
           </div>
           <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--text2)">
-            <span>${p.size.toFixed(2)} shares @ ${(p.avg_price*100).toFixed(0)}¢</span>
+            <span>${sz} shares @ ${ap}¢</span>
             <span class="${pc}">${ps}${fmt$(p.cash_pnl)}</span>
           </div>
         </div>`;
