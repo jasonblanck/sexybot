@@ -165,14 +165,16 @@ class PolymarketBot:
                 (f"{today}%",))
             total = cur.fetchone()[0] or 0
             return float(total)
-        except:
+        except Exception as e:
+            log.warning(f"get_daily_loss DB error: {e}")
             return 0.0
 
     def has_position(self, token_id: str) -> bool:
         try:
             cur = self.db.execute("SELECT 1 FROM positions WHERE token_id=?", (token_id,))
             return cur.fetchone() is not None
-        except:
+        except Exception as e:
+            log.warning(f"has_position DB error (token_id={token_id[:16]}…): {e}")
             return False
 
     def _sync_positions(self, active_token_ids: set):
@@ -264,14 +266,16 @@ class PolymarketBot:
         try:
             mp = self.client.get_midpoint(token_id)
             return float(mp.get("mid", 0))
-        except Exception:
+        except Exception as e:
+            log.debug(f"get_midpoint failed (token={token_id[:16]}…): {e}")
             return None
 
     def get_spread(self, token_id: str) -> Optional[float]:
         try:
             sp = self.client.get_spread(token_id)
             return float(sp.get("spread", 0))
-        except Exception:
+        except Exception as e:
+            log.debug(f"get_spread failed (token={token_id[:16]}…): {e}")
             return None
 
     def get_orderbook(self, token_id: str) -> Optional[dict]:
@@ -310,8 +314,8 @@ class PolymarketBot:
                 result["order_id"] = resp.get("orderID")
                 self._log(f"ORDER: {side} ${amount_usdc:.2f} → {result['order_id']} {result['status']}")
             except Exception as e:
-                result["status"] = f"error: {e}"
-                self._log(f"Order failed: {e}", "error")
+                result["status"] = "error"
+                self._log(f"Order failed (token={token_id[:16]}… side={side} amt={amount_usdc}): {e}", "error")
         self.trades.append(result)
         if len(self.trades) > 1000:
             self.trades = self.trades[-1000:]
@@ -346,8 +350,8 @@ class PolymarketBot:
                 result["order_id"] = resp.get("orderID")
                 self._log(f"LIMIT: {side} {size}@{price:.4f} → {result['order_id']} {result['status']}")
             except Exception as e:
-                result["status"] = f"error: {e}"
-                self._log(f"Limit order failed: {e}", "error")
+                result["status"] = "error"
+                self._log(f"Limit order failed (token={token_id[:16]}… side={side} price={price} size={size}): {e}", "error")
         self.trades.append(result)
         if len(self.trades) > 1000:
             self.trades = self.trades[-1000:]
@@ -430,7 +434,8 @@ class PolymarketBot:
             with _ureq.urlopen(url, timeout=5) as r:
                 d = _j.loads(r.read())
                 rate = float(d["observations"][0]["value"])
-        except:
+        except Exception as e:
+            log.warning(f"FRED FEDFUNDS fetch failed, using fallback 4.5: {e}")
             rate = 4.5
         try:
             # Fetch 13 months to compute YoY % change
@@ -441,7 +446,8 @@ class PolymarketBot:
                 cpi_now = float(obs[0]["value"])
                 cpi_yr  = float(obs[12]["value"])
                 cpi = round((cpi_now - cpi_yr) / cpi_yr * 100, 2)  # YoY %
-        except:
+        except Exception as e:
+            log.warning(f"FRED CPIAUCSL fetch failed, using fallback 3.0: {e}")
             cpi = 3.0
         # VIX (updated daily by FRED — good enough for volatility scoring)
         vix = None
@@ -452,8 +458,8 @@ class PolymarketBot:
                 obs3 = [o for o in d3["observations"] if o["value"] != "."]
                 if obs3:
                     vix = float(obs3[0]["value"])
-        except:
-            pass
+        except Exception as e:
+            log.warning(f"FRED VIXCLS fetch failed, vix=None: {e}")
         self._macro_cache = {"fed_rate": rate, "cpi": cpi, "vix": vix}
         self._macro_cache_time = time.time()
         return self._macro_cache
@@ -781,7 +787,8 @@ class PolymarketBot:
                 "resolved": row[0] if row else 0,
                 "avg_brier_score": round(row[1], 4) if row and row[1] else None,
             }
-        except:
+        except Exception as e:
+            log.warning(f"get_brier_stats DB error: {e}")
             return {}
 
     def get_courtlistener_data(self, query: str) -> str:
@@ -1213,8 +1220,8 @@ Rules:
 
                     try:
                         await bot._broadcast_state()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug(f"broadcast_state error: {e}")
                     await asyncio.sleep(0.5)
 
             except Exception as e:
@@ -1225,8 +1232,10 @@ Rules:
             self._log(f"Cycle complete. Next scan in {interval}s…")
             try:
                 await asyncio.sleep(interval)
-            except Exception:
-                pass
+            except asyncio.CancelledError:
+                break  # clean shutdown signal — exit the loop
+            except Exception as e:
+                log.debug(f"run_loop sleep interrupted: {e}")
         self._log("Bot stopped.")
         await asyncio.to_thread(self.send_telegram, "Bot stopped.")
 
@@ -1269,8 +1278,8 @@ Rules:
                 if addr:
                     self._proxy_wallet = addr
                     return addr
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"get_proxy_wallet failed — position value tracking unavailable: {e}")
         return ""
 
     _balance_cache: float = 0.0
@@ -1482,6 +1491,18 @@ def _sec_compare(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode(), b.encode())
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request, exc):
+    """Catch-all: log full detail server-side, return generic 500 to client.
+    Prevents stack traces and internal paths from leaking in error responses."""
+    log.error(
+        f"Unhandled exception: {request.method} {request.url.path} — "
+        f"{type(exc).__name__}: {exc}",
+        exc_info=True,
+    )
+    return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
 @app.get("/status")
 def status():
     return JSONResponse(bot.get_state())
@@ -1661,7 +1682,8 @@ def weather_data():
         with _ureq.urlopen(url, timeout=8) as r:
             return JSONResponse(_j.loads(r.read()))
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        log.warning(f"weather fetch error: {e}")
+        return JSONResponse({"error": "Weather data unavailable"}, status_code=503)
 
 
 @app.get("/fmp")
@@ -1726,6 +1748,7 @@ def macro_data():
                 date  = obs[0]["date"]
             result.append({"id": sid, "label": label, "value": value, "date": date, "unit": unit})
         except Exception as e:
+            log.warning(f"macro endpoint: FRED series {sid} failed: {e}")
             result.append({"id": sid, "label": label, "value": None, "date": None, "unit": unit})
     return JSONResponse(result)
 
