@@ -933,7 +933,7 @@ Rules:
 - risk = "high" if outcome is binary/volatile, "low" if near-certain resolution"""
 
             msg = client.messages.create(
-                model="claude-haiku-4-5",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=200,
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -948,7 +948,7 @@ Rules:
             decision = _j.loads(text)
             return decision
         except Exception as e:
-            log.debug(f"Claude analysis error: {e}")
+            log.warning(f"Claude analysis error: {e}")
             return None
 
     def analyze(self, market: dict) -> Optional[dict]:
@@ -1057,6 +1057,7 @@ Rules:
 
         while self.running:
             try:
+                _ai_failures = 0  # circuit breaker: disable AI mid-cycle after 3 consecutive failures
                 markets = await asyncio.to_thread(self.get_markets, 30)
                 self._log(f"Scanning {len(markets)} markets…")
 
@@ -1112,7 +1113,7 @@ Rules:
                     ob_data = await asyncio.to_thread(self.get_orderbook_depth, token_id) if token_id else {}
                     predicted_prob = None  # will be set by AI or estimated below
 
-                    if ai_enabled and float(signal.get("confidence", 0)) >= 30:
+                    if ai_enabled and _ai_failures < 3 and float(signal.get("confidence", 0)) >= 30:
                         q_lower = question.lower()
                         is_legal = any(x in q_lower for x in ["indicted","trial","court","lawsuit","ruling","judge","convicted","charged","plea","verdict","sentenced"])
                         is_legislative = any(x in q_lower for x in ["bill","act","legislation","congress","senate","pass","signed","law","vote","amendment"])
@@ -1125,6 +1126,10 @@ Rules:
                             "govtrack":  await asyncio.to_thread(self.get_govtrack_data, question[:60]) if is_legislative else "",
                         }
                         ai = await self.analyze_with_claude(mkt, yes_p, research)
+                        if ai is None:
+                            _ai_failures += 1
+                            if _ai_failures >= 3:
+                                self._log("AI circuit breaker: 3 consecutive failures — skipping AI for rest of cycle", "warning")
                         if ai:
                             if ai.get("action") == "SKIP":
                                 self._log(f"AI SKIP: {question[:50]} — {ai.get('reasoning','')}")
