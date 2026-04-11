@@ -9,6 +9,10 @@ import urllib.request as _ureq
 
 load_dotenv()
 
+# Compiled once at import time — used in run_loop, orderbook route, and manual_trade route
+_TOKEN_ID_RE = _re_mod.compile(r"[0-9a-fA-F]{1,80}")
+_VALID_SIDES  = {"BUY", "SELL", "YES", "NO"}
+
 try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import (
@@ -229,7 +233,6 @@ class PolymarketBot:
                     api_secret=API_SECRET,
                     api_passphrase=API_PASSPHRASE,
                 )
-            import os
             funder = os.getenv("POLYMARKET_FUNDER", "")
             # signature_type=2 (builder/proxy wallet) required when using API creds
             sig_type = 2 if creds else 0
@@ -932,7 +935,9 @@ Rules:
 - Consider order book imbalance — if OBI strongly opposes your side, SKIP
 - risk = "high" if outcome is binary/volatile, "low" if near-certain resolution"""
 
-            msg = client.messages.create(
+            # Run blocking Anthropic SDK call in thread pool to avoid blocking the event loop
+            msg = await asyncio.to_thread(
+                client.messages.create,
                 model="claude-haiku-4-5-20251001",
                 max_tokens=200,
                 messages=[{"role": "user", "content": prompt}]
@@ -1222,19 +1227,21 @@ Rules:
                     min_conf = 55 if ai_enabled else 40
                     mkt_name = signal.get("market", question)
                     if float(signal.get("confidence", 0)) >= min_conf and signal.get("token_id"):
+                        # Use asyncio.to_thread so blocking network I/O (CLOB API calls) in
+                        # place_market_order / place_limit_order don't stall the event loop.
                         if signal["strategy"] == "arbitrage" and "BUY" in signal["signal"]:
-                            self.place_market_order(signal["token_id"], "BUY", amt / 2, mkt_name)
+                            await asyncio.to_thread(self.place_market_order, signal["token_id"], "BUY", amt / 2, mkt_name)
                             if signal.get("no_token_id"):
-                                self.place_market_order(signal["no_token_id"], "BUY", amt / 2, mkt_name)
+                                await asyncio.to_thread(self.place_market_order, signal["no_token_id"], "BUY", amt / 2, mkt_name)
                             cycle_cash -= amt  # update cycle cash after trade
                         elif signal["strategy"] == "marketMaking":
                             if signal.get("bid"):
-                                self.place_limit_order(signal["token_id"], "BUY", signal["bid"], amt)
+                                await asyncio.to_thread(self.place_limit_order, signal["token_id"], "BUY", signal["bid"], amt)
                             if signal.get("ask"):
-                                self.place_limit_order(signal["token_id"], "SELL", signal["ask"], amt)
+                                await asyncio.to_thread(self.place_limit_order, signal["token_id"], "SELL", signal["ask"], amt)
                             cycle_cash -= amt
                         elif "BUY" in signal.get("signal", ""):
-                            self.place_market_order(signal["token_id"], "BUY", amt, mkt_name)
+                            await asyncio.to_thread(self.place_market_order, signal["token_id"], "BUY", amt, mkt_name)
                             cycle_cash -= amt  # prevent over-trading in same cycle
 
                     try:
@@ -1470,6 +1477,7 @@ _bot_task: Optional[asyncio.Task] = None
 async def lifespan(app_: FastAPI):
     global _bot_task
     if bot.connect():
+        bot.running = True  # set before create_task to prevent double-start race at startup
         _bot_task = asyncio.create_task(bot.run_loop(interval=30.0))
         log.info("Bot auto-started on startup")
     else:
@@ -1575,9 +1583,6 @@ def orderbook(token_id: str):
         raise HTTPException(status_code=400, detail="Invalid token_id")
     return JSONResponse(bot.get_orderbook(token_id) or {})
 
-
-_VALID_SIDES = {"BUY", "SELL", "YES", "NO"}
-_TOKEN_ID_RE = _re_mod.compile(r"[0-9a-fA-F]{1,80}")
 
 @app.post("/trade", dependencies=[Depends(require_api_key)])
 async def manual_trade(

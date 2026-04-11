@@ -216,7 +216,7 @@ function setFilter(f,btn){activeFilter=f;[btn.closest('div').querySelectorAll('.
 function filterTrades(trades){if(activeFilter==='ALL')return trades;const now=Date.now();const w={'1D':86400000,'1W':604800000,'1M':2592000000};return trades.filter(t=>(now-new Date(t.time||0).getTime())<=(w[activeFilter]||86400000));}
 function initChart(){
   const ctx=document.getElementById('pnl-chart').getContext('2d');
-  pnlChart=new Chart(ctx,{type:'line',data:{labels:['now'],datasets:[{data:[40],borderColor:'#ff6600',backgroundColor:'rgba(255,102,0,0.08)',borderWidth:2,pointRadius:0,tension:0.4,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#444',font:{family:'DM Mono',size:9},maxTicksLimit:6},grid:{color:'#1a1a1a'}},y:{grid:{color:'#1a1a1a'},ticks:{color:'#555',font:{family:'DM Mono',size:10},callback:v=>'$'+v.toFixed(2)}}}}});
+  pnlChart=new Chart(ctx,{type:'line',data:{labels:['now'],datasets:[{data:[0],borderColor:'#ff6600',backgroundColor:'rgba(255,102,0,0.08)',borderWidth:2,pointRadius:0,tension:0.4,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#444',font:{family:'DM Mono',size:9},maxTicksLimit:6},grid:{color:'#1a1a1a'}},y:{grid:{color:'#1a1a1a'},ticks:{color:'#555',font:{family:'DM Mono',size:10},callback:v=>'$'+v.toFixed(2)}}}}});
 }
 function renderChart(){
   if(!pnlChart)return;
@@ -424,7 +424,10 @@ const WS_API_KEY=sessionStorage.getItem('sb_key')||'';
 function connectWS(){
   const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+'/ws');
   ws.onmessage=function(e){
-    try{const d=JSON.parse(e.data);if(d.error&&!d.authed)return;applyState(d);}catch(err){}
+    try{const d=JSON.parse(e.data);
+      // Skip hello and error-only messages that lack actual state data
+      if(d.connected||d.error||(!d.hasOwnProperty('running')&&!d.trades))return;
+      applyState(d);}catch(err){}
   };
   ws.onopen=function(){
     if(WS_API_KEY)ws.send(JSON.stringify({cmd:'auth',key:WS_API_KEY}));
