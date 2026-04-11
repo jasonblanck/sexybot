@@ -660,7 +660,8 @@ psCalc();
 <script>
 async function confirmKill(){
   document.getElementById('kill-overlay').style.display='none';
-  try{await fetch(`http://${location.hostname}:8000/stop`,{method:'POST'});}catch(e){}
+  const key=sessionStorage.getItem('sb_key')||'';
+  try{await fetch(`${BOT}/stop`,{method:'POST',headers:key?{'X-API-Key':key}:{}});}catch(e){}
   document.getElementById('kill-status').textContent='bot stopped';
   document.getElementById('sdot').className='dot off';
   document.getElementById('stext').textContent='stopped';

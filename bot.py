@@ -1,7 +1,7 @@
 """
 Polymarket Trading Bot — fixed for py_clob_client v0.34+
 """
-import asyncio, json, logging, os, time, sqlite3
+import asyncio, json, logging, os, time, sqlite3, re as _re_mod
 from datetime import datetime, date
 from typing import Optional
 from dotenv import load_dotenv
@@ -13,9 +13,8 @@ try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import (
         ApiCreds, OrderArgs, OrderType,
-        MarketOrderArgs, BookParams,
+        MarketOrderArgs,
     )
-    from py_clob_client.constants import POLYGON
 except ImportError as e:
     raise SystemExit(f"Missing dependency: {e}\nRun: pip install py-clob-client")
 
@@ -121,16 +120,23 @@ class PolymarketBot:
                 "DELETE FROM idempotency_keys WHERE datetime(created) < datetime('now', '-24 hours')"
             )
 
+    def _trade_row(self, trade: dict) -> tuple:
+        """Return the values tuple for a trades INSERT. Single source of truth for column order."""
+        return (
+            trade.get("market", ""), trade.get("side", ""),
+            trade.get("amount_usdc", trade.get("amount", 0)),
+            trade.get("price", 0), trade.get("shares", 0),
+            trade.get("type", "market"), trade.get("status", ""),
+            trade.get("order_id", ""), 1 if trade.get("dry_run") else 0,
+            trade.get("time", ""),
+        )
+
     def save_trade(self, trade: dict):
         try:
             with self.db:
                 self.db.execute("""INSERT INTO trades
                     (market,side,amount,price,shares,order_type,status,order_id,dry_run,time)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    (trade.get("market",""), trade.get("side",""), trade.get("amount_usdc",trade.get("amount",0)),
-                     trade.get("price",0), trade.get("shares",0), trade.get("type","market"),
-                     trade.get("status",""), trade.get("order_id",""),
-                     1 if trade.get("dry_run") else 0, trade.get("time","")))
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""", self._trade_row(trade))
         except Exception as e:
             log.warning(f"DB save failed: {e}")
 
@@ -142,13 +148,7 @@ class PolymarketBot:
             with self.db:
                 self.db.execute("""INSERT INTO trades
                     (market,side,amount,price,shares,order_type,status,order_id,dry_run,time)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    (trade.get("market",""), trade.get("side",""),
-                     trade.get("amount_usdc", trade.get("amount",0)),
-                     trade.get("price",0), trade.get("shares",0),
-                     trade.get("type","market"), trade.get("status",""),
-                     trade.get("order_id",""), 1 if trade.get("dry_run") else 0,
-                     trade.get("time","")))
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""", self._trade_row(trade))
                 if position_args:
                     tid, market, side, shares, cost = position_args
                     self.db.execute("""INSERT OR REPLACE INTO positions
@@ -159,7 +159,7 @@ class PolymarketBot:
 
     def get_daily_loss(self) -> float:
         try:
-            today = date.today().isoformat()
+            today = datetime.utcnow().strftime("%Y-%m-%d")  # match UTC stored in time column
             cur = self.db.execute(
                 "SELECT SUM(amount) FROM trades WHERE time LIKE ? AND dry_run=0 AND status NOT LIKE '%error%' AND status NOT LIKE '%match%' AND status NOT LIKE '%balance%'",
                 (f"{today}%",))
@@ -1177,7 +1177,7 @@ Rules:
                         self._log(f"EDGE SKIP: edge={raw_edge:.3f} < min={vol_min_edge:.2f} (vol={vol_state}) {question[:40]}")
                         continue
 
-                    kelly_f_full = p_true - ((1 - p_true) / ((1 - entry_price) / entry_price)) if entry_price < 1 else 0
+                    kelly_f_full = p_true - ((1 - p_true) / ((1 - entry_price) / entry_price)) if 0 < entry_price < 1 else 0
                     # Use volatility-adjusted Kelly fraction (smaller during hot markets)
                     amt = self.kelly_size(p_true, entry_price, cash, fraction=vol_kelly_fraction)
                     if amt < 0.50:
@@ -1195,9 +1195,8 @@ Rules:
                     self._log(f"KELLY: p={p_true:.3f} price={entry_price:.3f} f={kelly_f_full:.3f} → ${amt:.2f}")
 
                     # ── Execute ───────────────────────────────────────────────
-                    import re as _re_exec
                     _exec_tid = str(signal.get("token_id", ""))
-                    if not _re_exec.fullmatch(r"[0-9a-fA-F]{1,80}", _exec_tid):
+                    if not _TOKEN_ID_RE.fullmatch(_exec_tid):
                         self._log(f"SKIP: token_id from market data failed format check ({_exec_tid[:20]})", "error")
                         continue
                     min_conf = 55 if ai_enabled else 40
@@ -1426,8 +1425,9 @@ class _ResourceMiddleware(BaseHTTPMiddleware):
             _rate_buckets[ip] = [1, now]
         else:
             bucket[0] += 1
-            # Authenticated endpoints get a higher ceiling
-            is_authed = bool(request.headers.get("x-api-key"))
+            # Higher ceiling only for requests with a valid (correct) API key
+            _req_key = request.headers.get("x-api-key", "")
+            is_authed = bool(_req_key) and _sec_compare(_req_key, API_SECRET_KEY)
             limit = _RATE_MAX_AUTHED if is_authed else _RATE_MAX_PUBLIC
             if bucket[0] > limit:
                 return _SResponse("Rate limit exceeded", status_code=429,
@@ -1464,12 +1464,16 @@ app = FastAPI(title="Polymarket Bot", lifespan=lifespan)
 app.add_middleware(_ResourceMiddleware)
 
 # Restrict CORS to same-host origins only (nginx serves the frontend)
+# SERVER_HOST must be set in .env — no hardcoded fallback to avoid baking IPs in source
+_server_host = os.getenv("SERVER_HOST", "")
 _ALLOWED_ORIGINS = [
     "http://localhost",
     "http://localhost:80",
     "http://localhost:8000",
-    f"http://{os.getenv('SERVER_HOST', '159.65.201.165')}",
-    f"https://{os.getenv('SERVER_HOST', '159.65.201.165')}",
+    *(
+        [f"http://{_server_host}", f"https://{_server_host}"]
+        if _server_host else []
+    ),
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -1529,6 +1533,7 @@ async def start_bot(interval: float = 30.0):
     if bot.running:
         return {"ok": False, "message": "Already running"}
     interval = max(10.0, min(interval, 300.0))  # clamp to [10s, 5min]
+    bot.running = True  # set before task creation to prevent double-start race
     _bot_task = asyncio.create_task(bot.run_loop(interval=interval))
     return {"ok": True, "message": "Bot started"}
 
@@ -1546,13 +1551,13 @@ def markets():
 
 @app.get("/orderbook/{token_id}")
 def orderbook(token_id: str):
-    import re
-    if not re.fullmatch(r"[0-9a-fA-F]{1,80}", token_id):
+    if not _TOKEN_ID_RE.fullmatch(token_id):
         raise HTTPException(status_code=400, detail="Invalid token_id")
     return JSONResponse(bot.get_orderbook(token_id) or {})
 
 
 _VALID_SIDES = {"BUY", "SELL", "YES", "NO"}
+_TOKEN_ID_RE = _re_mod.compile(r"[0-9a-fA-F]{1,80}")
 
 @app.post("/trade", dependencies=[Depends(require_api_key)])
 async def manual_trade(
@@ -1560,9 +1565,7 @@ async def manual_trade(
     order_type: str = "market", price: float = 0.0,
     x_idempotency_key: Optional[str] = None,
 ):
-    from fastapi import Request
-    import re
-    if not re.fullmatch(r"[0-9a-fA-F]{1,80}", token_id):
+    if not _TOKEN_ID_RE.fullmatch(token_id):
         raise HTTPException(status_code=400, detail="Invalid token_id")
     if side.upper() not in _VALID_SIDES:
         raise HTTPException(status_code=400, detail="side must be BUY or SELL")
@@ -1575,7 +1578,7 @@ async def manual_trade(
 
     # Idempotency: return cached response if key was seen in the last 24h
     if x_idempotency_key:
-        if not re.fullmatch(r"[A-Za-z0-9\-_]{1,64}", x_idempotency_key):
+        if not _re_mod.fullmatch(r"[A-Za-z0-9\-_]{1,64}", x_idempotency_key):
             raise HTTPException(status_code=400, detail="X-Idempotency-Key: 1-64 alphanumeric/dash/underscore chars")
         try:
             row = bot.db.execute(
@@ -1764,7 +1767,8 @@ async def websocket_endpoint(websocket: WebSocket):
     _ws_authed = False
     bot.ws_clients.append(websocket)
     try:
-        await websocket.send_text(json.dumps(bot.get_state()))
+        # Send minimal hello — full state is sent after successful auth handshake
+        await websocket.send_text(json.dumps({"connected": True}))
         while True:
             msg = await websocket.receive_text()
             # Guard against oversized messages before any parsing
@@ -1782,7 +1786,8 @@ async def websocket_endpoint(websocket: WebSocket):
             if cmd == "auth":
                 if _sec_compare(str(data.get("key", "")), API_SECRET_KEY):
                     _ws_authed = True
-                    await websocket.send_text(json.dumps({"ok": True, "authed": True}))
+                    # Send full state now that client is authenticated
+                    await websocket.send_text(json.dumps({"ok": True, "authed": True, **bot.get_state()}))
                 else:
                     await websocket.send_text(json.dumps({"error": "unauthorized"}))
                 continue
@@ -1795,18 +1800,18 @@ async def websocket_endpoint(websocket: WebSocket):
             if cmd == "start":
                 global _bot_task
                 if not bot.running:
+                    bot.running = True  # set before task creation to prevent double-start race
                     _bot_task = asyncio.create_task(bot.run_loop())
             elif cmd == "stop":
                 bot.stop()
             elif cmd == "trade":
-                import re
                 tid  = str(data.get("token_id", ""))
                 side = str(data.get("side", "")).upper()
                 try:
                     amt = float(data.get("amount", 0))
                 except (TypeError, ValueError):
                     amt = 0
-                if (re.fullmatch(r"[0-9a-fA-F]{1,80}", tid)
+                if (_TOKEN_ID_RE.fullmatch(tid)
                         and side in _VALID_SIDES
                         and 0.01 <= amt <= MAX_ORDER_SIZE * 2):
                     await asyncio.to_thread(bot.place_market_order, tid, side, amt)
