@@ -63,6 +63,14 @@ TAVILY_API_KEY     = os.getenv("TAVILY_API_KEY", "")
 NEWS_API_KEY       = os.getenv("NEWS_API_KEY", "")
 ALCHEMY_API_KEY    = os.getenv("ALCHEMY_API_KEY", "")
 COINGECKO_API_KEY  = os.getenv("COINGECKO_API_KEY", "")
+PAPER_MODE    = os.getenv("PAPER_MODE", "false").lower() == "true"
+PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "1000.0"))
+
+try:
+    from paper import PolymarketPaperHandler, paper_resolution_oracle as _paper_oracle
+    _PAPER_AVAILABLE = True
+except ImportError:
+    _PAPER_AVAILABLE = False
 
 
 class PolymarketBot:
@@ -138,6 +146,13 @@ class PolymarketBot:
             log.info(f"Loaded {len(self.trades)} trades from DB into memory")
         except Exception as e:
             log.warning(f"Could not restore trades from DB: {e}")
+        # Paper trading handler — shares the same SQLite connection
+        if PAPER_MODE and _PAPER_AVAILABLE:
+            self.paper = PolymarketPaperHandler(self.db, PAPER_BALANCE)
+        else:
+            self.paper = None
+            if PAPER_MODE:
+                log.warning("PAPER_MODE=true but paper.py not found — paper trading disabled")
 
     def _trade_row(self, trade: dict) -> tuple:
         """Return the values tuple for a trades INSERT. Single source of truth for column order."""
@@ -375,6 +390,21 @@ class PolymarketBot:
             self.trades = self.trades[-1000:]
         self.save_trade(result)  # persist limit orders — was missing, lost on restart
         return result
+
+    async def _execute_order(self, token_id: str, side: str, amount: float, market: str = "",
+                              order_type: str = "market", price: float = 0.0, size: float = 0.0) -> dict:
+        """
+        Safety wrapper: routes execution to paper handler or live CLOB.
+        All automated trading in run_loop goes through this method — never
+        calls place_market_order / place_limit_order directly.
+        """
+        if PAPER_MODE and self.paper:
+            if order_type == "limit":
+                return await asyncio.to_thread(self.paper.execute_limit_order, token_id, side, price, size, market)
+            return await asyncio.to_thread(self.paper.execute_market_order, token_id, side, amount, market)
+        if order_type == "limit":
+            return await asyncio.to_thread(self.place_limit_order, token_id, side, price, size)
+        return await asyncio.to_thread(self.place_market_order, token_id, side, amount, market)
 
     def cancel_all_orders(self):
         if DRY_RUN:
@@ -1095,8 +1125,12 @@ Rules:
                     self._log(f"⚡ VOL={vol_state.upper()} gas={gwei} gwei ({gas_mult}x) → kelly={vol_kelly_fraction} min_edge={vol_min_edge:.0%}")
 
                 # Fetch balance once per cycle (non-blocking)
-                cycle_cash = await asyncio.to_thread(self.get_balance, True)
-                self._log(f"Cash: ${cycle_cash:.2f}")
+                if PAPER_MODE and self.paper:
+                    cycle_cash = self.paper.get_balance()
+                    self._log(f"[PAPER] Balance: ${cycle_cash:.2f}")
+                else:
+                    cycle_cash = await asyncio.to_thread(self.get_balance, True)
+                    self._log(f"Cash: ${cycle_cash:.2f}")
 
                 for mkt in markets:
                     if not self.running:
@@ -1230,19 +1264,19 @@ Rules:
                         # Use asyncio.to_thread so blocking network I/O (CLOB API calls) in
                         # place_market_order / place_limit_order don't stall the event loop.
                         if signal["strategy"] == "arbitrage" and "BUY" in signal["signal"]:
-                            await asyncio.to_thread(self.place_market_order, signal["token_id"], "BUY", amt / 2, mkt_name)
+                            await self._execute_order(signal["token_id"], "BUY", amt / 2, mkt_name)
                             if signal.get("no_token_id"):
-                                await asyncio.to_thread(self.place_market_order, signal["no_token_id"], "BUY", amt / 2, mkt_name)
-                            cycle_cash -= amt  # update cycle cash after trade
+                                await self._execute_order(signal["no_token_id"], "BUY", amt / 2, mkt_name)
+                            cycle_cash -= amt
                         elif signal["strategy"] == "marketMaking":
                             if signal.get("bid"):
-                                await asyncio.to_thread(self.place_limit_order, signal["token_id"], "BUY", signal["bid"], amt)
+                                await self._execute_order(signal["token_id"], "BUY", amt, mkt_name, "limit", signal["bid"], amt)
                             if signal.get("ask"):
-                                await asyncio.to_thread(self.place_limit_order, signal["token_id"], "SELL", signal["ask"], amt)
+                                await self._execute_order(signal["token_id"], "SELL", amt, mkt_name, "limit", signal["ask"], amt)
                             cycle_cash -= amt
                         elif "BUY" in signal.get("signal", ""):
-                            await asyncio.to_thread(self.place_market_order, signal["token_id"], "BUY", amt, mkt_name)
-                            cycle_cash -= amt  # prevent over-trading in same cycle
+                            await self._execute_order(signal["token_id"], "BUY", amt, mkt_name)
+                            cycle_cash -= amt
 
                     try:
                         await bot._broadcast_state()
@@ -1404,10 +1438,11 @@ Rules:
     def get_state(self) -> dict:
         cash = self.get_balance()
         positions = self.get_positions_value()
-        return {
+        d = {
             "running": self.running,
             "strategy": STRATEGY,
             "dry_run": DRY_RUN,
+            "paper_mode": PAPER_MODE,
             "balance": cash,
             "positions_value": positions,
             "portfolio_value": round(cash + positions, 2),
@@ -1418,6 +1453,12 @@ Rules:
             "volatility": self._vol_state,
             "gas": self._gas_cache,
         }
+        if PAPER_MODE and self.paper:
+            try:
+                d["paper"] = {"balance": self.paper.get_balance(), "mode": True}
+            except Exception:
+                pass
+        return d
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -1480,6 +1521,9 @@ async def lifespan(app_: FastAPI):
         bot.running = True  # set before create_task to prevent double-start race at startup
         _bot_task = asyncio.create_task(bot.run_loop(interval=30.0))
         log.info("Bot auto-started on startup")
+        if PAPER_MODE and _PAPER_AVAILABLE and bot.paper:
+            asyncio.create_task(_paper_oracle(bot.paper))
+            log.info("[PAPER] Resolution oracle started (5 min interval)")
     else:
         log.warning("Could not connect — check .env credentials")
     yield
@@ -1847,6 +1891,61 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         if websocket in bot.ws_clients:
             bot.ws_clients.remove(websocket)
+
+
+@app.get("/paper/status")
+def paper_status():
+    if not PAPER_MODE or not bot.paper:
+        return JSONResponse({"paper_mode": False})
+    try:
+        pnl = bot.paper.get_pnl()
+        return JSONResponse({
+            "paper_mode": True,
+            "balance": pnl["balance"],
+            "portfolio_value": pnl["portfolio_value"],
+            "positions_value": pnl["positions_value"],
+            "total_pnl": pnl["total_pnl"],
+            "pct_pnl": pnl["pct_pnl"],
+            "starting_balance": pnl["starting_balance"],
+            "positions": pnl["positions"],
+        })
+    except Exception as e:
+        log.warning(f"paper_status error: {e}")
+        return JSONResponse({"paper_mode": True, "error": "internal error"}, status_code=500)
+
+
+@app.get("/paper/portfolio")
+def paper_portfolio():
+    if not PAPER_MODE or not bot.paper:
+        return JSONResponse({"paper_mode": False})
+    try:
+        return JSONResponse(bot.paper.get_pnl())
+    except Exception as e:
+        log.warning(f"paper_portfolio error: {e}")
+        return JSONResponse({"paper_mode": True, "error": "internal error"}, status_code=500)
+
+
+@app.get("/paper/trades")
+def paper_trades(limit: int = 50):
+    if not PAPER_MODE or not bot.paper:
+        return JSONResponse({"paper_mode": False, "trades": []})
+    limit = max(1, min(limit, 200))
+    try:
+        return JSONResponse({"paper_mode": True, "trades": bot.paper.get_trades(limit)})
+    except Exception as e:
+        log.warning(f"paper_trades error: {e}")
+        return JSONResponse({"paper_mode": True, "trades": [], "error": "internal error"})
+
+
+@app.post("/paper/reset", dependencies=[Depends(require_api_key)])
+def paper_reset(balance: float = 1000.0):
+    if not PAPER_MODE or not bot.paper:
+        raise HTTPException(status_code=400, detail="Paper mode not enabled (set PAPER_MODE=true in .env)")
+    if not (10.0 <= balance <= 100_000.0):
+        raise HTTPException(status_code=400, detail="balance must be between $10 and $100,000")
+    bot.paper.reset(balance)
+    log.info(f"[PAPER] Portfolio reset via API — new balance ${balance:.2f}")
+    return {"ok": True, "new_balance": balance}
 
 
 if __name__ == "__main__":

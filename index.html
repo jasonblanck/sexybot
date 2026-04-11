@@ -95,6 +95,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
         <div class="wr-bar"><div class="wr-fill" id="wrfill" style="width:0%"></div></div>
         <div class="stat-row" style="margin-top:8px"><span class="stat-lbl">Strategy</span><span class="stat-val o" id="strat">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Mode</span><span class="stat-val" id="mode">—</span></div>
+        <div class="stat-row" id="paper-mode-row" style="display:none"><span class="stat-lbl">Paper Bal</span><span class="stat-val p" id="paper-bal-mini">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Status</span><span class="stat-val" id="bstatus">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Volatility</span><span class="stat-val" id="vol-state">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Gas (Polygon)</span><span class="stat-val" id="gas-state">—</span></div>
@@ -193,6 +194,25 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
       <div class="panel-title">MARKET MOVERS <span id="fmp-sentiment" style="font-size:9px"></span></div>
       <div id="fmp-movers"><div style="color:var(--text3);font-size:11px;padding:4px 0">loading…</div></div>
     </div>
+    <div class="panel" id="paper-panel" style="display:none">
+      <div class="panel-title">PAPER WALLET <span id="paper-badge" style="background:#aa55ff22;color:var(--purple);border:1px solid #aa55ff44;font-size:9px;padding:1px 6px;border-radius:2px;letter-spacing:1px">[P]</span></div>
+      <div style="display:flex;gap:1px;margin-bottom:8px">
+        <div style="flex:1;background:#0a0a0a;border:1px solid var(--border2);border-radius:3px;padding:8px 10px">
+          <div style="font-size:10px;color:var(--text3);font-family:var(--mono);letter-spacing:1px;margin-bottom:3px">BALANCE</div>
+          <div style="font-family:var(--mono);font-size:18px;font-weight:500;color:var(--text)" id="paper-balance">$—</div>
+        </div>
+        <div style="flex:1;background:#0a0a0a;border:1px solid var(--border2);border-radius:3px;padding:8px 10px">
+          <div style="font-size:10px;color:var(--text3);font-family:var(--mono);letter-spacing:1px;margin-bottom:3px">P&amp;L</div>
+          <div style="font-family:var(--mono);font-size:18px;font-weight:500" id="paper-pnl">$—</div>
+        </div>
+      </div>
+      <div class="stat-row"><span class="stat-lbl">Portfolio Value</span><span class="stat-val p" id="paper-portval">—</span></div>
+      <div class="stat-row"><span class="stat-lbl">Starting Balance</span><span class="stat-val" id="paper-start">—</span></div>
+      <div class="stat-row"><span class="stat-lbl">Return</span><span class="stat-val" id="paper-pct">—</span></div>
+      <div class="stat-row"><span class="stat-lbl">Open Positions</span><span class="stat-val p" id="paper-poscount">0</span></div>
+      <div style="margin-top:10px;font-family:var(--mono);font-size:9px;letter-spacing:1px;color:var(--text3);margin-bottom:6px;text-transform:uppercase">Paper Trades</div>
+      <div class="tlog" id="paper-tlog" style="max-height:140px"><div style="color:var(--text3);font-size:11px;padding:8px 0">no paper trades yet</div></div>
+    </div>
     <div class="panel">
       <div class="panel-title">TRADE HISTORY</div>
       <div class="tlog" id="tlog"><div style="color:var(--text3);font-size:11px;padding:8px 0">no trades yet</div></div>
@@ -249,9 +269,12 @@ async function fetchBot(){
     document.getElementById('sdot').className='dot'+(d.running?' pulse':' off');
     document.getElementById('stext').textContent=d.running?'live':'stopped';
     document.getElementById('strat').textContent=(d.strategy||'—').toUpperCase();
-    document.getElementById('mode').textContent=d.dry_run?'DRY RUN':'LIVE';
-    document.getElementById('mode').className='stat-val '+(d.dry_run?'o':'g');
+    const modeStr=d.paper_mode?'PAPER':(d.dry_run?'DRY RUN':'LIVE');
+    const modeCls=d.paper_mode?'p':(d.dry_run?'o':'g');
+    document.getElementById('mode').textContent=modeStr;
+    document.getElementById('mode').className='stat-val '+modeCls;
     document.getElementById('bstatus').innerHTML=d.running?'<span class="g">● RUNNING</span>':'<span class="r">○ STOPPED</span>';
+    if(d.paper&&d.paper.balance!=null){document.getElementById('paper-mode-row').style.display='';document.getElementById('paper-bal-mini').textContent=fmt$(d.paper.balance);}else if(!d.paper_mode){document.getElementById('paper-mode-row').style.display='none';}
     const trades=d.trades||[];
     // "filled" = confirmed trades (matched in live mode, simulated in dry-run)
     const filled=trades.filter(t=>t.status==='matched'||t.status==='simulated');
@@ -425,9 +448,12 @@ function applyState(d){
   document.getElementById('sdot').className='dot'+(d.running?' pulse':' off');
   document.getElementById('stext').textContent=d.running?'live':'stopped';
   document.getElementById('strat').textContent=(d.strategy||'-').toUpperCase();
-  document.getElementById('mode').textContent=d.dry_run?'DRY RUN':'LIVE';
-  document.getElementById('mode').className='stat-val '+(d.dry_run?'o':'g');
+  const modeStr=d.paper_mode?'PAPER':(d.dry_run?'DRY RUN':'LIVE');
+  const modeCls=d.paper_mode?'p':(d.dry_run?'o':'g');
+  document.getElementById('mode').textContent=modeStr;
+  document.getElementById('mode').className='stat-val '+modeCls;
   document.getElementById('bstatus').innerHTML=d.running?'<span class="g">● RUNNING</span>':'<span class="r">○ STOPPED</span>';
+  if(d.paper&&d.paper.balance!=null){document.getElementById('paper-mode-row').style.display='';document.getElementById('paper-bal-mini').textContent=fmt$(d.paper.balance);}else if(!d.paper_mode){document.getElementById('paper-mode-row').style.display='none';}
   const trades=d.trades||[];
   const filled=trades.filter(function(t){return t.status==='matched'||t.status==='simulated';});
   const invested=filled.reduce(function(s,t){return s+(t.amount_usdc||t.amount||0);},0);
@@ -493,6 +519,37 @@ async function fetchPortfolio(){
     }
   }catch(e){console.error('fetchPortfolio',e);}
 }
+async function fetchPaperPortfolio(){
+  try{
+    const r=await fetch(`${BOT}/paper/portfolio`);
+    const d=await r.json();
+    if(!d.paper_mode){document.getElementById('paper-panel').style.display='none';document.getElementById('paper-mode-row').style.display='none';return;}
+    document.getElementById('paper-panel').style.display='';
+    document.getElementById('paper-mode-row').style.display='';
+    const bal=d.balance||0;const pnl=d.total_pnl||0;const pct=d.pct_pnl||0;
+    document.getElementById('paper-balance').textContent=fmt$(bal);
+    document.getElementById('paper-bal-mini').textContent=fmt$(bal);
+    const pnlEl=document.getElementById('paper-pnl');
+    const sign=pnl>=0?'+':'';const cls=pnl>=0?'p':'r';
+    pnlEl.textContent=sign+fmt$(pnl);pnlEl.className=cls;
+    document.getElementById('paper-portval').textContent=fmt$(d.portfolio_value||0);
+    document.getElementById('paper-start').textContent=fmt$(d.starting_balance||0);
+    document.getElementById('paper-pct').innerHTML=`<span class="${cls}">${sign}${pct.toFixed(2)}%</span>`;
+    const pos=d.positions||[];
+    document.getElementById('paper-poscount').textContent=pos.length;
+    const trades=d.trades||[];
+    if(trades.length>0){
+      document.getElementById('paper-tlog').innerHTML=trades.slice(0,20).map(t=>{
+        const isY=t.side==='YES'||t.side==='BUY';
+        const settled=t.status==='settled';
+        const spnl=t.settled_pnl!=null?` <span class="${t.settled_pnl>=0?'g':'r'}" style="font-size:9px">${t.settled_pnl>=0?'+':''}${fmt$(t.settled_pnl)}</span>`:'';
+        return`<div class="tlog-item"><span class="tlog-mkt" style="color:var(--purple)">[P] ${safeHtml((t.market||'').slice(0,30))}</span><span class="badge ${isY?'badge-y':'badge-n'}">${safeHtml(t.side||'BUY')}</span><span class="tlog-amt" style="font-size:10px">${fmt$(t.amount_usdc||0)}${spnl}</span></div>`;
+      }).join('');
+    }else{
+      document.getElementById('paper-tlog').innerHTML='<div style="color:var(--text3);font-size:11px;padding:8px 0">no paper trades yet</div>';
+    }
+  }catch(e){console.error('fetchPaperPortfolio',e);}
+}
 async function fetchFMP(){
   try{
     const r=await fetch(`${BOT}/fmp`);
@@ -513,8 +570,8 @@ async function fetchFMP(){
     document.getElementById('fmp-movers').innerHTML=rows.join('')||'<div style="color:var(--text3);font-size:11px;padding:4px 0">no data</div>';
   }catch(e){console.error('fetchFMP',e);}
 }
-connectWS();fetchBot();fetchIndices();fetchMarketData();fetchPortfolio();fetchMarkets();fetchFMP();
-setInterval(fetchBot,15000);setInterval(fetchPortfolio,30000);setInterval(fetchMarkets,60000);setInterval(fetchFMP,300000);
+connectWS();fetchBot();fetchIndices();fetchMarketData();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();
+setInterval(fetchBot,15000);setInterval(fetchPortfolio,30000);setInterval(fetchMarkets,60000);setInterval(fetchFMP,300000);setInterval(fetchPaperPortfolio,30000);
 </script>
 <!-- ── POSITION SIZER ───────────────────────────────────────────────── -->
 <div style="background:var(--panel);border-top:1px solid var(--border2);padding:20px 24px 24px;">
