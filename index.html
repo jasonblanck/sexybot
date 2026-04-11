@@ -205,7 +205,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
-const BOT=`http://${location.hostname}:8000`;
+const BOT=`${location.protocol}//${location.host}`;
 // API keys belong server-side only — all data endpoints proxy through /api/*
 let pnlChart=null,allTrades=[],activeFilter='1D';
 // XSS sanitizer — escapes all user-origin strings before innerHTML injection
