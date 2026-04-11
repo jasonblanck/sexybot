@@ -180,7 +180,7 @@ class PolymarketBot:
         try:
             today = datetime.utcnow().strftime("%Y-%m-%d")  # match UTC stored in time column
             cur = self.db.execute(
-                "SELECT SUM(amount) FROM trades WHERE time LIKE ? AND dry_run=0 AND status NOT LIKE '%error%' AND status NOT LIKE '%match%' AND status NOT LIKE '%balance%'",
+                "SELECT SUM(amount) FROM trades WHERE time LIKE ? AND dry_run=0 AND status='matched'",
                 (f"{today}%",))
             total = cur.fetchone()[0] or 0
             return float(total)
