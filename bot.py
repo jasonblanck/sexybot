@@ -426,6 +426,9 @@ class PolymarketBot:
     _weather_cache_time = 0
     _fmp_cache = {}
     _fmp_cache_time = 0
+    _volume_history: dict = {}          # token_key → [(timestamp, vol24h), ...]
+    _econ_surprise_cache: dict = {}     # series_id → surprise dict
+    _econ_surprise_cache_time: float = 0
 
     # Key tickers: SPY (S&P proxy), plus individual mega-caps relevant to predictions
     FMP_TICKERS = ["SPY", "AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN"]
@@ -474,6 +477,90 @@ class PolymarketBot:
             self._fmp_cache = results
             self._fmp_cache_time = time.time()
         return results
+
+    def get_economic_surprises(self) -> dict:
+        """
+        Detect economic "surprises" by comparing latest FRED readings to recent trend.
+        Uses only free FRED data — no paid API required.
+
+        Returns dict: series_id → {name, latest, date, trend, surprise_pct, direction}
+          direction = "above" | "below" | "inline"
+          surprise_pct > 0  → reading came in HOTTER than recent trend
+          surprise_pct < 0  → reading came in SOFTER than recent trend
+
+        Cached 6 hours (FRED data is released infrequently).
+        """
+        if not FRED_API_KEY:
+            return {}
+        if time.time() - self._econ_surprise_cache_time < 21600 and self._econ_surprise_cache:
+            return self._econ_surprise_cache
+
+        import json as _j
+
+        # series_id → (friendly_name, unit_label, n_history_periods)
+        SERIES = {
+            "CPIAUCSL":         ("CPI",              "%",  6),   # Consumer prices
+            "UNRATE":           ("Unemployment",     "%",  6),   # Unemployment rate
+            "PAYEMS":           ("Nonfarm Payrolls", "K",  5),   # Jobs added
+            "FEDFUNDS":         ("Fed Funds Rate",   "%",  4),   # Fed rate
+            "A191RL1Q225SBEA":  ("GDP Growth",       "%",  4),   # Real GDP QoQ
+        }
+
+        surprises = {}
+        for sid, (name, unit, n) in SERIES.items():
+            try:
+                url = (
+                    f"https://api.stlouisfed.org/fred/series/observations"
+                    f"?series_id={sid}&api_key={FRED_API_KEY}"
+                    f"&sort_order=desc&limit={n + 1}&file_type=json"
+                )
+                with _ureq.urlopen(url, timeout=6) as r:
+                    data = _j.loads(r.read())
+                obs = [o for o in data["observations"] if o["value"] != "."]
+                if len(obs) < 3:
+                    continue
+                latest     = float(obs[0]["value"])
+                latest_date = obs[0]["date"][:10]
+                prev_vals  = [float(o["value"]) for o in obs[1:n]]
+                trend      = sum(prev_vals) / len(prev_vals) if prev_vals else latest
+
+                # Surprise = deviation from trend as % of trend magnitude
+                if abs(trend) > 0.001:
+                    surprise_pct = (latest - trend) / abs(trend) * 100
+                else:
+                    surprise_pct = 0.0
+
+                THRESHOLD = 2.5  # percent deviation required to call it a "surprise"
+                if surprise_pct > THRESHOLD:
+                    direction = "above"
+                elif surprise_pct < -THRESHOLD:
+                    direction = "below"
+                else:
+                    direction = "inline"
+
+                surprises[sid] = {
+                    "name":         name,
+                    "latest":       latest,
+                    "date":         latest_date,
+                    "trend":        round(trend, 3),
+                    "prev":         float(obs[1]["value"]),
+                    "surprise_pct": round(surprise_pct, 2),
+                    "direction":    direction,
+                    "unit":         unit,
+                }
+            except Exception as e:
+                log.debug(f"FRED {sid} surprise fetch error: {e}")
+
+        self._econ_surprise_cache      = surprises
+        self._econ_surprise_cache_time = time.time()
+
+        alerts = [
+            f"{v['name']} {v['direction'].upper()} trend ({v['surprise_pct']:+.1f}%)"
+            for v in surprises.values() if v["direction"] != "inline"
+        ]
+        if alerts:
+            self._log(f"[NEWS EDGE] Economic surprise: {' | '.join(alerts)}")
+        return surprises
 
     def get_macro_context(self) -> dict:
         import urllib.request, json as _j
@@ -1078,14 +1165,202 @@ Rules:
                         "confidence": round(spread * 500, 1),
                         "market": question,
                         "amount": MAX_ORDER_SIZE / 2}
+
+        # ── Volume Spike ────────────────────────────────────────────────────────
+        if STRATEGY in ("volumeSpike", "both"):
+            sig = self._volume_spike_signal(market, yes_p, yes_id, no_id, question)
+            if sig:
+                return sig
+
+        # ── News Edge ───────────────────────────────────────────────────────────
+        if STRATEGY in ("newsEdge", "both"):
+            sig = self._news_edge_signal(market, yes_p, yes_id, no_id, question)
+            if sig:
+                return sig
+
+        # ── "both" also runs momentum as a fallback ─────────────────────────────
+        if STRATEGY == "both":
+            dev = abs(yes_p - 0.5)
+            if dev > 0.08:
+                macro   = self.get_macro_context()
+                fmp     = self.get_fmp_market()
+                sentiment = fmp.get("_sentiment", {})
+                confidence = round(dev * 200, 1)
+                amount     = min(MAX_ORDER_SIZE, MAX_ORDER_SIZE * dev * 2)
+                q_lower    = question.lower()
+                is_economic = any(x in q_lower for x in ["fed","rate","inflation","gdp","economy","recession","cpi","stock","market"])
+                is_tech     = any(x in q_lower for x in ["tech","ai","apple","microsoft","nvidia","tesla","amazon","meta","google"])
+                if sentiment.get("bullish") and (is_economic or is_tech):
+                    confidence *= 1.10
+                elif sentiment.get("bearish") and (is_economic or is_tech):
+                    confidence *= 0.85
+                    amount *= 0.8
+                side_label = "YES" if yes_p > 0.5 else "NO"
+                tid        = yes_id if yes_p > 0.5 else no_id
+                return {"strategy": "momentum", "signal": f"BUY {side_label}",
+                        "token_id": tid, "price": yes_p,
+                        "confidence": round(confidence, 1),
+                        "market": question, "amount": amount}
+
         return None
+
+    def _volume_spike_signal(self, market: dict, yes_p: float,
+                              yes_id: str, no_id: str, question: str) -> Optional[dict]:
+        """
+        Volume Spike strategy: detect markets where volume24h has jumped 3× above
+        its recent rolling average and follow the smart-money direction.
+
+        Direction is inferred from the current price level:
+          price > 0.60 → smart money is buying YES → BUY YES
+          price < 0.40 → smart money is buying NO  → BUY NO
+          0.40–0.60    → ambiguous; defer to OBI check in run_loop (signal skipped here)
+
+        The existing OBI guard in run_loop provides a second confirmation layer.
+        """
+        import json as _j
+        vol = float(market.get("volume24hr", 0) or 0)
+        now = time.time()
+
+        raw_ids = market.get("clobTokenIds", "[]")
+        ids = _j.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+        key = (ids[0] if ids else yes_id)[:24]
+
+        # Maintain rolling history: keep last hour, max 120 readings
+        hist = self._volume_history.setdefault(key, [])
+        hist.append((now, vol))
+        hist[:] = [(ts, v) for ts, v in hist if now - ts < 3600][-120:]
+
+        # Need at least 5 baseline readings before we can call a spike
+        if len(hist) < 6:
+            return None
+
+        # Exclude the two most-recent readings from the baseline so a current
+        # spike doesn't inflate the average and mask itself
+        baseline = hist[:-2]
+        if len(baseline) < 3:
+            return None
+
+        avg_vol = sum(v for _, v in baseline) / len(baseline)
+        if avg_vol < 200:           # skip illiquid markets
+            return None
+
+        spike_ratio = vol / avg_vol
+        if spike_ratio < 3.0:
+            return None
+
+        # Directional filter: price must be decisively one-sided
+        if yes_p > 0.60:
+            side_label = "YES"
+            tid        = yes_id
+            entry_p    = yes_p
+        elif yes_p < 0.40:
+            side_label = "NO"
+            tid        = no_id if no_id else yes_id
+            entry_p    = 1 - yes_p
+        else:
+            return None   # price is too ambiguous — skip
+
+        if not tid:
+            return None
+
+        # Confidence scales with spike magnitude (caps at 88 to stay below AI override)
+        confidence = min(50 + (spike_ratio - 3.0) * 8, 88)
+        amount     = round(min(MAX_ORDER_SIZE, MAX_ORDER_SIZE * min(spike_ratio / 5.0, 1.5)), 2)
+        reason     = (f"Volume spike {spike_ratio:.1f}× rolling avg "
+                      f"(${vol:,.0f}/24h vs avg ${avg_vol:,.0f})")
+
+        self._log(f"[VOL SPIKE] {spike_ratio:.1f}× avg → BUY {side_label} | {question[:50]}")
+        return {
+            "strategy":    "volumeSpike",
+            "signal":      f"BUY {side_label}",
+            "token_id":    tid,
+            "price":       round(entry_p, 4),
+            "confidence":  round(confidence, 1),
+            "market":      question,
+            "amount":      amount,
+            "spike_ratio": round(spike_ratio, 1),
+            "reason":      reason,
+        }
+
+    def _news_edge_signal(self, market: dict, yes_p: float,
+                           yes_id: str, no_id: str, question: str) -> Optional[dict]:
+        """
+        News Edge strategy: compare latest FRED economic releases to recent trend.
+        When a reading comes in meaningfully above/below its recent trend (i.e. a
+        "surprise"), bet accordingly on related Polymarket questions.
+
+        Mapping logic:
+          CPI above trend     → YES on inflation/rate-hike markets
+          Unemployment above  → NO on jobs/employment markets
+          Payrolls above      → YES on jobs/employment markets
+          Fed Funds above     → YES on rate/hawkish markets
+          GDP above           → YES on growth/no-recession markets
+        """
+        import json as _j
+        surprises = self.get_economic_surprises()
+        if not surprises:
+            return None
+
+        q_lower = question.lower()
+
+        # (series_id, market_keywords, side_if_above, side_if_below)
+        MAPPINGS = [
+            ("CPIAUCSL", ["inflation","cpi","consumer price","rate hike","fed","interest rate"],
+             "YES", "NO"),
+            ("UNRATE",   ["unemployment","jobless","labor","layoff","jobs","employment"],
+             "NO",  "YES"),
+            ("PAYEMS",   ["payroll","nonfarm","jobs","hiring","employment","labor market"],
+             "YES", "NO"),
+            ("FEDFUNDS", ["fed","fomc","rate hike","rate cut","interest rate","monetary"],
+             "YES", "NO"),
+            ("A191RL1Q225SBEA", ["gdp","growth","recession","economy","economic contraction"],
+             "YES", "NO"),
+        ]
+
+        for sid, keywords, above_side, below_side in MAPPINGS:
+            surp = surprises.get(sid)
+            if not surp or surp["direction"] == "inline":
+                continue
+            if not any(kw in q_lower for kw in keywords):
+                continue
+
+            # Economic surprise relevant to this market found
+            side_label = above_side if surp["direction"] == "above" else below_side
+            tid        = yes_id if side_label == "YES" else (no_id if no_id else yes_id)
+            entry_p    = yes_p  if side_label == "YES" else (1 - yes_p)
+
+            if not tid:
+                continue
+
+            surprise_mag = abs(surp["surprise_pct"])
+            confidence   = min(40 + surprise_mag * 4.0, 82)
+            amount       = round(min(MAX_ORDER_SIZE, MAX_ORDER_SIZE * min(surprise_mag / 10.0, 1.0)), 2)
+            reason       = (
+                f"{surp['name']} {surp['direction']} trend: "
+                f"{surp['latest']}{surp['unit']} vs trend {surp['trend']}{surp['unit']} "
+                f"({surp['surprise_pct']:+.1f}%, {surp['date']})"
+            )
+
+            self._log(f"[NEWS EDGE] {surp['name']} surprise → BUY {side_label} | {question[:50]}")
+            return {
+                "strategy":     "newsEdge",
+                "signal":       f"BUY {side_label}",
+                "token_id":     tid,
+                "price":        round(entry_p, 4),
+                "confidence":   round(confidence, 1),
+                "market":       question,
+                "amount":       amount,
+                "indicator":    surp["name"],
+                "surprise_pct": surp["surprise_pct"],
+                "reason":       reason,
+            }
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     async def run_loop(self, interval: float = 30.0):
         self.running = True
         ai_enabled = bool(ANTHROPIC_API_KEY)
-        self._log(f"Bot started — strategy={STRATEGY} dry_run={DRY_RUN} interval={interval}s AI={'ON' if ai_enabled else 'OFF'}")
+        self._log(f"Bot started — strategy={STRATEGY} dry_run={DRY_RUN} interval={interval}s AI={'ON' if ai_enabled else 'OFF'} FRED={'ON' if FRED_API_KEY else 'OFF'}")
         # Pre-warm shared caches in thread executor (non-blocking)
         await asyncio.to_thread(self.get_macro_context)
         await asyncio.to_thread(self.get_fmp_market)
@@ -1995,8 +2270,8 @@ async def update_settings(body: dict):
         updates["DRY_RUN"] = "true" if DRY_RUN else "false"
     if "strategy" in body:
         val = str(body["strategy"]).lower()
-        if val not in ("momentum", "value", "both"):
-            raise HTTPException(status_code=400, detail="strategy must be momentum|value|both")
+        if val not in ("momentum", "value", "both", "volumeSpike", "newsEdge", "meanReversion", "arbitrage", "marketMaking"):
+            raise HTTPException(status_code=400, detail="strategy must be momentum|value|both|volumeSpike|newsEdge")
         STRATEGY = val
         bot.strategy = val
         updates["STRATEGY"] = val
