@@ -81,6 +81,7 @@ class PolymarketBot:
         self.signals: list = []
         self.log_lines: list = []
         self.ws_clients: list = []
+        self._monitor_active: bool = False  # guard against duplicate position_monitor_loop tasks
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -742,58 +743,65 @@ class PolymarketBot:
           • Timeout     : position held > 30 minutes
         Exits are executed via _execute_order(side="SELL").
         """
+        if self._monitor_active:
+            self._log("[ECON FLOW] Position monitor already running — skipping duplicate start")
+            return
+        self._monitor_active = True
         self._log("[ECON FLOW] Position monitor started")
-        while self.running:
-            await asyncio.sleep(30)
-            if not self._managed_positions:
-                continue
+        try:
+            while self.running:
+                await asyncio.sleep(30)
+                if not self._managed_positions:
+                    continue
 
-            now  = time.time()
-            exits = []
+                now  = time.time()
+                exits = []
 
-            for token_id, pos in list(self._managed_positions.items()):
-                try:
-                    mid = await asyncio.to_thread(self.get_midpoint, token_id)
-                    if mid is None:
-                        continue
+                for token_id, pos in list(self._managed_positions.items()):
+                    try:
+                        mid = await asyncio.to_thread(self.get_midpoint, token_id)
+                        if mid is None:
+                            continue
 
-                    entry_p  = pos["entry_price"]
-                    age_min  = (now - pos["entry_time"]) / 60
-                    side     = pos["side"]   # "YES" or "NO"
+                        entry_p  = pos["entry_price"]
+                        age_min  = (now - pos["entry_time"]) / 60
+                        side     = pos["side"]   # "YES" or "NO"
 
-                    # Normalise to the perspective of our side
-                    current_p = mid if side == "YES" else (1.0 - mid)
-                    pnl_c     = (current_p - entry_p) * 100   # cents
+                        # Normalise to the perspective of our side
+                        current_p = mid if side == "YES" else (1.0 - mid)
+                        pnl_c     = (current_p - entry_p) * 100   # cents
 
-                    reason = None
-                    if pnl_c >= 8.0:
-                        reason = f"TP +{pnl_c:.1f}¢"
-                    elif pnl_c <= -5.0:
-                        reason = f"SL {pnl_c:.1f}¢"
-                    elif age_min >= 30.0:
-                        reason = f"timeout {age_min:.0f}min (PnL {pnl_c:+.1f}¢)"
+                        reason = None
+                        if pnl_c >= 8.0:
+                            reason = f"TP +{pnl_c:.1f}¢"
+                        elif pnl_c <= -5.0:
+                            reason = f"SL {pnl_c:.1f}¢"
+                        elif age_min >= 30.0:
+                            reason = f"timeout {age_min:.0f}min (PnL {pnl_c:+.1f}¢)"
 
-                    if reason:
-                        exits.append((token_id, pos, reason))
-                except Exception as e:
-                    log.debug(f"position_monitor check error ({token_id[:16]}): {e}")
+                        if reason:
+                            exits.append((token_id, pos, reason))
+                    except Exception as e:
+                        log.debug(f"position_monitor check error ({token_id[:16]}): {e}")
 
-            for token_id, pos, reason in exits:
-                try:
-                    mkt  = pos.get("market", "")
-                    side = pos["side"]
-                    self._log(f"[ECON FLOW] EXIT {side} {mkt[:40]} — {reason}")
+                for token_id, pos, reason in exits:
+                    try:
+                        mkt  = pos.get("market", "")
+                        side = pos["side"]
+                        self._log(f"[ECON FLOW] EXIT {side} {mkt[:40]} — {reason}")
 
-                    shares = pos.get("shares", 0)
-                    amt    = shares if shares > 0 else pos.get("amount_usdc", 1.0)
-                    await self._execute_order(token_id, "SELL", amt, mkt, "market")
+                        shares = pos.get("shares", 0)
+                        amt    = shares if shares > 0 else pos.get("amount_usdc", 1.0)
+                        await self._execute_order(token_id, "SELL", amt, mkt, "market")
 
-                    self._managed_positions.pop(token_id, None)
-                    asyncio.create_task(
-                        asyncio.to_thread(self.send_telegram,
-                                          f"Exit {side} {mkt[:40]}: {reason}"))
-                except Exception as e:
-                    log.warning(f"position_monitor exit failed ({token_id[:16]}): {e}")
+                        self._managed_positions.pop(token_id, None)
+                        asyncio.create_task(
+                            asyncio.to_thread(self.send_telegram,
+                                              f"Exit {side} {mkt[:40]}: {reason}"))
+                    except Exception as e:
+                        log.warning(f"position_monitor exit failed ({token_id[:16]}): {e}")
+        finally:
+            self._monitor_active = False
 
     def get_macro_context(self) -> dict:
         import urllib.request, json as _j
@@ -2616,7 +2624,6 @@ async def update_settings(body: dict):
             raise HTTPException(status_code=400, detail=f"strategy must be one of: {', '.join(_valid)}")
         old_strategy = STRATEGY
         STRATEGY = val
-        bot.strategy = val
         updates["STRATEGY"] = val
         # Start position monitor if switching into econFlow
         if val == "econFlow" and old_strategy != "econFlow" and bot.running:
