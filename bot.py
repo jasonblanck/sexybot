@@ -430,6 +430,19 @@ class PolymarketBot:
     _econ_surprise_cache: dict = {}     # series_id → surprise dict
     _econ_surprise_cache_time: float = 0
 
+    # ── EconFlow state ────────────────────────────────────────────────────────
+    _watched_econ_markets: list = []    # filtered economic markets (5-min cache)
+    _watched_markets_time: float = 0
+    _trade_rate_history: dict = {}      # condition_id → [(ts, trades_per_min)]
+    _managed_positions: dict = {}       # token_id → position dict for TP/SL/timeout
+
+    ECON_KEYWORDS = [
+        "inflation", "cpi", "consumer price", "fed ", "federal reserve", "fomc",
+        "interest rate", "rate hike", "rate cut", "jobs report", "unemployment",
+        "nonfarm payroll", "gdp", "recession", "economic", "deficit", "debt ceiling",
+        "treasury", "tariff", "trade war", "dollar index", "pce",
+    ]
+
     # Key tickers: SPY (S&P proxy), plus individual mega-caps relevant to predictions
     FMP_TICKERS = ["SPY", "AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN"]
 
@@ -561,6 +574,226 @@ class PolymarketBot:
         if alerts:
             self._log(f"[NEWS EDGE] Economic surprise: {' | '.join(alerts)}")
         return surprises
+
+    def get_economic_markets(self, limit: int = 200) -> list:
+        """
+        Fetch Polymarket markets and filter for economic topics.
+        Cached 5 minutes so the scanner doesn't hammer the API.
+        """
+        if time.time() - self._watched_markets_time < 300 and self._watched_econ_markets:
+            return self._watched_econ_markets
+        try:
+            import json as _j, urllib.request as _ur
+            url = (f"https://gamma-api.polymarket.com/markets"
+                   f"?active=true&closed=false&limit={limit}"
+                   f"&order=volume24hr&ascending=false")
+            req = _ur.Request(url, headers={"User-Agent": "polybot/1.0"})
+            with _ur.urlopen(req, timeout=10) as r:
+                markets = _j.loads(r.read())
+            filtered = [
+                m for m in markets
+                if any(kw in (m.get("question", "") + " " + m.get("description", "")).lower()
+                       for kw in self.ECON_KEYWORDS)
+            ]
+            self._watched_econ_markets = filtered
+            self._watched_markets_time = time.time()
+            self._log(f"[ECON FLOW] Market scan: {len(filtered)}/{len(markets)} economic markets found")
+            return filtered
+        except Exception as e:
+            log.warning(f"get_economic_markets error: {e}")
+            return self._watched_econ_markets   # return stale cache on error
+
+    def get_recent_trades(self, condition_id: str, limit: int = 200) -> list:
+        """
+        Fetch the last N trades for a market from the Polymarket data API.
+        Falls back to empty list on any error — callers must handle gracefully.
+        """
+        try:
+            import json as _j, urllib.parse
+            url = (f"https://data-api.polymarket.com/trades"
+                   f"?market_id={urllib.parse.quote(condition_id)}&limit={limit}")
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0",
+                                              "Accept": "application/json"})
+            with _ureq.urlopen(req, timeout=6) as r:
+                data = _j.loads(r.read())
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                return data.get("trades", data.get("activity", []))
+            return []
+        except Exception as e:
+            log.debug(f"get_recent_trades error (cond={condition_id[:16]}…): {e}")
+            return []
+
+    def analyze_trade_flow(self, trades: list, condition_id: str) -> dict:
+        """
+        Given a list of recent trades for a market, detect:
+          1. Volume spike  – trade rate 3× above rolling baseline
+          2. Dominant side – is smart money hitting YES or NO?
+
+        Returns dict:
+          has_spike      (bool)
+          dominant_side  "YES" | "NO" | None
+          confidence     0-100
+          spike_ratio    float
+          recent_trades  int  (count in last 5 min)
+        """
+        if not trades:
+            return {"has_spike": False, "dominant_side": None,
+                    "confidence": 0.0, "spike_ratio": 0.0, "recent_trades": 0}
+
+        now = time.time()
+        WINDOW = 300  # 5-minute recent window
+
+        def _parse_ts(trade: dict) -> float:
+            for field in ("timestamp", "created_at", "time", "transactionHash"):
+                val = trade.get(field)
+                if not val:
+                    continue
+                try:
+                    if isinstance(val, (int, float)):
+                        v = float(val)
+                        # Detect ms vs s: timestamps before 2001 in seconds would be < 1e9
+                        return v / 1000 if v > 1e12 else v
+                    from datetime import datetime
+                    return datetime.fromisoformat(str(val).replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    pass
+            return now - WINDOW  # safe fallback
+
+        recent  = [t for t in trades if now - _parse_ts(t) < WINDOW]
+        older   = [t for t in trades if WINDOW <= now - _parse_ts(t) < WINDOW * 3]
+
+        recent_rate  = len(recent) / (WINDOW / 60)                              # trades/min
+        older_rate   = len(older)  / (WINDOW * 2 / 60) if older else 0.0
+
+        # Blend with stored rolling history for a more stable baseline
+        ckey = condition_id[:24]
+        hist = self._trade_rate_history.setdefault(ckey, [])
+        hist.append((now, recent_rate))
+        hist[:] = [(ts, r) for ts, r in hist if now - ts < 3600][-40:]
+
+        if len(hist) >= 4:
+            # Exclude latest reading from baseline so the spike doesn't inflate itself
+            baseline_rate = sum(r for _, r in hist[:-1]) / (len(hist) - 1)
+        elif older_rate > 0:
+            baseline_rate = older_rate
+        else:
+            return {"has_spike": False, "dominant_side": None,
+                    "confidence": 0.0, "spike_ratio": 0.0, "recent_trades": len(recent)}
+
+        baseline_rate = max(baseline_rate, 0.1)  # prevent div/0
+        spike_ratio   = recent_rate / baseline_rate
+
+        # Need at least 10 trades in the window to trust the signal
+        has_spike = spike_ratio >= 3.0 and len(recent) >= 10
+
+        # Determine dominant side from USDC-weighted recent trades
+        yes_vol = no_vol = 0.0
+        for t in recent:
+            raw_side    = (t.get("side") or t.get("outcome") or "").upper()
+            size        = float(t.get("size") or t.get("amount") or 0)
+            price       = float(t.get("price") or 0.5)
+            usdc_size   = size * price if price > 0 else size
+
+            # Polymarket trade "side" semantics vary by API endpoint:
+            #   data-api: "SELL" = maker sold YES (taker bought YES) → YES demand
+            #             "BUY"  = maker bought YES (taker sold YES)  → NO demand
+            # We track taker-side demand (the aggressor):
+            if "YES" in raw_side or raw_side == "SELL":
+                yes_vol += usdc_size
+            elif "NO" in raw_side or raw_side == "BUY":
+                no_vol  += usdc_size
+
+        total_vol = yes_vol + no_vol
+        if total_vol > 0:
+            yes_pct = yes_vol / total_vol
+            if yes_pct >= 0.65:
+                dominant_side    = "YES"
+                side_confidence  = yes_pct * 100
+            elif yes_pct <= 0.35:
+                dominant_side    = "NO"
+                side_confidence  = (1 - yes_pct) * 100
+            else:
+                dominant_side   = None
+                side_confidence = 50.0
+        else:
+            dominant_side   = None
+            side_confidence = 50.0
+
+        confidence = round(min(side_confidence * (spike_ratio / 3.0), 85.0), 1) if has_spike else 0.0
+
+        return {
+            "has_spike":     has_spike,
+            "dominant_side": dominant_side,
+            "confidence":    confidence,
+            "spike_ratio":   round(spike_ratio, 2),
+            "recent_trades": len(recent),
+            "yes_vol":       round(yes_vol, 2),
+            "no_vol":        round(no_vol, 2),
+        }
+
+    async def position_monitor_loop(self):
+        """
+        Separate background task — fires every 30 seconds.
+        Checks every EconFlow managed position for exit conditions:
+          • Take profit : price moved +8¢ in our direction
+          • Stop loss   : price moved -5¢ against us
+          • Timeout     : position held > 30 minutes
+        Exits are executed via _execute_order(side="SELL").
+        """
+        self._log("[ECON FLOW] Position monitor started")
+        while self.running:
+            await asyncio.sleep(30)
+            if not self._managed_positions:
+                continue
+
+            now  = time.time()
+            exits = []
+
+            for token_id, pos in list(self._managed_positions.items()):
+                try:
+                    mid = await asyncio.to_thread(self.get_midpoint, token_id)
+                    if mid is None:
+                        continue
+
+                    entry_p  = pos["entry_price"]
+                    age_min  = (now - pos["entry_time"]) / 60
+                    side     = pos["side"]   # "YES" or "NO"
+
+                    # Normalise to the perspective of our side
+                    current_p = mid if side == "YES" else (1.0 - mid)
+                    pnl_c     = (current_p - entry_p) * 100   # cents
+
+                    reason = None
+                    if pnl_c >= 8.0:
+                        reason = f"TP +{pnl_c:.1f}¢"
+                    elif pnl_c <= -5.0:
+                        reason = f"SL {pnl_c:.1f}¢"
+                    elif age_min >= 30.0:
+                        reason = f"timeout {age_min:.0f}min (PnL {pnl_c:+.1f}¢)"
+
+                    if reason:
+                        exits.append((token_id, pos, reason))
+                except Exception as e:
+                    log.debug(f"position_monitor check error ({token_id[:16]}): {e}")
+
+            for token_id, pos, reason in exits:
+                try:
+                    mkt  = pos.get("market", "")
+                    side = pos["side"]
+                    self._log(f"[ECON FLOW] EXIT {side} {mkt[:40]} — {reason}")
+
+                    shares = pos.get("shares", 0)
+                    amt    = shares if shares > 0 else pos.get("amount_usdc", 1.0)
+                    await self._execute_order(token_id, "SELL", amt, mkt, "market")
+
+                    self._managed_positions.pop(token_id, None)
+                    asyncio.create_task(
+                        asyncio.to_thread(self.send_telegram,
+                                          f"Exit {side} {mkt[:40]}: {reason}"))
+                except Exception as e:
+                    log.warning(f"position_monitor exit failed ({token_id[:16]}): {e}")
 
     def get_macro_context(self) -> dict:
         import urllib.request, json as _j
@@ -1166,6 +1399,12 @@ Rules:
                         "market": question,
                         "amount": MAX_ORDER_SIZE / 2}
 
+        # ── EconFlow ────────────────────────────────────────────────────────────
+        if STRATEGY in ("econFlow", "both"):
+            sig = self._econflow_signal(market, yes_p, yes_id, no_id, question)
+            if sig:
+                return sig
+
         # ── Volume Spike ────────────────────────────────────────────────────────
         if STRATEGY in ("volumeSpike", "both"):
             sig = self._volume_spike_signal(market, yes_p, yes_id, no_id, question)
@@ -1203,6 +1442,72 @@ Rules:
                         "market": question, "amount": amount}
 
         return None
+
+    def _econflow_signal(self, market: dict, yes_p: float,
+                          yes_id: str, no_id: str, question: str) -> Optional[dict]:
+        """
+        EconFlow strategy — only fires on markets in the 5-min economic watchlist.
+        Fetches last 200 trades, checks for 3× volume spike, determines dominant
+        side from USDC-weighted buy pressure, then returns a BUY signal.
+        Max bet is capped at $100 regardless of Kelly output.
+        """
+        import json as _j
+
+        # Only process markets that are in our economic watchlist
+        watched = self._watched_econ_markets
+        if not watched:
+            return None
+        cond_id = market.get("conditionId") or market.get("condition_id", "")
+        if not cond_id:
+            return None
+        # Check if this market is in the watched list
+        in_watchlist = any(
+            m.get("conditionId") == cond_id or m.get("condition_id") == cond_id
+            for m in watched
+        )
+        if not in_watchlist:
+            return None
+
+        # Fetch recent trades (blocking, runs in asyncio thread pool from run_loop)
+        trades = self.get_recent_trades(cond_id, limit=200)
+        if not trades:
+            return None
+
+        flow = self.analyze_trade_flow(trades, cond_id)
+        if not flow["has_spike"] or not flow["dominant_side"]:
+            return None
+
+        side_label = flow["dominant_side"]   # "YES" or "NO"
+        tid        = yes_id if side_label == "YES" else (no_id if no_id else yes_id)
+        entry_p    = yes_p if side_label == "YES" else (1.0 - yes_p)
+
+        if not tid:
+            return None
+
+        # Hard cap: never bet more than $100 on an EconFlow trade
+        amount = min(MAX_ORDER_SIZE, 100.0, max(1.0, flow["confidence"] / 10.0))
+
+        reason = (
+            f"Trade flow spike {flow['spike_ratio']:.1f}× avg "
+            f"({flow['recent_trades']} trades in 5min, "
+            f"{flow['yes_vol']:.0f} YES / {flow['no_vol']:.0f} NO USDC)"
+        )
+
+        self._log(
+            f"[ECON FLOW] {side_label} pressure on {question[:45]} "
+            f"— {flow['spike_ratio']:.1f}× spike, conf={flow['confidence']}%"
+        )
+        return {
+            "strategy":    "econFlow",
+            "signal":      f"BUY {side_label}",
+            "token_id":    tid,
+            "price":       round(entry_p, 4),
+            "confidence":  flow["confidence"],
+            "market":      question,
+            "amount":      round(amount, 2),
+            "spike_ratio": flow["spike_ratio"],
+            "reason":      reason,
+        }
 
     def _volume_spike_signal(self, market: dict, yes_p: float,
                               yes_id: str, no_id: str, question: str) -> Optional[dict]:
@@ -1373,6 +1678,10 @@ Rules:
                 markets = await asyncio.to_thread(self.get_markets, 30)
                 self._log(f"Scanning {len(markets)} markets…")
 
+                # Refresh economic watchlist every 5 min for EconFlow strategy
+                if STRATEGY in ("econFlow", "both"):
+                    await asyncio.to_thread(self.get_economic_markets, 200)
+
                 # Sync positions: remove resolved/expired markets from DB
                 import json as _j_sync
                 active_tids = set()
@@ -1540,6 +1849,7 @@ Rules:
                     if float(signal.get("confidence", 0)) >= min_conf and signal.get("token_id"):
                         # Use asyncio.to_thread so blocking network I/O (CLOB API calls) in
                         # place_market_order / place_limit_order don't stall the event loop.
+                        result = None
                         if signal["strategy"] == "arbitrage" and "BUY" in signal["signal"]:
                             await self._execute_order(signal["token_id"], "BUY", amt / 2, mkt_name)
                             if signal.get("no_token_id"):
@@ -1552,8 +1862,22 @@ Rules:
                                 await self._execute_order(signal["token_id"], "SELL", amt, mkt_name, "limit", signal["ask"], amt)
                             cycle_cash -= amt
                         elif "BUY" in signal.get("signal", ""):
-                            await self._execute_order(signal["token_id"], "BUY", amt, mkt_name)
+                            result = await self._execute_order(signal["token_id"], "BUY", amt, mkt_name)
                             cycle_cash -= amt
+
+                        # Register EconFlow positions for TP/SL/timeout management
+                        if (signal["strategy"] == "econFlow"
+                                and result and result.get("status") not in ("error", None, "canceled", "cancelled")):
+                            tok = signal["token_id"]
+                            self._managed_positions[tok] = {
+                                "entry_price": result.get("price", signal.get("price", 0.5)),
+                                "entry_time":  time.time(),
+                                "side":        "YES" if "YES" in signal["signal"] else "NO",
+                                "shares":      result.get("shares", 0),
+                                "amount_usdc": amt,
+                                "market":      mkt_name,
+                            }
+                            self._log(f"[ECON FLOW] Tracking {signal['side'] if 'side' in signal else 'position'} {mkt_name[:40]} — TP +8¢ / SL -5¢ / timeout 30min")
 
                     try:
                         await bot._broadcast_state()
@@ -1801,6 +2125,9 @@ async def lifespan(app_: FastAPI):
         if PAPER_MODE and _PAPER_AVAILABLE and bot.paper:
             asyncio.create_task(_paper_oracle(bot.paper))
             log.info("[PAPER] Resolution oracle started (5 min interval)")
+        if STRATEGY in ("econFlow", "both"):
+            asyncio.create_task(bot.position_monitor_loop())
+            log.info("[ECON FLOW] Position monitor started (30s interval)")
     else:
         log.warning("Could not connect — check .env credentials")
     yield
@@ -1891,6 +2218,9 @@ async def start_bot(interval: float = 30.0):
         if bot.paper:
             asyncio.create_task(_paper_oracle(bot.paper))
             log.info("[PAPER] Resolution oracle restarted")
+    if STRATEGY in ("econFlow", "both"):
+        asyncio.create_task(bot.position_monitor_loop())
+        log.info("[ECON FLOW] Position monitor restarted")
     return {"ok": True, "message": "Bot started"}
 
 
@@ -2270,7 +2600,7 @@ async def update_settings(body: dict):
         updates["DRY_RUN"] = "true" if DRY_RUN else "false"
     if "strategy" in body:
         val = str(body["strategy"]).lower()
-        if val not in ("momentum", "value", "both", "volumeSpike", "newsEdge", "meanReversion", "arbitrage", "marketMaking"):
+        if val not in ("momentum", "value", "both", "volumeSpike", "newsEdge", "econFlow", "meanReversion", "arbitrage", "marketMaking"):
             raise HTTPException(status_code=400, detail="strategy must be momentum|value|both|volumeSpike|newsEdge")
         STRATEGY = val
         bot.strategy = val
