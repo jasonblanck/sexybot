@@ -560,6 +560,9 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
               <option value="volumeSpike">Volume Spike</option>
               <option value="newsEdge">News Edge</option>
               <option value="econFlow">Econ Flow</option>
+              <option value="meanReversion">Mean Reversion</option>
+              <option value="arbitrage">Arbitrage</option>
+              <option value="marketMaking">Market Making</option>
               <option value="both">All Strategies</option>
             </select>
           </div>
@@ -1012,6 +1015,16 @@ function renderPositions(){
       return`<tr><td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${safeHtml(p.title||p.token_id||'')}<br><span style="font-size:9px;color:var(--text3);font-family:var(--mono)">${safeHtml((p.token_id||'').slice(0,20))}…</span></td><td><span class="badge ${p.outcome==='Yes'?'badge-y':'badge-n'}">${safeHtml(p.outcome||'YES')}</span></td><td class="num">${sz}</td><td class="num">${ap}</td><td class="num">${cv}</td><td class="num ${pc}">${ps}${fmt$(p.cash_pnl)}</td></tr>`;
     }).join('');
   }else{document.getElementById('pos-open-body').innerHTML='<tr><td colspan="6" style="color:var(--text3);padding:20px 0;text-align:center">no open positions</td></tr>';}
+  // Closed positions from trade history
+  const closed=allTrades.filter(t=>t.status==='matched'||t.status==='simulated'||t.status==='filled');
+  if(closed.length>0){
+    document.getElementById('pos-closed-body').innerHTML=closed.slice().reverse().map(t=>{
+      const isY=t.side==='YES'||t.side==='BUY';
+      const ts=t.time?new Date(t.time).toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+      const st=t.status||'filled';
+      return`<tr><td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${safeHtml((t.market||'').slice(0,50))}</td><td><span class="badge ${isY?'badge-y':'badge-n'}">${safeHtml(t.side||'BUY')}</span></td><td class="num">${fmt$(t.amount_usdc||t.amount||0)}</td><td class="num g">${safeHtml(st.toUpperCase())}</td><td class="num" style="color:var(--text3);font-size:10px">${ts}</td></tr>`;
+    }).join('');
+  }else{document.getElementById('pos-closed-body').innerHTML='<tr><td colspan="5" style="color:var(--text3);padding:20px 0;text-align:center">no closed trades</td></tr>';}
 }
 
 /* ══════════════════════════════════════════════════════

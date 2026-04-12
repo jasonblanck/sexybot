@@ -1783,7 +1783,8 @@ Rules:
                         self._log(f"OBI SKIP: book pressure opposes trade (obi={obi:.2f}) {question[:40]}")
                         continue
 
-                    self.signals.append({**signal, "time": datetime.utcnow().isoformat()})
+                    sig_record = {**signal, "time": datetime.utcnow().isoformat(), "traded": False}
+                    self.signals.append(sig_record)
                     if len(self.signals) > 1000:
                         self.signals = self.signals[-1000:]
                     self._log(f"SIGNAL [{signal['strategy']}] {signal['signal']} | conf={signal.get('confidence','?')}% | {signal['market'][:50]}")
@@ -1798,12 +1799,14 @@ Rules:
 
                     if signal.get("token_id") and self.has_position(signal["token_id"]):
                         self._log(f"SKIP: already have position in {signal['market'][:40]}")
+                        sig_record["skip_reason"] = "already have position"
                         continue
 
                     # ── Kelly Criterion sizing ────────────────────────────────
                     cash = cycle_cash
                     if cash < 1.0:
                         self._log(f"SKIP: insufficient cash (${cash:.2f})")
+                        sig_record["skip_reason"] = f"insufficient cash (${cash:.2f})"
                         continue
 
                     # Determine entry price for Kelly (price of the side we're buying)
@@ -1820,6 +1823,7 @@ Rules:
                     raw_edge = p_true - entry_price
                     if raw_edge < vol_min_edge:
                         self._log(f"EDGE SKIP: edge={raw_edge:.3f} < min={vol_min_edge:.2f} (vol={vol_state}) {question[:40]}")
+                        sig_record["skip_reason"] = f"edge {raw_edge:.3f} < min {vol_min_edge:.2f} ({vol_state})"
                         continue
 
                     kelly_f_full = p_true - ((1 - p_true) / ((1 - entry_price) / entry_price)) if 0 < entry_price < 1 else 0
@@ -1827,6 +1831,7 @@ Rules:
                     amt = self.kelly_size(p_true, entry_price, cash, fraction=vol_kelly_fraction)
                     if amt < 0.50:
                         self._log(f"KELLY SKIP: no meaningful edge (p={p_true:.3f} price={entry_price:.3f} kelly_f={kelly_f_full:.3f})")
+                        sig_record["skip_reason"] = f"Kelly edge too small (f={kelly_f_full:.3f})"
                         continue
 
                     # Log prediction for Brier score calibration
@@ -1855,15 +1860,19 @@ Rules:
                             if signal.get("no_token_id"):
                                 await self._execute_order(signal["no_token_id"], "BUY", amt / 2, mkt_name)
                             cycle_cash -= amt
+                            sig_record["traded"] = True
                         elif signal["strategy"] == "marketMaking":
                             if signal.get("bid"):
                                 await self._execute_order(signal["token_id"], "BUY", amt, mkt_name, "limit", signal["bid"], amt)
                             if signal.get("ask"):
                                 await self._execute_order(signal["token_id"], "SELL", amt, mkt_name, "limit", signal["ask"], amt)
                             cycle_cash -= amt
+                            sig_record["traded"] = True
                         elif "BUY" in signal.get("signal", ""):
                             result = await self._execute_order(signal["token_id"], "BUY", amt, mkt_name)
                             cycle_cash -= amt
+                            if result and result.get("status") not in ("error", None):
+                                sig_record["traded"] = True
 
                         # Register EconFlow positions for TP/SL/timeout management
                         if (signal["strategy"] == "econFlow"
@@ -1878,6 +1887,8 @@ Rules:
                                 "market":      mkt_name,
                             }
                             self._log(f"[ECON FLOW] Tracking {signal['side'] if 'side' in signal else 'position'} {mkt_name[:40]} — TP +8¢ / SL -5¢ / timeout 30min")
+                    else:
+                        sig_record["skip_reason"] = f"conf {signal.get('confidence',0)}% < min {min_conf}%"
 
                     try:
                         await bot._broadcast_state()
@@ -2599,12 +2610,18 @@ async def update_settings(body: dict):
         DRY_RUN = bool(body["dry_run"])
         updates["DRY_RUN"] = "true" if DRY_RUN else "false"
     if "strategy" in body:
-        val = str(body["strategy"]).lower()
-        if val not in ("momentum", "value", "both", "volumeSpike", "newsEdge", "econFlow", "meanReversion", "arbitrage", "marketMaking"):
-            raise HTTPException(status_code=400, detail="strategy must be momentum|value|both|volumeSpike|newsEdge")
+        val = str(body["strategy"])
+        _valid = ("momentum", "value", "both", "volumeSpike", "newsEdge", "econFlow", "meanReversion", "arbitrage", "marketMaking")
+        if val not in _valid:
+            raise HTTPException(status_code=400, detail=f"strategy must be one of: {', '.join(_valid)}")
+        old_strategy = STRATEGY
         STRATEGY = val
         bot.strategy = val
         updates["STRATEGY"] = val
+        # Start position monitor if switching into econFlow
+        if val == "econFlow" and old_strategy != "econFlow" and bot.running:
+            asyncio.create_task(bot.position_monitor_loop())
+            log.info("[SETTINGS] EconFlow selected — position monitor started")
     if "max_order_size" in body:
         val = float(body["max_order_size"])
         if not (0.1 <= val <= 10_000):
