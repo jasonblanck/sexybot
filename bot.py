@@ -1960,5 +1960,82 @@ def paper_reset(balance: float = 1000.0):
     return {"ok": True, "new_balance": balance}
 
 
+@app.get("/settings")
+def get_settings():
+    return JSONResponse({
+        "paper_mode": PAPER_MODE,
+        "dry_run": DRY_RUN,
+        "strategy": STRATEGY,
+        "max_order_size": MAX_ORDER_SIZE,
+        "daily_loss_limit": DAILY_LOSS_LIMIT,
+    })
+
+
+@app.post("/settings", dependencies=[Depends(require_api_key)])
+async def update_settings(body: dict):
+    global PAPER_MODE, DRY_RUN, STRATEGY, MAX_ORDER_SIZE, DAILY_LOSS_LIMIT
+    allowed = {"paper_mode", "dry_run", "strategy", "max_order_size", "daily_loss_limit"}
+    unknown = set(body.keys()) - allowed
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown fields: {unknown}")
+
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    try:
+        with open(env_path, "r") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+
+    updates: dict = {}
+    if "paper_mode" in body:
+        PAPER_MODE = bool(body["paper_mode"])
+        updates["PAPER_MODE"] = "true" if PAPER_MODE else "false"
+    if "dry_run" in body:
+        DRY_RUN = bool(body["dry_run"])
+        updates["DRY_RUN"] = "true" if DRY_RUN else "false"
+    if "strategy" in body:
+        val = str(body["strategy"]).lower()
+        if val not in ("momentum", "value", "both"):
+            raise HTTPException(status_code=400, detail="strategy must be momentum|value|both")
+        STRATEGY = val
+        bot.strategy = val
+        updates["STRATEGY"] = val
+    if "max_order_size" in body:
+        val = float(body["max_order_size"])
+        if not (0.1 <= val <= 10_000):
+            raise HTTPException(status_code=400, detail="max_order_size must be 0.1–10000")
+        MAX_ORDER_SIZE = val
+        updates["MAX_ORDER_SIZE"] = str(val)
+    if "daily_loss_limit" in body:
+        val = float(body["daily_loss_limit"])
+        if not (0 <= val <= 1_000_000):
+            raise HTTPException(status_code=400, detail="daily_loss_limit must be 0–1000000")
+        DAILY_LOSS_LIMIT = val
+        updates["DAILY_LOSS_LIMIT"] = str(val)
+
+    # Rewrite .env preserving all other values
+    new_lines = []
+    written = set()
+    for line in lines:
+        key = line.split("=", 1)[0].strip()
+        if key in updates:
+            new_lines.append(f"{key}={updates[key]}\n")
+            written.add(key)
+        else:
+            new_lines.append(line)
+    for key, val in updates.items():
+        if key not in written:
+            new_lines.append(f"{key}={val}\n")
+
+    try:
+        with open(env_path, "w") as f:
+            f.writelines(new_lines)
+    except Exception as e:
+        log.warning(f"settings: could not write .env: {e}")
+
+    log.info(f"[SETTINGS] Updated: {updates}")
+    return {"ok": True, "applied": updates}
+
+
 if __name__ == "__main__":
     uvicorn.run("bot:app", host="0.0.0.0", port=8000, reload=False)
