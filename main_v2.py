@@ -311,6 +311,14 @@ async def strategy_loop(
                     "EXITED | %s  reason=%s  id=%s  status=%s",
                     token_id[:14], reason, exit_result.order_id, exit_result.status,
                 )
+            elif exit_result.error and "too small" in (exit_result.error or ""):
+                # Position value < $1 — Polymarket won't accept the order.
+                # Abandon it rather than retrying every cycle forever.
+                log.warning(
+                    "ABANDON | %s  value<$1  entry=%.4f  qty=%.4f  bid=%.4f",
+                    token_id[:14], pos.entry_price, pos.token_qty, book.best_bid,
+                )
+                del open_positions[token_id]
 
         # Collect live books — skip markets with an open position (no stacking)
         live: list[tuple[PolyMarket, BookSnapshot]] = []

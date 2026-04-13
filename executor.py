@@ -32,6 +32,16 @@ from signing import OrderSide
 
 log = logging.getLogger(__name__)
 
+# py_clob_client uses a shared httpx.Client with no timeout — patch it to 15 s
+# so get_balance_allowance / post_order / create_order never hang indefinitely.
+try:
+    import httpx as _httpx
+    import py_clob_client.http_helpers.helpers as _clob_http
+    _clob_http._http_client = _httpx.Client(http2=True, timeout=15.0)
+    log.debug("py_clob_client HTTP timeout patched to 15 s")
+except Exception as _e:
+    log.warning("Could not patch py_clob_client timeout: %s", _e)
+
 CLOB_HOST = "https://clob.polymarket.com"
 
 # CTF Exchange V2 address — key used to look up allowance in API response
