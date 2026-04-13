@@ -54,7 +54,7 @@ API_SECRET_KEY    = os.getenv("API_SECRET_KEY", "")
 if not API_SECRET_KEY:
     import secrets as _sec
     API_SECRET_KEY = _sec.token_hex(24)
-    log.warning(f"API_SECRET_KEY not set — generated ephemeral key (set in .env to persist): {API_SECRET_KEY}")
+    log.warning(f"API_SECRET_KEY not set — generated ephemeral key (set in .env to persist): {API_SECRET_KEY[:6]}…")
 FRED_API_KEY       = os.getenv("FRED_API_KEY", "")
 OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY", "")
 FMP_API_KEY        = os.getenv("FMP_API_KEY", "")
@@ -2185,7 +2185,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_headers=["X-API-Key", "Content-Type"],
 )
 
 # ── API key auth (protects all write endpoints) ───────────────────────────────

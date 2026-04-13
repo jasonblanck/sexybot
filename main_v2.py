@@ -216,10 +216,10 @@ async def estimate_true_probability(
 async def strategy_loop(
     executor:       ClobExecutor,
     book_manager:   BookManager,
-    markets:        list[PolyMarket],
-    last_traded:    dict[str, float],      # persisted across restarts by caller
-    cycle_count:    list[int],             # [0] mutable int, persisted across restarts
-    open_positions: dict[str, "Position"], # token_id → Position; persisted across restarts
+    markets_box:    list[list[PolyMarket]], # [0] mutable box — persisted across restarts
+    last_traded:    dict[str, float],       # persisted across restarts by caller
+    cycle_count:    list[int],              # [0] mutable int, persisted across restarts
+    open_positions: dict[str, "Position"],  # token_id → Position; persisted across restarts
     redeemer:       Optional[PositionRedeemer] = None,
 ) -> None:
     # Give WebSocket connections time to receive initial snapshots for all tokens
@@ -228,10 +228,11 @@ async def strategy_loop(
 
     # Build the set of token IDs that have active WS subscriptions (fixed at startup).
     # Used to filter out new-market results from periodic refreshes that have no WS data.
-    subscribed_yes_ids: set[str] = {mkt.yes_token_id for mkt in markets}
+    subscribed_yes_ids: set[str] = {mkt.yes_token_id for mkt in markets_box[0]}
 
     while True:
         cycle_count[0] += 1
+        markets = markets_box[0]
         log.info("── Scanning %d markets (cycle %d) ──", len(markets), cycle_count[0])
 
         # Periodically re-discover markets so closed/resolved ones drop off.
@@ -252,7 +253,8 @@ async def strategy_loop(
                 # Drop any new markets — only keep already-subscribed ones
                 still_active = [m for m in fresh if m.yes_token_id in subscribed_yes_ids]
                 if still_active:
-                    markets = still_active
+                    markets_box[0] = still_active
+                    markets = markets_box[0]
                 log.info(
                     "Markets refreshed — %d/%d still active",
                     len(markets), len(subscribed_yes_ids),
@@ -452,11 +454,12 @@ async def main() -> None:
     async def _strategy_with_restart() -> None:
         last_traded:    dict[str, float]    = {}
         open_positions: dict[str, Position] = {}
-        cycle_count:    list[int]           = [0]   # mutable box
+        cycle_count:    list[int]           = [0]            # mutable box
+        markets_box:    list[list[PolyMarket]] = [markets]   # mutable box — survives restarts
         while True:
             try:
                 await strategy_loop(
-                    executor, book_manager, markets,
+                    executor, book_manager, markets_box,
                     last_traded, cycle_count, open_positions,
                     redeemer=redeemer,
                 )

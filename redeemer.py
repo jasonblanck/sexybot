@@ -333,8 +333,9 @@ class PositionRedeemer:
         if neg_risk:
             # NegRisk adapter: redeemPositions(bytes32 conditionId, uint256[] amounts)
             # amounts array has one entry per outcome; put size at outcome_index
-            size_scaled = int(pos["size"] * 1_000_000)
-            amounts = [0, 0]
+            size_scaled = int(float(pos.get("size", 0)) * 1_000_000)
+            # Build array large enough for this outcome index (NegRisk can have >2 outcomes)
+            amounts = [0] * max(2, outcome_index + 1)
             amounts[outcome_index] = size_scaled
             data = self._neg_risk.encodeABI(fn_name="redeemPositions", args=[cid, amounts])
             target = NEG_RISK_ADAPTER
