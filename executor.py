@@ -79,18 +79,20 @@ def _make_client(private_key: str, funder_address: Optional[str] = None) -> Clob
     return client
 
 
-def _parse_balance(raw: dict, neg_risk: bool = False) -> BalanceInfo:
+def _parse_balance(raw: dict) -> BalanceInfo:
     """
     Parse the V2 /balance-allowance response.
     Response: {'balance': '213800000', 'allowances': {'0x4bFb...': '0', ...}}
+    Returns the maximum allowance across CTF Exchange V2 and NegRisk Exchange
+    (both use the same USDC.e collateral; whichever has allowance is usable).
     Lookup is case-insensitive to guard against mixed-case API responses.
     """
     balance_raw = int(float(raw.get("balance", "0") or "0"))
     allowances  = raw.get("allowances", {})
-    target      = (NEG_RISK_CTF if neg_risk else CTF_EXCHANGE).lower()
-    allowance_raw = int(float(
-        next((v for k, v in allowances.items() if k.lower() == target), "0") or "0"
-    ))
+    lc          = {k.lower(): v for k, v in allowances.items()}
+    allow_ctf   = int(float(lc.get(CTF_EXCHANGE.lower(),  "0") or "0"))
+    allow_nr    = int(float(lc.get(NEG_RISK_CTF.lower(),  "0") or "0"))
+    allowance_raw = max(allow_ctf, allow_nr)
     return BalanceInfo(balance_raw=balance_raw, allowance_raw=allowance_raw)
 
 
@@ -141,7 +143,7 @@ class ClobExecutor:
         raw  = self._client.get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
-        info = _parse_balance(raw, neg_risk=self._neg_risk)
+        info = _parse_balance(raw)
 
         if info.is_critical:
             log.error("CRITICAL: PMUSD balance $%.2f — orders blocked", info.balance)
@@ -152,7 +154,7 @@ class ClobExecutor:
             log.error(
                 "CTF Exchange allowance is 0 — approve PMUSD spending at polymarket.com "
                 "or call approve() on the PMUSD contract for %s",
-                NEG_RISK_CTF if self._neg_risk else CTF_EXCHANGE,
+                CTF_EXCHANGE,
             )
 
         log.info("Balance: $%.2f PMUSD  CTF-allowance: $%.2f", info.balance, info.allowance)
