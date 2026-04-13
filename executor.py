@@ -14,7 +14,7 @@ from typing import Optional
 
 import requests
 from eth_account import Account
-from eth_account.messages import defunct_hash_message
+from eth_account.messages import encode_defunct
 from web3 import Web3
 
 from orderbook_ws import BookManager, BookSnapshot
@@ -36,7 +36,7 @@ def build_auth_headers(private_key: str, address: str) -> dict:
     pk  = private_key if private_key.startswith("0x") else f"0x{private_key}"
     acc = Account.from_key(pk)
 
-    msg_hash = defunct_hash_message(text=ts)
+    msg_hash = encode_defunct(text=ts)
     signed   = acc.sign_message(msg_hash)
     sig_hex  = signed.signature.hex()
     if not sig_hex.startswith("0x"):
