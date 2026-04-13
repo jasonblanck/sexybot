@@ -58,6 +58,30 @@ class BookSnapshot:
         return round((self.best_bid + self.best_ask) / 2, 6)
 
     @property
+    def vamp(self) -> Optional[float]:
+        """
+        Volume-Adjusted Mid Price — depth-weighted average across both sides.
+
+        Uses the VWAP of the top-5 bid levels and the top-5 ask levels, then
+        averages them. More accurate than simple mid when one side is thicker:
+        e.g. if bids are concentrated near the ask, VAMP > mid, correctly
+        signalling a higher fair value.
+
+        Falls back to simple mid if either side is empty.
+        """
+        bid_lvs = self.bids[:5]
+        ask_lvs = self.asks[:5]
+        if not bid_lvs or not ask_lvs:
+            return self.mid
+        bid_total = sum(lv.size for lv in bid_lvs)
+        ask_total = sum(lv.size for lv in ask_lvs)
+        if bid_total == 0 or ask_total == 0:
+            return self.mid
+        bid_vwap = sum(lv.price * lv.size for lv in bid_lvs) / bid_total
+        ask_vwap = sum(lv.price * lv.size for lv in ask_lvs) / ask_total
+        return round((bid_vwap + ask_vwap) / 2, 6)
+
+    @property
     def spread_cents(self) -> Optional[float]:
         if self.best_bid is None or self.best_ask is None:
             return None

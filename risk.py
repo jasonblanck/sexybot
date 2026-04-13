@@ -9,19 +9,24 @@ ExecutionGate: two-condition pre-trade check (spread + EV).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import os
+import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 from orderbook_ws import BookSnapshot
 
 log = logging.getLogger(__name__)
 
-SPREAD_MAX_CENTS = 0.50
-SLIPPAGE_RATE    = 0.01
-MIN_EV           = 0.0
-LOW_BALANCE      = 50.0
-CRITICAL_BALANCE = 10.0
-PMUSD_SCALAR     = 1_000_000
+SPREAD_MAX_CENTS    = 0.50
+SLIPPAGE_RATE       = 0.01
+MIN_EV              = 0.0
+LOW_BALANCE         = 50.0
+CRITICAL_BALANCE    = 10.0
+PMUSD_SCALAR        = 1_000_000
+
+MAX_DRAWDOWN_USD    = float(os.getenv("MAX_DRAWDOWN_USD", "50.0"))   # halt if peak-to-trough > $50
+DRAWDOWN_WINDOW_SEC = int(os.getenv("DRAWDOWN_WINDOW",   "600"))     # rolling 10-minute window
 
 
 @dataclass
@@ -166,6 +171,80 @@ class ExecutionGate:
             side, ev_net, spread_cents, true_prob, execution_price,
         )
         return GateVerdict(passed=True, ev_net=ev_net, spread_cents=spread_cents)
+
+
+class DrawdownHalt(Exception):
+    """
+    Raised by DrawdownGuard when the account-level drawdown kill-switch fires.
+    Caught by the strategy restart wrapper to stop quoting without restarting.
+    """
+
+
+class DrawdownGuard:
+    """
+    Account-level max-drawdown kill-switch — the "Golden Rule".
+
+    Records balance snapshots on every scan cycle. If the peak-to-current
+    drawdown within a rolling window exceeds `max_drawdown`, raises
+    DrawdownHalt (cancels restart loop) and logs a CRITICAL alert.
+
+    Usage
+    -----
+    guard = DrawdownGuard()
+    # In the main loop, after every balance fetch:
+    guard.record_and_check(cycle_balance.balance)   # raises DrawdownHalt if triggered
+    """
+
+    def __init__(
+        self,
+        max_drawdown: float = MAX_DRAWDOWN_USD,
+        window:       float = DRAWDOWN_WINDOW_SEC,
+    ):
+        self.max_drawdown = max_drawdown
+        self.window       = window
+        self._history:    list[tuple[float, float]] = []   # (ts, balance)
+        self._triggered   = False
+
+    @property
+    def is_triggered(self) -> bool:
+        return self._triggered
+
+    def record_and_check(self, balance: float) -> None:
+        """
+        Record current balance; raise DrawdownHalt if limit is breached.
+        Once triggered, every subsequent call also raises — strategy stays halted.
+        """
+        if self._triggered:
+            raise DrawdownHalt("drawdown kill-switch already triggered — manual reset required")
+
+        now = time.time()
+        self._history.append((now, balance))
+        cutoff = now - self.window
+        self._history = [(t, b) for t, b in self._history if t >= cutoff]
+
+        if len(self._history) < 2:
+            return
+
+        peak     = max(b for _, b in self._history)
+        drawdown = peak - balance
+        if drawdown >= self.max_drawdown:
+            self._triggered = True
+            log.critical(
+                "⛔ DRAWDOWN KILL-SWITCH | peak=$%.2f  current=$%.2f  drop=$%.2f >= limit=$%.2f  "
+                "window=%ds — all quoting halted, manual restart required",
+                peak, balance, drawdown, self.max_drawdown, int(self.window),
+            )
+            raise DrawdownHalt(
+                f"balance dropped ${drawdown:.2f} "
+                f"(peak=${peak:.2f} → current=${balance:.2f}) "
+                f"within {self.window / 60:.0f}min window"
+            )
+
+    def reset(self) -> None:
+        """Manually reset after investigating the drawdown. Use with caution."""
+        self._triggered = False
+        self._history.clear()
+        log.warning("DrawdownGuard manually reset — strategy will resume on next restart")
 
 
 def kelly_size(

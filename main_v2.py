@@ -17,13 +17,14 @@ from dataclasses import dataclass
 from typing import Optional
 
 import requests
+from pydantic import BaseModel, field_validator
 
 from discovery import MarketFilter, PolyMarket, fetch_markets
 from executor import ClobExecutor
 from market_maker import MarketMaker
 from orderbook_ws import BookManager, BookSnapshot
 from redeemer import PositionRedeemer
-from risk import BalanceInfo, ExecutionGate, kelly_size
+from risk import BalanceInfo, DrawdownGuard, DrawdownHalt, ExecutionGate, kelly_size
 from signing import OrderSide
 
 log = logging.getLogger(__name__)
@@ -62,6 +63,38 @@ STRATEGY      = os.getenv("STRATEGY", "momentum")
 MM_HALF_SPREAD = float(os.getenv("MM_HALF_SPREAD", "0.02"))   # half-spread in prob units
 MM_ORDER_SIZE  = float(os.getenv("MM_ORDER_SIZE",  "5.0"))    # USDC per side per quote
 
+# Drawdown kill-switch — inherited from risk.py env vars but logged here for clarity
+# MAX_DRAWDOWN_USD (default $50): halt if balance drops this much from recent peak
+# DRAWDOWN_WINDOW  (default 600s): rolling window for peak measurement
+
+
+# ── Signal schema ──────────────────────────────────────────────────────────────
+
+class VolumeSpike(BaseModel):
+    """
+    Strictly-typed momentum signal from CLOB trade data.
+    Replaces the plain-dict return so callers get type safety and
+    pydantic's runtime validation catches malformed data early.
+    """
+    has_spike:     bool
+    dominant_side: Optional[str]   = None   # "YES" | "NO" | None
+    confidence:    float           = 0.0    # 0–85 %
+    spike_ratio:   float           = 0.0    # recent_rate / baseline_rate
+
+    @field_validator("dominant_side")
+    @classmethod
+    def _validate_side(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in ("YES", "NO"):
+            raise ValueError(f"dominant_side must be 'YES', 'NO', or None, got {v!r}")
+        return v
+
+    @field_validator("confidence", "spike_ratio")
+    @classmethod
+    def _non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("confidence and spike_ratio must be >= 0")
+        return v
+
 
 @dataclass
 class Position:
@@ -96,13 +129,15 @@ async def _get_recent_trades(token_id: str) -> list[dict]:
     return await asyncio.to_thread(_get_recent_trades_sync, token_id)
 
 
-def _detect_volume_spike(trades: list[dict]) -> dict:
+def _detect_volume_spike(trades: list[dict]) -> VolumeSpike:
     """
     Detect a directional volume spike in recent CLOB trades.
-    Returns: {has_spike, dominant_side, confidence, spike_ratio}
+    Returns a validated VolumeSpike model (replaces plain dict).
     """
+    _null = VolumeSpike(has_spike=False)
+
     if len(trades) < 5:
-        return {"has_spike": False, "dominant_side": None, "confidence": 0.0, "spike_ratio": 0.0}
+        return _null
 
     now = time.time()
     recent: list[dict] = []
@@ -122,7 +157,7 @@ def _detect_volume_spike(trades: list[dict]) -> dict:
             continue
 
     if not recent:
-        return {"has_spike": False, "dominant_side": None, "confidence": 0.0, "spike_ratio": 0.0}
+        return _null
 
     baseline_rate = max(len(baseline) / (SPIKE_WINDOW_SEC * 4), 0.1)
     recent_rate   = len(recent) / SPIKE_WINDOW_SEC
@@ -137,7 +172,7 @@ def _detect_volume_spike(trades: list[dict]) -> dict:
 
     yes_pct = yes_vol / total
     if yes_pct >= 0.60:
-        dominant_side = "YES"
+        dominant_side: Optional[str] = "YES"
         side_conf     = yes_pct * 100
     elif yes_pct <= 0.40:
         dominant_side = "NO"
@@ -148,12 +183,12 @@ def _detect_volume_spike(trades: list[dict]) -> dict:
 
     confidence = round(min(side_conf * (spike_ratio / 3.0), 85.0), 1) if has_spike else 0.0
 
-    return {
-        "has_spike":     has_spike,
-        "dominant_side": dominant_side,
-        "confidence":    confidence,
-        "spike_ratio":   round(spike_ratio, 2),
-    }
+    return VolumeSpike(
+        has_spike     = has_spike,
+        dominant_side = dominant_side,
+        confidence    = confidence,
+        spike_ratio   = round(spike_ratio, 2),
+    )
 
 
 async def estimate_true_probability(
@@ -169,16 +204,16 @@ async def estimate_true_probability(
       3. OBI must confirm (not oppose) the trade direction
       4. Edge = |estimated_prob − execution_price| must exceed MIN_EDGE
     """
-    if book.mid is None:
+    # Use VAMP for a depth-weighted fair value; fall back to simple mid if unavailable
+    yes_price = book.vamp or book.mid
+    if yes_price is None:
         return None
-
-    yes_price = book.mid
 
     # 1. Volume spike (non-blocking)
     trades = await _get_recent_trades(book.token_id)
     spike  = _detect_volume_spike(trades)
 
-    if not spike["has_spike"] or spike["dominant_side"] is None:
+    if not spike.has_spike or spike.dominant_side is None:
         # Fall back to OBI-only signal
         obi = book.obi
         if abs(obi) < 0.35:
@@ -186,8 +221,8 @@ async def estimate_true_probability(
         dominant_side = "YES" if obi > 0 else "NO"
         confidence    = abs(obi) * 50    # maps ±0.35–1.0 → 17.5–50%
     else:
-        dominant_side = spike["dominant_side"]
-        confidence    = spike["confidence"]
+        dominant_side = spike.dominant_side
+        confidence    = spike.confidence
 
     # 2. OBI must not oppose the signal direction
     obi = book.obi
@@ -214,7 +249,7 @@ async def estimate_true_probability(
         return None
 
     log.info(
-        "SIGNAL | %s  side=%s  prob=%.3f  mid=%.3f  edge=%.3f  obi=%+.3f  conf=%.1f%%",
+        "SIGNAL | %s  side=%s  prob=%.3f  vamp=%.3f  edge=%.3f  obi=%+.3f  conf=%.1f%%",
         market.question[:55], dominant_side, true_prob, yes_price, edge, obi, confidence,
     )
     return true_prob, side
@@ -231,6 +266,7 @@ async def strategy_loop(
     open_positions: dict[str, "Position"],  # token_id → Position; persisted across restarts
     redeemer:       Optional[PositionRedeemer] = None,
     market_maker:   Optional[MarketMaker]       = None,
+    drawdown_guard: Optional[DrawdownGuard]     = None,
 ) -> None:
     # Give WebSocket connections time to receive initial snapshots for all tokens
     log.info("Waiting 10s for WebSocket order books to populate…")
@@ -279,6 +315,12 @@ async def strategy_loop(
             log.error("Balance fetch failed: %s — skipping cycle", exc)
             await asyncio.sleep(SCAN_INTERVAL)
             continue
+
+        # ── Drawdown kill-switch check ────────────────────────────────────────
+        # DrawdownHalt propagates up — _strategy_with_restart will NOT restart
+        # after a drawdown halt (unlike normal crashes).
+        if drawdown_guard is not None and cycle_balance is not None:
+            drawdown_guard.record_and_check(cycle_balance.balance)
 
         # ── Claim resolved positions / merge back-to-back positions ────────────
         if redeemer is not None:
@@ -517,14 +559,30 @@ async def main() -> None:
         open_positions: dict[str, Position] = {}
         cycle_count:    list[int]           = [0]            # mutable box
         markets_box:    list[list[PolyMarket]] = [markets]   # mutable box — survives restarts
+        drawdown_guard  = DrawdownGuard()                    # account-level kill-switch
         while True:
             try:
                 await strategy_loop(
                     executor, book_manager, markets_box,
                     last_traded, cycle_count, open_positions,
-                    redeemer=redeemer,
-                    market_maker=market_maker,
+                    redeemer       = redeemer,
+                    market_maker   = market_maker,
+                    drawdown_guard = drawdown_guard,
                 )
+            except DrawdownHalt as exc:
+                # Cancel all outstanding orders before halting
+                try:
+                    await market_maker.cancel_all() if market_maker else asyncio.to_thread(
+                        executor.cancel_all_orders
+                    )
+                except Exception:
+                    pass
+                log.critical(
+                    "STRATEGY HALTED by drawdown kill-switch: %s\n"
+                    "  Fix: investigate balance drop, then restart the service manually.",
+                    exc,
+                )
+                return   # exit restart wrapper — bot stops quoting, dashboard stays up
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

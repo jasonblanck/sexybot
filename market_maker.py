@@ -155,7 +155,8 @@ class MarketMaker:
         if book is None or book.is_stale or book.mid is None:
             return 0
 
-        mid = book.mid
+        # VAMP gives a depth-weighted fair value; fall back to simple mid
+        mid = book.vamp or book.mid
         state = self._states.setdefault(mkt.yes_token_id, MMState())
 
         # Track mid history for circuit breaker
