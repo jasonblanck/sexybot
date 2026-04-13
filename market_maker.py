@@ -42,14 +42,13 @@ from typing import Optional
 from discovery import PolyMarket
 from executor import ClobExecutor, OrderResult
 from orderbook_ws import BookManager, BookSnapshot
-from risk import BalanceInfo
+from risk import BalanceInfo, CRITICAL_BALANCE
 from signing import OrderSide
 
 log = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-HALF_SPREAD          = float.__new__(float)   # set via env; default 0.02 (4 c spread)
 ORDER_SIZE_USDC      = 5.0     # USDC per side per quote
 MAX_INVENTORY_USDC   = 50.0    # stop quoting if abs(yes−no) > this in USDC value
 SKEW_FACTOR          = 0.5     # fraction of inventory imbalance used to skew mid
@@ -113,6 +112,17 @@ class MarketMaker:
         if balance is not None and balance.is_critical:
             log.warning("MM: critical balance — skipping all quoting")
             return 0
+
+        # Guard: ensure both order legs won't push balance below the $10 reserve.
+        # bypass_gate=True skips the executor's reserve check, so we enforce it here.
+        if balance is not None:
+            spendable = balance.balance - CRITICAL_BALANCE
+            if spendable < self._size:
+                log.warning(
+                    "MM: spendable $%.2f < order_size $%.2f — insufficient margin for both legs",
+                    spendable, self._size,
+                )
+                return 0
 
         actions = 0
         for mkt in markets:
