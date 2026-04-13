@@ -2205,6 +2205,10 @@ def _sec_compare(a: str, b: str) -> bool:
 async def _unhandled_exception_handler(request, exc):
     """Catch-all: log full detail server-side, return generic 500 to client.
     Prevents stack traces and internal paths from leaking in error responses."""
+    # HTTPException (401, 404, etc.) must pass through to FastAPI's built-in handler
+    if isinstance(exc, HTTPException):
+        from fastapi.exception_handlers import http_exception_handler
+        return await http_exception_handler(request, exc)
     log.error(
         f"Unhandled exception: {request.method} {request.url.path} — "
         f"{type(exc).__name__}: {exc}",
@@ -2214,7 +2218,7 @@ async def _unhandled_exception_handler(request, exc):
 
 
 @app.get("/status")
-def status():
+def get_status():
     return JSONResponse(bot.get_state())
 
 
