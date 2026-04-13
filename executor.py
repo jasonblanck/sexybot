@@ -54,7 +54,7 @@ def _make_client(private_key: str, funder_address: Optional[str] = None) -> Clob
     pk = private_key if private_key.startswith("0x") else f"0x{private_key}"
 
     if funder_address:
-        sig_type = 1   # POLY_PROXY: signer != funder/maker
+        sig_type = 2   # POLY_GNOSIS_SAFE / proxy-wallet: signer != funder/maker
         funder   = funder_address
     else:
         sig_type = 0   # EOA: signer == maker
@@ -69,11 +69,12 @@ def _make_client(private_key: str, funder_address: Optional[str] = None) -> Clob
     )
     creds = client.create_or_derive_api_creds()
     client.set_api_creds(creds)
+    mode = {0: "EOA", 1: "POLY_PROXY", 2: "POLY_GNOSIS_SAFE"}.get(sig_type, str(sig_type))
     log.info(
-        "CLOB auth ready | signer=%s funder=%s sig_type=%d api_key=%s",
+        "CLOB auth ready | signer=%s funder=%s mode=%s api_key=%s",
         client.get_address(),
         funder_address or "(self)",
-        sig_type,
+        mode,
         creds.api_key[:8] + "…",
     )
     return client
