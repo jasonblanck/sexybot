@@ -1290,7 +1290,14 @@ function mobActivate(el){
   el.classList.add('active');
 }
 function initMobileCollapse(){
+  // Panels that contain charts must not be collapsible — Chart.js won't resize after re-expand
+  var chartPanels = new Set();
+  document.querySelectorAll('.chart-wrap, [id$="-chart"]').forEach(function(el){
+    var p = el.closest('.panel'); if(p) chartPanels.add(p);
+  });
+
   document.querySelectorAll('.panel').forEach(function(p){
+    if(chartPanels.has(p)) return;                          // skip chart panels
     if(!p.closest('.mob-collapse')) {
       p.parentElement && p.parentElement.classList.contains('col') && p.classList.add('mob-collapse');
     }
@@ -1298,17 +1305,17 @@ function initMobileCollapse(){
   // By default collapse lower-priority panels
   var lowPri = ['FED / MACRO','WEATHER','CRYPTO','MARKET MOVERS','TRADE HISTORY'];
   document.querySelectorAll('.panel-title').forEach(function(t){
+    if(t._mobBound) return;                                 // already wired — prevents duplicate listeners
+    var panel = t.parentElement;
+    if(chartPanels.has(panel)) return;                     // skip chart panels
     if(lowPri.some(s=>t.textContent.trim().startsWith(s))){
-      var panel = t.parentElement;
       panel.classList.add('mob-collapse');
       panel.classList.add('collapsed');
-      // toggle on click
+    }
+    if(panel.classList.contains('mob-collapse')){
+      t._mobBound = true;
       t.addEventListener('click', function(){ panel.classList.toggle('collapsed'); });
     }
-  });
-  // Make open panels toggle-able too
-  document.querySelectorAll('.panel.mob-collapse:not(.collapsed) .panel-title').forEach(function(t){
-    if(!t._mobBound){ t._mobBound=true; t.addEventListener('click', function(){ t.parentElement.classList.toggle('collapsed'); }); }
   });
 }
 function syncMobPortBar(){
@@ -1323,9 +1330,6 @@ function syncMobPortBar(){
   if(wr)  { var mw=document.getElementById('mob-wr');  if(mw) mw.textContent=wr.textContent; }
   if(dot && st){ var md=document.getElementById('mob-dot'); var ms=document.getElementById('mob-status'); if(md){md.className=dot.className;} if(ms) ms.textContent=st.textContent; }
 }
-// Sync port bar whenever bot data updates
-var _origFetchBot = typeof fetchBot !== 'undefined' ? fetchBot : null;
-function _postFetchBot(){ setTimeout(syncMobPortBar, 200); }
 // override showPage to sync mobile nav
 var _origShowPage = showPage;
 showPage = function(id, el){
@@ -1335,8 +1339,8 @@ showPage = function(id, el){
   var mnId = mapping[id];
   if(mnId){ document.querySelectorAll('.mob-tab').forEach(t=>t.classList.remove('active')); var mn=document.getElementById(mnId); if(mn) mn.classList.add('active'); }
 };
-// wrap fetchBot to keep mob bar in sync
-document.addEventListener('DOMContentLoaded', function(){ setInterval(syncMobPortBar, 5000); });
+// Sync mob port bar every 5s — DOMContentLoaded has already fired at this point, call directly
+setInterval(syncMobPortBar, 5000);
 setTimeout(function(){ syncMobPortBar(); if(document.documentElement.getAttribute('data-view')==='mobile') initMobileCollapse(); }, 1000);
 
 </script>
