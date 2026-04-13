@@ -20,9 +20,10 @@ import requests
 
 from discovery import MarketFilter, PolyMarket, fetch_markets
 from executor import ClobExecutor
+from market_maker import MarketMaker
 from orderbook_ws import BookManager, BookSnapshot
 from redeemer import PositionRedeemer
-from risk import BalanceInfo, ExecutionGate
+from risk import BalanceInfo, ExecutionGate, kelly_size
 from signing import OrderSide
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,14 @@ TRADE_COOLDOWN_SEC    = 300   # seconds before re-buying the same token
 MARKET_REFRESH_CYCLES = 20   # re-discover markets every N scan cycles
 PROFIT_TARGET         = float(os.getenv("PROFIT_TARGET", "0.08"))   # 8% gain → close
 STOP_LOSS             = float(os.getenv("STOP_LOSS",     "0.05"))   # 5% loss → close
+KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.25"))  # Quarter Kelly
+
+# Strategy selection
+# STRATEGY=momentum  (default) — directional momentum + OBI signals
+# STRATEGY=market_making       — two-sided quotes, spread capture, liquidity rewards
+STRATEGY      = os.getenv("STRATEGY", "momentum")
+MM_HALF_SPREAD = float(os.getenv("MM_HALF_SPREAD", "0.02"))   # half-spread in prob units
+MM_ORDER_SIZE  = float(os.getenv("MM_ORDER_SIZE",  "5.0"))    # USDC per side per quote
 
 
 @dataclass
@@ -221,6 +230,7 @@ async def strategy_loop(
     cycle_count:    list[int],              # [0] mutable int, persisted across restarts
     open_positions: dict[str, "Position"],  # token_id → Position; persisted across restarts
     redeemer:       Optional[PositionRedeemer] = None,
+    market_maker:   Optional[MarketMaker]       = None,
 ) -> None:
     # Give WebSocket connections time to receive initial snapshots for all tokens
     log.info("Waiting 10s for WebSocket order books to populate…")
@@ -246,7 +256,7 @@ async def strategy_loop(
                 fresh = (
                     MarketFilter(fresh_raw)
                     .max_spread_cents(3.0)
-                    .price_range(0.05, 0.95)
+                    .price_range(0.08, 0.92)
                     .top(20, key="volume_24h")
                     .results()
                 )
@@ -278,6 +288,18 @@ async def strategy_loop(
                     log.info("REDEEMER: %d on-chain transaction(s) sent", claimed)
             except Exception as exc:
                 log.warning("REDEEMER error (non-fatal): %s", exc)
+
+        # ── Market Making: two-sided quoting + circuit breaker ──────────────────
+        if market_maker is not None:
+            try:
+                mm_actions = await market_maker.run_once(markets, cycle_balance)
+                if mm_actions:
+                    log.info("MM: %d order action(s) this cycle", mm_actions)
+            except Exception as exc:
+                log.warning("MM error (non-fatal): %s", exc)
+            # MM handles its own order management — skip momentum signal loop
+            await asyncio.sleep(SCAN_INTERVAL)
+            continue
 
         # ── Exit open positions that hit profit target or stop-loss ─────────────
         for token_id, pos in list(open_positions.items()):
@@ -367,13 +389,30 @@ async def strategy_loop(
                 )
                 continue
 
+            # Kelly position sizing: f* = (prob - price) / (1 - price) × Kelly fraction
+            trade_book = book_manager.get_book(trade_token_id)
+            trade_price = (trade_book.best_ask if trade_book and trade_book.best_ask
+                           else trade_prob)
+            kelly_dollars = kelly_size(
+                trade_prob, trade_price,
+                cycle_balance.balance if cycle_balance else MAX_ORDER_SIZE,
+                kelly_fraction = KELLY_FRACTION,
+                max_size       = MAX_ORDER_SIZE,
+            )
+            if kelly_dollars < 1.0:
+                log.debug(
+                    "KELLY SKIP | %s  kelly=$%.2f edge too small",
+                    mkt.question[:40], kelly_dollars,
+                )
+                continue
+
             try:
                 result = await asyncio.to_thread(
                     executor.place_limit_order,
                     trade_token_id,
                     trade_side,
                     trade_prob,
-                    MAX_ORDER_SIZE,
+                    kelly_dollars,
                     cached_balance=cycle_balance,
                 )
             except Exception as exc:
@@ -411,8 +450,8 @@ async def strategy_loop(
 
 async def main() -> None:
     log.info(
-        "SexyBot V2 starting | DRY_RUN=%s MAX_ORDER=$%.2f FUNDER=%s",
-        DRY_RUN, MAX_ORDER_SIZE, FUNDER_ADDRESS or "(EOA/self)",
+        "SexyBot V2 starting | strategy=%s DRY_RUN=%s MAX_ORDER=$%.2f KELLY=%.0f%% FUNDER=%s",
+        STRATEGY, DRY_RUN, MAX_ORDER_SIZE, KELLY_FRACTION * 100, FUNDER_ADDRESS or "(EOA/self)",
     )
 
     # 1. Discover markets
@@ -421,7 +460,7 @@ async def main() -> None:
     markets = (
         MarketFilter(raw)
         .max_spread_cents(3.0)
-        .price_range(0.05, 0.95)
+        .price_range(0.08, 0.92)
         .top(20, key="volume_24h")
         .results()
     )
@@ -456,6 +495,20 @@ async def main() -> None:
         )
         log.info("PositionRedeemer ready | safe=%s", FUNDER_ADDRESS)
 
+    # 3c. Market Maker (when STRATEGY=market_making)
+    market_maker: Optional[MarketMaker] = None
+    if STRATEGY == "market_making":
+        market_maker = MarketMaker(
+            executor,
+            book_manager,
+            half_spread = MM_HALF_SPREAD,
+            order_size  = MM_ORDER_SIZE,
+        )
+        log.info(
+            "MarketMaker ready | half_spread=%.3f order_size=$%.2f",
+            MM_HALF_SPREAD, MM_ORDER_SIZE,
+        )
+
     # 4. Run WebSocket + strategy concurrently
     # strategy_loop is isolated — an exception there won't cancel book_manager.
     # last_traded and cycle_count live here so they survive strategy_loop restarts.
@@ -470,6 +523,7 @@ async def main() -> None:
                     executor, book_manager, markets_box,
                     last_traded, cycle_count, open_positions,
                     redeemer=redeemer,
+                    market_maker=market_maker,
                 )
             except asyncio.CancelledError:
                 raise

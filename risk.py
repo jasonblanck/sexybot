@@ -166,3 +166,36 @@ class ExecutionGate:
             side, ev_net, spread_cents, true_prob, execution_price,
         )
         return GateVerdict(passed=True, ev_net=ev_net, spread_cents=spread_cents)
+
+
+def kelly_size(
+    true_prob:  float,
+    price:      float,
+    balance:    float,
+    *,
+    kelly_fraction: float = 0.25,
+    max_size:       float = 10.0,
+    min_size:       float = 1.0,
+) -> float:
+    """
+    Quarter-Kelly position sizing for a binary prediction market.
+
+    Formula (buying YES at `price`):
+        f* = (true_prob - price) / (1 - price)
+        bet = f* × kelly_fraction × balance
+
+    The Quarter Kelly (kelly_fraction=0.25) caps exposure at 25% of the
+    theoretical full-Kelly bet, protecting against model overconfidence and
+    undetected oracle risk ("black swan" resolution disputes).
+
+    Returns 0.0 when there is no positive edge.
+    """
+    if price <= 0 or price >= 1:
+        return 0.0
+    edge = true_prob - price
+    if edge <= 0:
+        return 0.0
+    full_kelly = edge / (1.0 - price)
+    size = full_kelly * kelly_fraction * balance
+    return round(max(min_size, min(size, max_size)), 2)
+

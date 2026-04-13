@@ -182,6 +182,7 @@ class ClobExecutor:
         cached_balance: Optional[BalanceInfo] = None,
         price_override: Optional[float]       = None,
         expiration:     int                   = 0,
+        bypass_gate:    bool                  = False,
     ) -> OrderResult:
         """
         Gate → sign → submit a single limit order.
@@ -201,12 +202,15 @@ class ClobExecutor:
         # 2. Balance (use cached value when available)
         balance = cached_balance if cached_balance is not None else self.get_balance()
 
-        # 3. Gate check
+        # 3. Gate check (skipped for market-making orders that bypass it)
         side_str = "BUY" if side == OrderSide.BUY else "SELL"
-        verdict: GateVerdict = self._gate.check(
-            book=book, true_prob=true_prob, side=side_str,
-            balance=balance, order_size=size_pmusd,
-        )
+        if bypass_gate:
+            verdict = GateVerdict(passed=True, ev_net=0.0, spread_cents=0.0)
+        else:
+            verdict = self._gate.check(
+                book=book, true_prob=true_prob, side=side_str,
+                balance=balance, order_size=size_pmusd,
+            )
         if not verdict:
             log.debug("GATE BLOCKED [%s]: %s", token_id_str[:12], verdict.reject_reason)
             return OrderResult(success=False, error=verdict.reject_reason)
@@ -356,3 +360,30 @@ class ClobExecutor:
             success=True, order_id=order_id, status=status,
             fill_price=price, token_qty=token_qty,
         )
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a single open order by ID."""
+        if self._dry_run:
+            log.info("DRY RUN — cancel order %s skipped", order_id)
+            return True
+        try:
+            self._client.cancel(order_id)
+            log.info("CANCELLED | order_id=%s", order_id)
+            return True
+        except Exception as exc:
+            log.error("cancel_order %s failed: %s", order_id, exc)
+            return False
+
+    def cancel_all_orders(self) -> bool:
+        """Cancel all outstanding open orders."""
+        if self._dry_run:
+            log.info("DRY RUN — cancel_all skipped")
+            return True
+        try:
+            self._client.cancel_all()
+            log.info("CANCEL ALL orders executed")
+            return True
+        except Exception as exc:
+            log.error("cancel_all_orders failed: %s", exc)
+            return False
+
