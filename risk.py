@@ -116,11 +116,13 @@ class ExecutionGate:
             )
 
         if balance is not None and order_size is not None:
-            if order_size > balance.balance:
+            spendable = balance.balance - CRITICAL_BALANCE   # never dip below $10 reserve
+            if order_size > spendable:
                 return GateVerdict(
                     passed=False,
                     reject_reason=(
-                        f"order ${order_size:.2f} > balance ${balance.balance:.2f} PMUSD"
+                        f"order ${order_size:.2f} would breach ${CRITICAL_BALANCE:.0f} reserve "
+                        f"(balance=${balance.balance:.2f} spendable=${spendable:.2f})"
                     ),
                 )
 

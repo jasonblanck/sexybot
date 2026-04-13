@@ -98,10 +98,12 @@ def _parse_balance(raw: dict) -> BalanceInfo:
 
 @dataclass
 class OrderResult:
-    success:  bool
-    order_id: Optional[str]  = None
-    status:   Optional[str]  = None
-    error:    Optional[str]  = None
+    success:    bool
+    order_id:   Optional[str]   = None
+    status:     Optional[str]   = None
+    error:      Optional[str]   = None
+    fill_price: Optional[float] = None   # actual execution price (best_ask/bid at order time)
+    token_qty:  Optional[float] = None   # outcome tokens purchased
 
     def __bool__(self) -> bool:
         return self.success
@@ -206,22 +208,36 @@ class ClobExecutor:
             price = book.best_ask
         else:
             price = book.best_bid
+
+        if price is None:
+            return OrderResult(success=False, error="no execution price available (empty book side)")
+
         price = max(0.001, min(0.999, round(price, 4)))
 
-        log.info(
-            "ORDER QUEUED | side=%s price=%.4f size=$%.2f ev=%.4f spread=%.3fc",
-            side.name, price, size_pmusd, verdict.ev_net, verdict.spread_cents,
-        )
-
-        if self._dry_run:
-            log.info("DRY RUN — not submitted | token=%s…", token_id_str[:14])
-            return OrderResult(success=True, order_id="DRY_RUN", status="dry_run")
-
-        # 5. Build + EIP-712 sign via ClobClient
+        # 5. Compute token size (must happen before dry-run so it's available for both paths)
         # py_clob_client OrderArgs.size = outcome tokens (not USDC).
         # Convert: tokens = USDC_amount / price_per_token.
         clob_side  = BUY if side == OrderSide.BUY else SELL
         token_size = round(size_pmusd / price, 4)
+
+        # Guard: Polymarket rejects orders below $1 notional value
+        if token_size * price < 1.0:
+            return OrderResult(
+                success=False,
+                error=f"order too small: ${token_size * price:.2f} < $1.00 min",
+            )
+
+        log.info(
+            "ORDER QUEUED | side=%s price=%.4f size=$%.2f tokens=%.4f ev=%.4f spread=%.3fc",
+            side.name, price, size_pmusd, token_size, verdict.ev_net, verdict.spread_cents,
+        )
+
+        if self._dry_run:
+            log.info("DRY RUN — not submitted | token=%s…", token_id_str[:14])
+            return OrderResult(
+                success=True, order_id="DRY_RUN", status="dry_run",
+                fill_price=price, token_qty=token_size,
+            )
         try:
             signed = self._client.create_order(
                 OrderArgs(
@@ -246,4 +262,87 @@ class ClobExecutor:
         order_id = resp.get("orderID") or resp.get("order_id") or resp.get("id", "")
         status   = resp.get("status", "unknown")
         log.info("ORDER PLACED | id=%s status=%s token=%s…", order_id, status, token_id_str[:14])
-        return OrderResult(success=True, order_id=order_id, status=status)
+        return OrderResult(
+            success=True, order_id=order_id, status=status,
+            fill_price=price, token_qty=token_size,
+        )
+
+    def close_position(
+        self,
+        token_id:   str | int,
+        token_qty:  float,
+        *,
+        reason:     str = "exit",
+        expiration: int = 0,
+    ) -> OrderResult:
+        """
+        Sell `token_qty` outcome tokens at the current best bid.
+        Used for profit-taking and stop-loss exits.
+
+        Bypasses the EV gate (we always want to exit a losing/winning position),
+        but still requires a live, non-stale book and a non-zero bid.
+        """
+        token_id_str = str(token_id)
+
+        book = self._books.get_book(token_id_str)
+        if book is None:
+            return OrderResult(success=False, error=f"no live book for {token_id_str[:16]}…")
+
+        if book.is_stale:
+            return OrderResult(success=False, error="order book is stale — skipping exit")
+
+        price = book.best_bid
+        if price is None:
+            return OrderResult(success=False, error="no bid on book — cannot exit")
+
+        price = max(0.001, min(0.999, round(price, 4)))
+
+        # Guard: Polymarket rejects orders below $1 notional value
+        if round(token_qty, 4) * price < 1.0:
+            return OrderResult(
+                success=False,
+                error=f"close too small: ${token_qty * price:.2f} < $1.00 min — position abandoned",
+            )
+
+        log.info(
+            "CLOSE QUEUED | reason=%s price=%.4f qty=%.4f token=%s…",
+            reason, price, token_qty, token_id_str[:14],
+        )
+
+        if self._dry_run:
+            log.info("DRY RUN — close not submitted | token=%s…", token_id_str[:14])
+            return OrderResult(
+                success=True, order_id="DRY_RUN", status="dry_run",
+                fill_price=price, token_qty=token_qty,
+            )
+
+        try:
+            signed = self._client.create_order(
+                OrderArgs(
+                    token_id   = token_id_str,
+                    price      = price,
+                    size       = round(token_qty, 4),
+                    side       = SELL,
+                    expiration = expiration,
+                )
+            )
+        except Exception as exc:
+            log.error("close_position create_order failed: %s", exc)
+            return OrderResult(success=False, error=str(exc))
+
+        try:
+            resp = self._client.post_order(signed, OrderType.GTC)
+        except Exception as exc:
+            log.error("close_position post_order failed: %s", exc)
+            return OrderResult(success=False, error=str(exc))
+
+        order_id = resp.get("orderID") or resp.get("order_id") or resp.get("id", "")
+        status   = resp.get("status", "unknown")
+        log.info(
+            "POSITION CLOSED | reason=%s id=%s status=%s token=%s…",
+            reason, order_id, status, token_id_str[:14],
+        )
+        return OrderResult(
+            success=True, order_id=order_id, status=status,
+            fill_price=price, token_qty=token_qty,
+        )

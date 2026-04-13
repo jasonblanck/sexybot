@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 import requests
@@ -20,6 +21,7 @@ import requests
 from discovery import MarketFilter, PolyMarket, fetch_markets
 from executor import ClobExecutor
 from orderbook_ws import BookManager, BookSnapshot
+from redeemer import PositionRedeemer
 from risk import BalanceInfo, ExecutionGate
 from signing import OrderSide
 
@@ -46,8 +48,18 @@ OBI_CONFIRM_MIN  = 0.20   # OBI must agree with signal direction
 MIN_EDGE         = 0.03   # minimum probability edge to place a trade
 
 # Position management
-TRADE_COOLDOWN_SEC = 300  # seconds before re-buying the same token
-MARKET_REFRESH_CYCLES = 20  # re-discover markets every N scan cycles
+TRADE_COOLDOWN_SEC    = 300   # seconds before re-buying the same token
+MARKET_REFRESH_CYCLES = 20   # re-discover markets every N scan cycles
+PROFIT_TARGET         = float(os.getenv("PROFIT_TARGET", "0.08"))   # 8% gain → close
+STOP_LOSS             = float(os.getenv("STOP_LOSS",     "0.05"))   # 5% loss → close
+
+
+@dataclass
+class Position:
+    token_id:   str
+    entry_price: float   # price per outcome token at fill time
+    token_qty:   float   # outcome tokens held
+    entry_time:  float   # unix timestamp
 
 
 # ── Momentum signal ────────────────────────────────────────────────────────────
@@ -202,11 +214,13 @@ async def estimate_true_probability(
 # ── Strategy loop ──────────────────────────────────────────────────────────────
 
 async def strategy_loop(
-    executor:     ClobExecutor,
-    book_manager: BookManager,
-    markets:      list[PolyMarket],
-    last_traded:  dict[str, float],   # persisted across restarts by caller
-    cycle_count:  list[int],          # [0] mutable int, persisted across restarts
+    executor:       ClobExecutor,
+    book_manager:   BookManager,
+    markets:        list[PolyMarket],
+    last_traded:    dict[str, float],      # persisted across restarts by caller
+    cycle_count:    list[int],             # [0] mutable int, persisted across restarts
+    open_positions: dict[str, "Position"], # token_id → Position; persisted across restarts
+    redeemer:       Optional[PositionRedeemer] = None,
 ) -> None:
     # Give WebSocket connections time to receive initial snapshots for all tokens
     log.info("Waiting 10s for WebSocket order books to populate…")
@@ -254,9 +268,54 @@ async def strategy_loop(
             await asyncio.sleep(SCAN_INTERVAL)
             continue
 
-        # Collect live books first
+        # ── Claim resolved positions / merge back-to-back positions ────────────
+        if redeemer is not None:
+            try:
+                claimed = await asyncio.to_thread(redeemer.run_once)
+                if claimed:
+                    log.info("REDEEMER: %d on-chain transaction(s) sent", claimed)
+            except Exception as exc:
+                log.warning("REDEEMER error (non-fatal): %s", exc)
+
+        # ── Exit open positions that hit profit target or stop-loss ─────────────
+        for token_id, pos in list(open_positions.items()):
+            book = book_manager.get_book(token_id)
+            if book is None or book.is_stale or book.best_bid is None:
+                continue
+            gain = (book.best_bid - pos.entry_price) / pos.entry_price
+            if gain >= PROFIT_TARGET:
+                reason = f"profit {gain * 100:.1f}%"
+            elif gain <= -STOP_LOSS:
+                reason = f"stop-loss {gain * 100:.1f}%"
+            else:
+                continue
+
+            log.info(
+                "EXIT | %s  reason=%s  entry=%.4f  bid=%.4f  qty=%.4f",
+                token_id[:14], reason, pos.entry_price, book.best_bid, pos.token_qty,
+            )
+            try:
+                exit_result = await asyncio.to_thread(
+                    executor.close_position, token_id, pos.token_qty, reason=reason
+                )
+            except Exception as exc:
+                log.error("close_position error for %s: %s", token_id[:14], exc)
+                continue
+
+            if exit_result:
+                del open_positions[token_id]
+                last_traded[token_id] = time.time()   # cooldown after exit
+                log.info(
+                    "EXITED | %s  reason=%s  id=%s  status=%s",
+                    token_id[:14], reason, exit_result.order_id, exit_result.status,
+                )
+
+        # Collect live books — skip markets with an open position (no stacking)
         live: list[tuple[PolyMarket, BookSnapshot]] = []
         for mkt in markets:
+            if mkt.yes_token_id in open_positions or mkt.no_token_id in open_positions:
+                log.debug("SKIP (position held): %s", mkt.question[:40])
+                continue
             yes_book = book_manager.get_book(mkt.yes_token_id)
             if yes_book is None or yes_book.is_stale:
                 log.debug("No live book for %s", mkt.question[:40])
@@ -299,12 +358,13 @@ async def strategy_loop(
                 continue
 
             try:
-                result = executor.place_limit_order(
-                    token_id       = trade_token_id,
-                    side           = trade_side,
-                    true_prob      = trade_prob,
-                    size_pmusd     = MAX_ORDER_SIZE,
-                    cached_balance = cycle_balance,
+                result = await asyncio.to_thread(
+                    executor.place_limit_order,
+                    trade_token_id,
+                    trade_side,
+                    trade_prob,
+                    MAX_ORDER_SIZE,
+                    cached_balance=cycle_balance,
                 )
             except Exception as exc:
                 log.error("Order error for %s: %s", mkt.question[:40], exc)
@@ -312,9 +372,26 @@ async def strategy_loop(
 
             if result:
                 last_traded[trade_token_id] = time.time()
+                # Deduct spend from cached balance so the next order this cycle
+                # sees the reduced figure and cannot breach the $10 reserve.
+                if cycle_balance is not None and result.fill_price and result.token_qty:
+                    spent_raw = int(result.fill_price * result.token_qty * 1_000_000)
+                    cycle_balance = BalanceInfo(
+                        balance_raw   = max(0, cycle_balance.balance_raw - spent_raw),
+                        allowance_raw = cycle_balance.allowance_raw,
+                    )
+                # Track position for profit-taking / stop-loss
+                if result.fill_price is not None and result.token_qty is not None:
+                    open_positions[trade_token_id] = Position(
+                        token_id    = trade_token_id,
+                        entry_price = result.fill_price,
+                        token_qty   = result.token_qty,
+                        entry_time  = time.time(),
+                    )
                 log.info(
-                    "EXECUTED | %s  id=%s  status=%s",
+                    "EXECUTED | %s  id=%s  status=%s  entry=%.4f  qty=%.4f",
                     mkt.question[:55], result.order_id, result.status,
+                    result.fill_price or 0, result.token_qty or 0,
                 )
 
         await asyncio.sleep(SCAN_INTERVAL)
@@ -358,15 +435,31 @@ async def main() -> None:
         funder_address = FUNDER_ADDRESS,
     )
 
+    # 3b. Position redeemer (only when a proxy/funder wallet is configured)
+    redeemer: Optional[PositionRedeemer] = None
+    if FUNDER_ADDRESS:
+        redeemer = PositionRedeemer(
+            private_key    = PRIVATE_KEY,
+            safe_address   = FUNDER_ADDRESS,
+            signer_address = executor._client.get_address(),
+            dry_run        = DRY_RUN,
+        )
+        log.info("PositionRedeemer ready | safe=%s", FUNDER_ADDRESS)
+
     # 4. Run WebSocket + strategy concurrently
     # strategy_loop is isolated — an exception there won't cancel book_manager.
     # last_traded and cycle_count live here so they survive strategy_loop restarts.
     async def _strategy_with_restart() -> None:
-        last_traded: dict[str, float] = {}
-        cycle_count: list[int] = [0]   # mutable box so strategy_loop can increment it
+        last_traded:    dict[str, float]    = {}
+        open_positions: dict[str, Position] = {}
+        cycle_count:    list[int]           = [0]   # mutable box
         while True:
             try:
-                await strategy_loop(executor, book_manager, markets, last_traded, cycle_count)
+                await strategy_loop(
+                    executor, book_manager, markets,
+                    last_traded, cycle_count, open_positions,
+                    redeemer=redeemer,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
