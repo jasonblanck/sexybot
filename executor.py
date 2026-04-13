@@ -219,13 +219,16 @@ class ClobExecutor:
             return OrderResult(success=True, order_id="DRY_RUN", status="dry_run")
 
         # 5. Build + EIP-712 sign via ClobClient
-        clob_side = BUY if side == OrderSide.BUY else SELL
+        # py_clob_client OrderArgs.size = outcome tokens (not USDC).
+        # Convert: tokens = USDC_amount / price_per_token.
+        clob_side  = BUY if side == OrderSide.BUY else SELL
+        token_size = round(size_pmusd / price, 4)
         try:
             signed = self._client.create_order(
                 OrderArgs(
                     token_id   = token_id_str,
                     price      = price,
-                    size       = size_pmusd,
+                    size       = token_size,
                     side       = clob_side,
                     expiration = expiration,
                 )

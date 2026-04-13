@@ -235,11 +235,24 @@ async def strategy_loop(
 
             true_prob, side = result_pair
 
+            # On Polymarket you can only BUY tokens you don't yet own.
+            # A bearish (NO) signal means BUY NO tokens, not SELL YES tokens.
+            # Map: SELL YES → BUY NO using the complementary token_id.
+            if side == OrderSide.SELL:
+                trade_token_id = mkt.no_token_id
+                trade_side     = OrderSide.BUY
+                # true_prob was estimated on YES; flip to NO perspective
+                trade_prob = 1.0 - true_prob
+            else:
+                trade_token_id = mkt.yes_token_id
+                trade_side     = side
+                trade_prob     = true_prob
+
             try:
                 result = executor.place_limit_order(
-                    token_id       = mkt.yes_token_id,
-                    side           = side,
-                    true_prob      = true_prob,
+                    token_id       = trade_token_id,
+                    side           = trade_side,
+                    true_prob      = trade_prob,
                     size_pmusd     = MAX_ORDER_SIZE,
                     cached_balance = cycle_balance,
                 )
