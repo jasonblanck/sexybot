@@ -115,12 +115,15 @@ class MarketMaker:
 
         # Guard: ensure both order legs won't push balance below the $10 reserve.
         # bypass_gate=True skips the executor's reserve check, so we enforce it here.
+        # Each cycle places a BUY YES leg and a BUY NO leg, each costing self._size USDC,
+        # so the spendable balance must cover 2 × order_size.
         if balance is not None:
             spendable = balance.balance - CRITICAL_BALANCE
-            if spendable < self._size:
+            required  = 2 * self._size
+            if spendable < required:
                 log.warning(
-                    "MM: spendable $%.2f < order_size $%.2f — insufficient margin for both legs",
-                    spendable, self._size,
+                    "MM: spendable $%.2f < 2 × order_size $%.2f — insufficient margin for both legs",
+                    spendable, required,
                 )
                 return 0
 

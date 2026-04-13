@@ -2307,10 +2307,12 @@ async def manual_trade(
         except Exception as e:
             log.debug(f"idempotency lookup failed: {e}")
 
-    # Route through _execute_order so PAPER_MODE is respected even for manual trades
+    # Route through _execute_order so PAPER_MODE is respected even for manual trades.
+    # For limit orders, `size` is the share count (= amount_usdc / price), not USDC.
+    size = round(amount / price, 4) if order_type == "limit" and price > 0 else amount
     result = await bot._execute_order(
         token_id, side.upper(), amount, "",
-        order_type, price, amount
+        order_type, price, size
     )
 
     # Persist idempotency key so retries within 24h return the same result
