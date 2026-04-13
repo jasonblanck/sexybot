@@ -128,6 +128,95 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .log-li{color:#4488ff;}.log-le{color:var(--red);}.log-ls{color:var(--green);}.log-lo{color:var(--accent2);}.log-lw{color:var(--accent);}
 /* ── KILL FOOTER ── */
 .kill-bar{background:#000;border-top:1px solid #ff3355;padding:10px 20px;display:flex;align-items:center;justify-content:space-between;}
+
+/* ── VIEW TOGGLE BUTTON ── */
+.view-toggle{background:transparent;border:1px solid var(--border2);color:var(--text2);font-family:var(--mono);font-size:11px;padding:4px 10px;border-radius:3px;cursor:pointer;letter-spacing:1px;transition:color .15s,border-color .15s;white-space:nowrap;}
+.view-toggle:hover{color:var(--accent);border-color:var(--accent);}
+
+/* ── MOBILE BOTTOM NAV ── */
+.mob-nav{display:none;position:fixed;bottom:0;left:0;right:0;background:#000;border-top:1px solid var(--accent);z-index:200;height:56px;padding-bottom:env(safe-area-inset-bottom,0);}
+.mob-nav-inner{display:flex;height:56px;}
+.mob-tab{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;cursor:pointer;color:var(--text3);font-family:var(--mono);font-size:8px;letter-spacing:1px;border:none;background:transparent;padding:0;transition:color .15s;}
+.mob-tab.active{color:var(--accent);}
+.mob-tab svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;}
+
+/* ── MOBILE VIEW OVERRIDES ── */
+[data-view="mobile"] body{font-size:14px;}
+[data-view="mobile"] .hdr-nav{display:none;}
+[data-view="mobile"] #hdr-tickers{display:none!important;}
+[data-view="mobile"] #clock{display:none;}
+[data-view="mobile"] .mob-nav{display:block;}
+[data-view="mobile"] .hdr{padding:0 12px;}
+[data-view="mobile"] .hdr-logo{font-size:13px;letter-spacing:2px;}
+[data-view="mobile"] #stext{font-size:10px;}
+
+/* Dashboard: single column */
+[data-view="mobile"] .main{grid-template-columns:1fr;min-height:unset;}
+[data-view="mobile"] .main .col{gap:0;}
+/* Reorder columns: center first (key data), then left (portfolio), then right */
+[data-view="mobile"] .main .col:nth-child(1){order:2;}
+[data-view="mobile"] .main .col:nth-child(2){order:1;}
+[data-view="mobile"] .main .col:nth-child(3){order:3;}
+
+/* Mobile panel collapsing */
+[data-view="mobile"] .panel{padding:12px 14px;}
+[data-view="mobile"] .mob-collapse>.panel-title{cursor:pointer;user-select:none;}
+[data-view="mobile"] .mob-collapse>.panel-title::after{content:'▾';float:right;color:var(--text3);font-size:12px;transition:transform .2s;}
+[data-view="mobile"] .mob-collapse.collapsed>.panel-title::after{transform:rotate(-90deg);}
+[data-view="mobile"] .mob-collapse.collapsed>*:not(.panel-title){display:none!important;}
+
+/* Mobile sticky portfolio bar at top of dashboard */
+.mob-port-bar{display:none;background:#000;border-bottom:1px solid var(--border2);padding:8px 14px;gap:0;}
+[data-view="mobile"] #page-dashboard .mob-port-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:nowrap;}
+.mob-port-bar .mpb-item{text-align:center;min-width:0;}
+.mob-port-bar .mpb-lbl{font-family:var(--mono);font-size:8px;letter-spacing:1px;color:var(--text3);margin-bottom:1px;}
+.mob-port-bar .mpb-val{font-family:var(--mono);font-size:15px;font-weight:500;white-space:nowrap;}
+
+/* Mobile page padding and body scroll */
+[data-view="mobile"] .pg-wrap{padding:14px 14px 80px;}
+[data-view="mobile"] .pg-grid-2{grid-template-columns:1fr;}
+[data-view="mobile"] .pg-grid-3{grid-template-columns:1fr;}
+[data-view="mobile"] .kill-bar{margin-bottom:56px;}
+
+/* Mobile tables: make them scroll horizontally */
+[data-view="mobile"] .dt-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+[data-view="mobile"] .dt{min-width:480px;}
+[data-view="mobile"] .mkt-table{min-width:340px;}
+
+/* Mobile settings: stack rows */
+[data-view="mobile"] .srow{flex-direction:column;align-items:flex-start;gap:8px;}
+[data-view="mobile"] .sinput,[data-view="mobile"] .sselect{width:100%;}
+
+/* Mobile trades stat grid */
+[data-view="mobile"] #page-trades .pg-grid{grid-template-columns:1fr 1fr;}
+
+/* Mobile chart height */
+[data-view="mobile"] .chart-wrap{height:140px;}
+[data-view="mobile"] .log-wrap{height:calc(100vh - 180px);}
+
+/* Add bottom padding to all pages in mobile so content doesn't hide under nav */
+[data-view="mobile"] .page{padding-bottom:0;}
+
+/* Auto mobile on narrow screens unless user overrides */
+@media(max-width:768px){
+  :root{--auto-mobile:1;}
+  body:not([data-override="desktop"]) .hdr-nav{display:none;}
+  body:not([data-override="desktop"]) #hdr-tickers{display:none!important;}
+  body:not([data-override="desktop"]) #clock{display:none;}
+  body:not([data-override="desktop"]) .mob-nav{display:block;}
+  body:not([data-override="desktop"]) .main{grid-template-columns:1fr;min-height:unset;}
+  body:not([data-override="desktop"]) .main .col:nth-child(1){order:2;}
+  body:not([data-override="desktop"]) .main .col:nth-child(2){order:1;}
+  body:not([data-override="desktop"]) .main .col:nth-child(3){order:3;}
+  body:not([data-override="desktop"]) .kill-bar{margin-bottom:56px;}
+  body:not([data-override="desktop"]) .pg-wrap{padding:14px 14px 80px;}
+  body:not([data-override="desktop"]) .pg-grid-2{grid-template-columns:1fr;}
+  body:not([data-override="desktop"]) .pg-grid-3{grid-template-columns:1fr;}
+  body:not([data-override="desktop"]) .panel{padding:12px 14px;}
+  body:not([data-override="desktop"]) .hdr{padding:0 12px;}
+  body:not([data-override="desktop"]) .hdr-logo{font-size:13px;letter-spacing:2px;}
+  body:not([data-override="desktop"]) #page-trades .pg-grid{grid-template-columns:1fr 1fr;}
+}
 </style></head>
 <body>
 
@@ -151,6 +240,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
     <span id="clock">—</span>
     <div class="dot pulse" id="sdot"></div>
     <span id="stext">connecting</span>
+    <button class="view-toggle" id="view-toggle-btn" onclick="toggleView()" title="Switch desktop/mobile view">📱 MOBILE</button>
   </div>
 </header>
 
@@ -158,6 +248,14 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
      PAGE: DASHBOARD
 ═══════════════════════════════════════════════════════════ -->
 <div id="page-dashboard" class="page active">
+<!-- Mobile portfolio summary bar -->
+<div class="mob-port-bar">
+  <div class="mpb-item"><div class="mpb-lbl">BALANCE</div><div class="mpb-val g" id="mob-cash">$—</div></div>
+  <div class="mpb-item"><div class="mpb-lbl">P&L</div><div class="mpb-val" id="mob-pnl">$—</div></div>
+  <div class="mpb-item"><div class="mpb-lbl">WIN RATE</div><div class="mpb-val y" id="mob-wr">—</div></div>
+  <div class="mpb-item" style="display:flex;align-items:center;gap:5px"><div class="dot pulse" id="mob-dot"></div><div class="mpb-val" id="mob-status" style="font-size:11px;color:var(--text2)">—</div></div>
+</div>
+
 <div class="main">
   <div class="col">
     <div class="panel">
@@ -1163,5 +1261,110 @@ setInterval(fetchPaperPortfolio,30000);
 connectWS();
 // Handle initial hash
 (()=>{const pg=location.hash.slice(1);if(pg&&pg!=='dashboard')showPage(pg);})();
+
+/* ── VIEW TOGGLE ── */
+(function(){
+  var saved = localStorage.getItem('sbView');
+  var isMobile = window.innerWidth <= 768;
+  var view = saved || (isMobile ? 'mobile' : 'desktop');
+  applyView(view);
+})();
+function applyView(v){
+  document.documentElement.setAttribute('data-view', v);
+  if(v==='mobile') document.body.setAttribute('data-override','');
+  else document.body.setAttribute('data-override','desktop');
+  var btn = document.getElementById('view-toggle-btn');
+  if(btn) btn.textContent = v==='mobile' ? '🖥 DESKTOP' : '📱 MOBILE';
+  localStorage.setItem('sbView', v);
+  // Add collapse behavior to panels in mobile
+  if(v==='mobile') initMobileCollapse();
+  // Sync mobile port bar
+  syncMobPortBar();
+}
+function toggleView(){
+  var cur = document.documentElement.getAttribute('data-view') || 'desktop';
+  applyView(cur==='mobile' ? 'desktop' : 'mobile');
+}
+function mobActivate(el){
+  document.querySelectorAll('.mob-tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+}
+function initMobileCollapse(){
+  document.querySelectorAll('.panel').forEach(function(p){
+    if(!p.closest('.mob-collapse')) {
+      p.parentElement && p.parentElement.classList.contains('col') && p.classList.add('mob-collapse');
+    }
+  });
+  // By default collapse lower-priority panels
+  var lowPri = ['FED / MACRO','WEATHER','CRYPTO','MARKET MOVERS','TRADE HISTORY'];
+  document.querySelectorAll('.panel-title').forEach(function(t){
+    if(lowPri.some(s=>t.textContent.trim().startsWith(s))){
+      var panel = t.parentElement;
+      panel.classList.add('mob-collapse');
+      panel.classList.add('collapsed');
+      // toggle on click
+      t.addEventListener('click', function(){ panel.classList.toggle('collapsed'); });
+    }
+  });
+  // Make open panels toggle-able too
+  document.querySelectorAll('.panel.mob-collapse:not(.collapsed) .panel-title').forEach(function(t){
+    if(!t._mobBound){ t._mobBound=true; t.addEventListener('click', function(){ t.parentElement.classList.toggle('collapsed'); }); }
+  });
+}
+function syncMobPortBar(){
+  // keep mob-port-bar in sync with main data
+  var bal = document.getElementById('cash-balance');
+  var pnl = document.getElementById('pc-pnl');
+  var wr  = document.getElementById('winrate');
+  var dot = document.getElementById('sdot');
+  var st  = document.getElementById('stext');
+  if(bal) { var mb=document.getElementById('mob-cash'); if(mb) mb.textContent=bal.textContent; }
+  if(pnl) { var mp=document.getElementById('mob-pnl'); if(mp){ mp.textContent=pnl.textContent; mp.className='mpb-val'+(pnl.textContent.includes('-')?' r':' g'); } }
+  if(wr)  { var mw=document.getElementById('mob-wr');  if(mw) mw.textContent=wr.textContent; }
+  if(dot && st){ var md=document.getElementById('mob-dot'); var ms=document.getElementById('mob-status'); if(md){md.className=dot.className;} if(ms) ms.textContent=st.textContent; }
+}
+// Sync port bar whenever bot data updates
+var _origFetchBot = typeof fetchBot !== 'undefined' ? fetchBot : null;
+function _postFetchBot(){ setTimeout(syncMobPortBar, 200); }
+// override showPage to sync mobile nav
+var _origShowPage = showPage;
+showPage = function(id, el){
+  _origShowPage(id, el);
+  // sync mobile nav active state
+  var mapping = {dashboard:'mnt-dashboard',activity:'mnt-activity',positions:'mnt-positions',trades:'mnt-trades',settings:'mnt-settings'};
+  var mnId = mapping[id];
+  if(mnId){ document.querySelectorAll('.mob-tab').forEach(t=>t.classList.remove('active')); var mn=document.getElementById(mnId); if(mn) mn.classList.add('active'); }
+};
+// wrap fetchBot to keep mob bar in sync
+document.addEventListener('DOMContentLoaded', function(){ setInterval(syncMobPortBar, 5000); });
+setTimeout(function(){ syncMobPortBar(); if(document.documentElement.getAttribute('data-view')==='mobile') initMobileCollapse(); }, 1000);
+
 </script>
+
+<!-- ── MOBILE BOTTOM NAV ── -->
+<nav class="mob-nav">
+  <div class="mob-nav-inner">
+    <button class="mob-tab active" id="mnt-dashboard" onclick="showPage('dashboard',null);mobActivate(this)">
+      <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      DASH
+    </button>
+    <button class="mob-tab" id="mnt-activity" onclick="showPage('activity',null);mobActivate(this)">
+      <svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      SIGNALS
+    </button>
+    <button class="mob-tab" id="mnt-positions" onclick="showPage('positions',null);mobActivate(this)">
+      <svg viewBox="0 0 24 24"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+      POS
+    </button>
+    <button class="mob-tab" id="mnt-trades" onclick="showPage('trades',null);mobActivate(this)">
+      <svg viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
+      TRADES
+    </button>
+    <button class="mob-tab" id="mnt-settings" onclick="showPage('settings',null);mobActivate(this)">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      CONFIG
+    </button>
+  </div>
+</nav>
+
 </body></html>
