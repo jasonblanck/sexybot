@@ -1330,6 +1330,17 @@ Rules:
         if not yes_id:
             return None
 
+        # ── Universal pre-filter: skip markets Claude can't trade profitably ──
+        liq = float(market.get("liquidity", market.get("liquidityNum", 0)) or 0)
+        vol = float(market.get("volume24hr", 0) or 0)
+        # Skip resolved/near-resolved markets (yes≤2% or ≥98%) — no momentum edge,
+        # just burns Anthropic API credits on already-decided outcomes
+        if yes_p <= 0.02 or yes_p >= 0.98:
+            return None
+        # Skip dead or illiquid markets — can't execute meaningfully
+        if liq < 5_000 or vol < 200:
+            return None
+
         if STRATEGY == "momentum":
             dev = abs(yes_p - 0.5)
             if dev > 0.08:
