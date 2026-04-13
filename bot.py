@@ -82,6 +82,7 @@ class PolymarketBot:
         self.log_lines: list = []
         self.ws_clients: list = []
         self._monitor_active: bool = False  # guard against duplicate position_monitor_loop tasks
+        self._paper_oracle_task: Optional[asyncio.Task] = None   # single paper oracle task handle
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -128,6 +129,12 @@ class PolymarketBot:
                 response TEXT NOT NULL,
                 created TEXT NOT NULL
             )""")
+            # Indexes on frequent WHERE-clause columns. Without these,
+            # get_daily_loss and brier-stats queries scan the whole table
+            # as trades/brier_scores grow — latency creeps up over weeks.
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_trades_time   ON trades(time)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_brier_resolved ON brier_scores(resolved)")
             # Purge idempotency keys older than 24h on startup
             self.db.execute(
                 "DELETE FROM idempotency_keys WHERE datetime(created) < datetime('now', '-24 hours')"
@@ -1932,7 +1939,23 @@ Rules:
 
     def stop(self):
         self.running = False
+        # Cancel the paper oracle if it's active so we don't leak a task
+        # (the oracle loops on its own timer and doesn't check bot.running).
+        if self._paper_oracle_task and not self._paper_oracle_task.done():
+            self._paper_oracle_task.cancel()
+        self._paper_oracle_task = None
         self.cancel_all_orders()
+
+    def start_paper_oracle(self) -> None:
+        """Start the paper resolution oracle, at most once.
+        Each /start (REST + WS) previously spawned a new oracle task; with
+        _paper_oracle looping forever on a 5-min timer, restarts stacked up
+        duplicate oracles. This guard ensures exactly one live task."""
+        if not (PAPER_MODE and _PAPER_AVAILABLE and self.paper):
+            return
+        if self._paper_oracle_task and not self._paper_oracle_task.done():
+            return   # already running
+        self._paper_oracle_task = asyncio.create_task(_paper_oracle(self.paper))
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -2153,7 +2176,7 @@ async def lifespan(app_: FastAPI):
         _bot_task = asyncio.create_task(bot.run_loop(interval=30.0))
         log.info("Bot auto-started on startup")
         if PAPER_MODE and _PAPER_AVAILABLE and bot.paper:
-            asyncio.create_task(_paper_oracle(bot.paper))
+            bot.start_paper_oracle()
             log.info("[PAPER] Resolution oracle started (5 min interval)")
         if STRATEGY in ("econFlow", "both"):
             asyncio.create_task(bot.position_monitor_loop())
@@ -2163,8 +2186,14 @@ async def lifespan(app_: FastAPI):
     yield
     # shutdown
     bot.running = False
+    if bot._paper_oracle_task and not bot._paper_oracle_task.done():
+        bot._paper_oracle_task.cancel()
     if _bot_task and not _bot_task.done():
         _bot_task.cancel()
+        try:
+            await _bot_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 app = FastAPI(title="Polymarket Bot", lifespan=lifespan)
 app.add_middleware(_ResourceMiddleware)
@@ -2250,7 +2279,7 @@ async def start_bot(interval: float = 30.0):
         if not bot.paper and hasattr(bot, 'db'):
             bot.paper = PolymarketPaperHandler(bot.db, PAPER_BALANCE)
         if bot.paper:
-            asyncio.create_task(_paper_oracle(bot.paper))
+            bot.start_paper_oracle()
             log.info("[PAPER] Resolution oracle restarted")
     if STRATEGY in ("econFlow", "both"):
         asyncio.create_task(bot.position_monitor_loop())
@@ -2523,7 +2552,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     bot.running = True  # set before task creation to prevent double-start race
                     _bot_task = asyncio.create_task(bot.run_loop())
                     if PAPER_MODE and _PAPER_AVAILABLE and bot.paper:
-                        asyncio.create_task(_paper_oracle(bot.paper))
+                        bot.start_paper_oracle()
             elif cmd == "stop":
                 bot.stop()
             elif cmd == "trade":
