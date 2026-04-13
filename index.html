@@ -989,11 +989,13 @@ async function fetchIndices(){
 }
 
 /* ── WEBSOCKET ── */
-const WS_API_KEY=sessionStorage.getItem('sb_key')||'';
 function connectWS(){
+  // Read the API key on every (re)connect so a key saved via saveSettings
+  // after page load is picked up without a full refresh.
+  const wsKey=sessionStorage.getItem('sb_key')||'';
   const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+'/ws');
   ws.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.connected||d.error||(!d.hasOwnProperty('running')&&!d.trades))return;applyState(d);}catch(err){}};
-  ws.onopen=()=>{if(WS_API_KEY)ws.send(JSON.stringify({cmd:'auth',key:WS_API_KEY}));};
+  ws.onopen=()=>{if(wsKey)ws.send(JSON.stringify({cmd:'auth',key:wsKey}));};
   ws.onclose=()=>setTimeout(connectWS,3000);
   ws.onerror=()=>ws.close();
 }
@@ -1204,8 +1206,24 @@ async function saveSettings(){
 ══════════════════════════════════════════════════════ */
 async function confirmKill(){
   document.getElementById('kill-overlay').style.display='none';
-  const key=sessionStorage.getItem('sb_key')||'';
-  try{await fetch(`${BOT}/stop`,{method:'POST',headers:key?{'X-API-Key':key}:{}});}catch(e){}
+  // /stop requires an API key — prompt if missing so the request isn't silently rejected.
+  const key=sessionStorage.getItem('sb_key')||prompt('Enter API key to stop the bot:','')||'';
+  if(!key){
+    document.getElementById('kill-status').textContent='kill cancelled — API key required';
+    return;
+  }
+  sessionStorage.setItem('sb_key',key);
+  try{
+    const r=await fetch(`${BOT}/stop`,{method:'POST',headers:{'X-API-Key':key}});
+    if(!r.ok){
+      let detail='';try{const d=await r.json();detail=d.detail||'';}catch(e){}
+      document.getElementById('kill-status').textContent=`kill failed (HTTP ${r.status})${detail?': '+detail:''}`;
+      return;
+    }
+  }catch(e){
+    document.getElementById('kill-status').textContent='kill failed — bot unreachable';
+    return;
+  }
   document.getElementById('kill-status').textContent='bot stopped';
   document.getElementById('sdot').className='dot off';
   document.getElementById('stext').textContent='stopped';
