@@ -228,31 +228,73 @@ class ClobWebSocket:
 
 
 class BookManager:
+    """
+    Manages live order books for multiple markets over a minimal number of
+    WebSocket connections.
+
+    All token IDs are batched into a single ClobWebSocket (up to TOKENS_PER_CONN
+    per connection). This replaces the previous design that created one connection
+    per market pair, which opened 20+ connections for 20 markets.
+
+    Usage
+    -----
+    mgr = BookManager()
+    mgr.add_market(yes_token_id, no_token_id)   # call before run()
+    await mgr.run()                              # blocks; use create_task()
+    snap = mgr.get_book(token_id)
+    """
+
+    TOKENS_PER_CONN = 80   # Polymarket WS handles ~100 tokens; stay conservative
+
     def __init__(self, on_update: Optional[BookCallback] = None):
-        self._on_update = on_update
-        self._ws_tasks: list[asyncio.Task]       = []
-        self._clients:  list[ClobWebSocket]      = []
-        self._registry: dict[str, ClobWebSocket] = {}
+        self._on_update   = on_update
+        self._pending:    list[str]       = []   # all token IDs to subscribe
+        self._ws_tasks:   list[asyncio.Task]     = []
+        self._clients:    list[ClobWebSocket]    = []
 
     def add_market(self, yes_token_id: str, no_token_id: str) -> None:
-        client = ClobWebSocket(
-            token_ids=[yes_token_id, no_token_id],
-            on_book_update=self._on_update,
-        )
-        self._clients.append(client)
-        self._registry[yes_token_id] = client
-        self._registry[no_token_id]  = client
+        """Register a market pair. Must be called before run()."""
+        for tid in (yes_token_id, no_token_id):
+            if tid not in self._pending:
+                self._pending.append(tid)
 
     def get_book(self, token_id: str) -> Optional[BookSnapshot]:
-        client = self._registry.get(token_id)
-        return client.get_book(token_id) if client else None
+        """Return the latest snapshot for a token, or None if not yet received."""
+        for client in self._clients:
+            snap = client.get_book(token_id)
+            if snap is not None:
+                return snap
+        return None
 
     async def run(self) -> None:
+        """
+        Batch all registered tokens into connections of TOKENS_PER_CONN and
+        launch them concurrently. Blocks until all connections stop.
+        """
+        if not self._pending:
+            log.warning("BookManager.run() called with no tokens registered")
+            return
+
+        # Chunk tokens into batches
+        batches = [
+            self._pending[i : i + self.TOKENS_PER_CONN]
+            for i in range(0, len(self._pending), self.TOKENS_PER_CONN)
+        ]
+
+        self._clients = [
+            ClobWebSocket(token_ids=batch, on_book_update=self._on_update)
+            for batch in batches
+        ]
+
+        log.info(
+            "BookManager: %d token(s) across %d WS connection(s)",
+            len(self._pending), len(self._clients),
+        )
+
         self._ws_tasks = [
             asyncio.create_task(client.run(), name=f"ws-{i}")
             for i, client in enumerate(self._clients)
         ]
-        log.info("BookManager: running %d WS connection(s)", len(self._ws_tasks))
         await asyncio.gather(*self._ws_tasks, return_exceptions=True)
 
     async def stop(self) -> None:

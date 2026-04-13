@@ -20,7 +20,7 @@ import requests
 from discovery import MarketFilter, PolyMarket, fetch_markets
 from executor import ClobExecutor
 from orderbook_ws import BookManager, BookSnapshot
-from risk import ExecutionGate
+from risk import BalanceInfo, ExecutionGate
 from signing import OrderSide
 
 log = logging.getLogger(__name__)
@@ -28,27 +28,27 @@ log = logging.getLogger(__name__)
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 PRIVATE_KEY      = os.environ["PRIVATE_KEY"]
-MIN_LIQUIDITY    = float(os.getenv("MIN_LIQUIDITY",      "10000"))
-MIN_VOLUME_24H   = float(os.getenv("MIN_VOLUME",         "1000"))
-MAX_ORDER_SIZE   = float(os.getenv("MAX_ORDER_SIZE",     "10"))
+MIN_LIQUIDITY    = float(os.getenv("MIN_LIQUIDITY",    "10000"))
+MIN_VOLUME_24H   = float(os.getenv("MIN_VOLUME",       "1000"))
+MAX_ORDER_SIZE   = float(os.getenv("MAX_ORDER_SIZE",   "10"))
 DRY_RUN          = os.getenv("DRY_RUN", "true").lower() == "true"
-SPREAD_MAX_CENTS = float(os.getenv("SPREAD_MAX_CENTS",   "0.5"))
-SCAN_INTERVAL    = float(os.getenv("SCAN_INTERVAL",      "30"))
+SPREAD_MAX_CENTS = float(os.getenv("SPREAD_MAX_CENTS", "0.5"))
+SCAN_INTERVAL    = float(os.getenv("SCAN_INTERVAL",    "30"))
 
-CLOB_BASE        = "https://clob.polymarket.com"
-REQUEST_TIMEOUT  = 8
+CLOB_BASE       = "https://clob.polymarket.com"
+REQUEST_TIMEOUT = 8
 
 # Momentum thresholds
-SPIKE_WINDOW_SEC   = 60      # look-back window for recent trades
-SPIKE_RATIO_MIN    = 2.5     # recent rate must be 2.5x the baseline to fire
-OBI_CONFIRM_MIN    = 0.20    # OBI must agree with direction (same sign, >= this)
-MIN_EDGE           = 0.03    # minimum raw probability edge over market price
+SPIKE_WINDOW_SEC = 60     # look-back window for recent trades
+SPIKE_RATIO_MIN  = 2.5    # recent rate must be 2.5× the baseline
+OBI_CONFIRM_MIN  = 0.20   # OBI must agree with signal direction
+MIN_EDGE         = 0.03   # minimum probability edge to place a trade
 
 
 # ── Momentum signal ────────────────────────────────────────────────────────────
 
-def _get_recent_trades(token_id: str) -> list[dict]:
-    """Fetch last 100 CLOB trades for a token."""
+def _get_recent_trades_sync(token_id: str) -> list[dict]:
+    """Synchronous trade fetch — always call via asyncio.to_thread()."""
     try:
         resp = requests.get(
             f"{CLOB_BASE}/trades",
@@ -62,6 +62,14 @@ def _get_recent_trades(token_id: str) -> list[dict]:
         return []
 
 
+async def _get_recent_trades(token_id: str) -> list[dict]:
+    """
+    Fetch recent CLOB trades without blocking the event loop.
+    Uses asyncio.to_thread so WebSocket processing continues while waiting.
+    """
+    return await asyncio.to_thread(_get_recent_trades_sync, token_id)
+
+
 def _detect_volume_spike(trades: list[dict]) -> dict:
     """
     Detect a directional volume spike in recent CLOB trades.
@@ -71,12 +79,14 @@ def _detect_volume_spike(trades: list[dict]) -> dict:
         return {"has_spike": False, "dominant_side": None, "confidence": 0.0, "spike_ratio": 0.0}
 
     now = time.time()
-    recent, baseline = [], []
+    recent: list[dict] = []
+    baseline: list[dict] = []
+
     for t in trades:
         try:
             ts = float(t.get("timestamp", t.get("created_at", 0)))
             if ts > 1e12:
-                ts /= 1000
+                ts /= 1000      # milliseconds → seconds
             age = now - ts
             if age <= SPIKE_WINDOW_SEC:
                 recent.append(t)
@@ -93,10 +103,11 @@ def _detect_volume_spike(trades: list[dict]) -> dict:
     spike_ratio   = recent_rate / baseline_rate
     has_spike     = spike_ratio >= SPIKE_RATIO_MIN
 
-    # Determine directional bias from recent trades
-    yes_vol = sum(float(t.get("size", 0)) for t in recent if t.get("side", "").upper() in ("BUY", "YES"))
-    no_vol  = sum(float(t.get("size", 0)) for t in recent if t.get("side", "").upper() in ("SELL", "NO"))
-    total   = yes_vol + no_vol or 1
+    yes_vol = sum(float(t.get("size", 0)) for t in recent
+                  if t.get("side", "").upper() in ("BUY", "YES"))
+    no_vol  = sum(float(t.get("size", 0)) for t in recent
+                  if t.get("side", "").upper() in ("SELL", "NO"))
+    total   = (yes_vol + no_vol) or 1.0
 
     yes_pct = yes_vol / total
     if yes_pct >= 0.60:
@@ -119,50 +130,49 @@ def _detect_volume_spike(trades: list[dict]) -> dict:
     }
 
 
-def estimate_true_probability(
+async def estimate_true_probability(
     market: PolyMarket,
     book:   BookSnapshot,
 ) -> Optional[tuple[float, OrderSide]]:
     """
-    Momentum + OBI signal model.
+    Momentum + OBI signal model. Returns (true_prob, side) or None.
 
-    Returns (true_prob, side) when a tradeable edge is detected, else None.
-
-    Signal logic:
-      1. Volume spike on CLOB trades (directional momentum)
-      2. OBI confirms the same direction
-      3. Estimated true probability must imply edge > MIN_EDGE over market price
+    Logic:
+      1. Fetch recent CLOB trades asynchronously
+      2. Detect volume spike; fall back to pure OBI if no spike
+      3. OBI must confirm (not oppose) the trade direction
+      4. Edge = |estimated_prob − execution_price| must exceed MIN_EDGE
     """
     if book.mid is None:
         return None
 
     yes_price = book.mid
 
-    # 1. Volume spike
-    trades = _get_recent_trades(book.token_id)
+    # 1. Volume spike (non-blocking)
+    trades = await _get_recent_trades(book.token_id)
     spike  = _detect_volume_spike(trades)
 
     if not spike["has_spike"] or spike["dominant_side"] is None:
-        # Fall back to pure OBI signal when no spike detected
+        # Fall back to OBI-only signal
         obi = book.obi
         if abs(obi) < 0.35:
             return None
         dominant_side = "YES" if obi > 0 else "NO"
-        confidence    = abs(obi) * 50  # 0–50%
+        confidence    = abs(obi) * 50    # maps ±0.35–1.0 → 17.5–50%
     else:
         dominant_side = spike["dominant_side"]
         confidence    = spike["confidence"]
 
-    # 2. OBI confirmation — must not oppose the trade direction
+    # 2. OBI must not oppose the signal direction
     obi = book.obi
     if dominant_side == "YES" and obi < -OBI_CONFIRM_MIN:
-        log.debug("OBI opposes YES trade (obi=%.3f) — skipping", obi)
+        log.debug("OBI opposes YES trade (obi=%.3f) — skipping %s", obi, market.question[:40])
         return None
     if dominant_side == "NO" and obi > OBI_CONFIRM_MIN:
-        log.debug("OBI opposes NO trade (obi=%.3f) — skipping", obi)
+        log.debug("OBI opposes NO trade (obi=%.3f) — skipping %s", obi, market.question[:40])
         return None
 
-    # 3. Estimate true probability with confidence boost
+    # 3. Estimate true probability
     conf_boost = (confidence / 100.0) * 0.12
 
     if dominant_side == "YES":
@@ -178,7 +188,7 @@ def estimate_true_probability(
         return None
 
     log.info(
-        "SIGNAL | %s  side=%s  true_prob=%.3f  market_mid=%.3f  edge=%.3f  obi=%+.3f  conf=%.1f%%",
+        "SIGNAL | %s  side=%s  prob=%.3f  mid=%.3f  edge=%.3f  obi=%+.3f  conf=%.1f%%",
         market.question[:55], dominant_side, true_prob, yes_price, edge, obi, confidence,
     )
     return true_prob, side
@@ -191,39 +201,56 @@ async def strategy_loop(
     book_manager: BookManager,
     markets:      list[PolyMarket],
 ) -> None:
-    # Give WebSocket 5 seconds to populate initial snapshots
-    log.info("Waiting 5s for WebSocket order books to populate…")
-    await asyncio.sleep(5)
+    # Give WebSocket connections time to receive initial snapshots for all tokens
+    log.info("Waiting 10s for WebSocket order books to populate…")
+    await asyncio.sleep(10)
 
     while True:
         log.info("── Scanning %d markets ──", len(markets))
 
+        # Fetch balance once per cycle — not once per signal
+        try:
+            cycle_balance: Optional[BalanceInfo] = executor.get_balance()
+        except Exception as exc:
+            log.error("Balance fetch failed: %s — skipping cycle", exc)
+            await asyncio.sleep(SCAN_INTERVAL)
+            continue
+
         for mkt in markets:
             yes_book = book_manager.get_book(mkt.yes_token_id)
             if yes_book is None or yes_book.is_stale:
-                log.debug("No live book yet for %s", mkt.question[:40])
+                log.debug("No live book for %s", mkt.question[:40])
                 continue
 
-            result_pair = estimate_true_probability(mkt, yes_book)
+            # estimate_true_probability is now async (trades fetched non-blocking)
+            try:
+                result_pair = await estimate_true_probability(mkt, yes_book)
+            except Exception as exc:
+                log.error("Signal error for %s: %s", mkt.question[:40], exc)
+                continue
+
             if result_pair is None:
                 continue
 
             true_prob, side = result_pair
 
-            result = executor.place_limit_order(
-                token_id   = mkt.yes_token_id,
-                side       = side,
-                true_prob  = true_prob,
-                size_pmusd = MAX_ORDER_SIZE,
-            )
+            try:
+                result = executor.place_limit_order(
+                    token_id       = mkt.yes_token_id,
+                    side           = side,
+                    true_prob      = true_prob,
+                    size_pmusd     = MAX_ORDER_SIZE,
+                    cached_balance = cycle_balance,
+                )
+            except Exception as exc:
+                log.error("Order error for %s: %s", mkt.question[:40], exc)
+                continue
 
             if result:
                 log.info(
                     "EXECUTED | %s  id=%s  status=%s",
                     mkt.question[:55], result.order_id, result.status,
                 )
-            else:
-                log.debug("SKIPPED  | %s  reason=%s", mkt.question[:40], result.error)
 
         await asyncio.sleep(SCAN_INTERVAL)
 
@@ -249,7 +276,7 @@ async def main() -> None:
         log.error("No tradeable markets found — exiting")
         return
 
-    # 2. WebSocket book manager
+    # 2. WebSocket — all tokens batched into minimal connections
     book_manager = BookManager()
     for mkt in markets:
         book_manager.add_market(mkt.yes_token_id, mkt.no_token_id)
@@ -263,15 +290,26 @@ async def main() -> None:
     )
 
     # 4. Run WebSocket + strategy concurrently
+    # strategy_loop is isolated — an exception there won't cancel book_manager
+    async def _strategy_with_restart() -> None:
+        while True:
+            try:
+                await strategy_loop(executor, book_manager, markets)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.exception("strategy_loop crashed, restarting in 5s: %s", exc)
+                await asyncio.sleep(5)
+
     await asyncio.gather(
         book_manager.run(),
-        strategy_loop(executor, book_manager, markets),
+        _strategy_with_restart(),
     )
 
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(message)s",
+        level  = logging.INFO,
+        format = "%(asctime)s %(levelname)-8s %(message)s",
     )
     asyncio.run(main())
