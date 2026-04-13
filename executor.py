@@ -32,8 +32,7 @@ from signing import OrderSide
 
 log = logging.getLogger(__name__)
 
-CLOB_HOST    = "https://clob.polymarket.com"
-PMUSD_SCALAR = 1_000_000
+CLOB_HOST = "https://clob.polymarket.com"
 
 # CTF Exchange V2 address — key used to look up allowance in API response
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
@@ -45,7 +44,7 @@ def _make_client(private_key: str, funder_address: Optional[str] = None) -> Clob
     Build a ClobClient and derive API credentials via L1 on startup.
 
     funder_address: proxy/funder wallet that holds USDC.e and has CTF Exchange
-                    allowances set. When provided, signature_type=1 (POLY_PROXY)
+                    allowances set. When provided, signature_type=2 (POLY_GNOSIS_SAFE)
                     is used so orders are built with maker=funder_address and
                     balance is read from the funder wallet.
                     When None, signature_type=0 (EOA) and the signing key's

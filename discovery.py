@@ -6,6 +6,7 @@ Collateral: PMUSD only | Sig Type: EOA (0) | Chain: Polygon (137)
 
 from __future__ import annotations
 
+import json
 import time
 import logging
 from dataclasses import dataclass, field
@@ -73,14 +74,13 @@ class PolyMarket:
 
 def _parse_market(raw: dict) -> Optional[PolyMarket]:
     try:
-        import json as _j
         raw_ids = raw.get("clobTokenIds", "[]")
-        token_ids: list[str] = _j.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+        token_ids: list[str] = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
         if len(token_ids) < 2:
             return None
 
         raw_prices = raw.get("outcomePrices", "[0.5, 0.5]")
-        prices: list[str] = _j.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+        prices: list[str] = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
         yes_price = float(prices[0]) if prices else 0.5
         no_price  = float(prices[1]) if len(prices) > 1 else round(1 - yes_price, 4)
 

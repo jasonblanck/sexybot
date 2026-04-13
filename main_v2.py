@@ -45,6 +45,10 @@ SPIKE_RATIO_MIN  = 2.5    # recent rate must be 2.5× the baseline
 OBI_CONFIRM_MIN  = 0.20   # OBI must agree with signal direction
 MIN_EDGE         = 0.03   # minimum probability edge to place a trade
 
+# Position management
+TRADE_COOLDOWN_SEC = 300  # seconds before re-buying the same token
+MARKET_REFRESH_CYCLES = 20  # re-discover markets every N scan cycles
+
 
 # ── Momentum signal ────────────────────────────────────────────────────────────
 
@@ -206,8 +210,32 @@ async def strategy_loop(
     log.info("Waiting 10s for WebSocket order books to populate…")
     await asyncio.sleep(10)
 
+    # Per-token cooldown: token_id → last trade timestamp
+    last_traded: dict[str, float] = {}
+    cycle_count = 0
+
     while True:
-        log.info("── Scanning %d markets ──", len(markets))
+        cycle_count += 1
+        log.info("── Scanning %d markets (cycle %d) ──", len(markets), cycle_count)
+
+        # Periodically re-discover markets so closed ones drop off and new ones join
+        if cycle_count % MARKET_REFRESH_CYCLES == 0:
+            try:
+                fresh_raw = fetch_markets(
+                    min_liquidity=MIN_LIQUIDITY, min_volume=MIN_VOLUME_24H, max_pages=3
+                )
+                fresh = (
+                    MarketFilter(fresh_raw)
+                    .max_spread_cents(3.0)
+                    .price_range(0.05, 0.95)
+                    .top(20, key="volume_24h")
+                    .results()
+                )
+                if fresh:
+                    markets = fresh
+                    log.info("Markets refreshed — watching %d markets", len(markets))
+            except Exception as exc:
+                log.warning("Market refresh failed (keeping old list): %s", exc)
 
         # Fetch balance once per cycle — not once per signal
         try:
@@ -217,19 +245,23 @@ async def strategy_loop(
             await asyncio.sleep(SCAN_INTERVAL)
             continue
 
+        # Collect live books first
+        live: list[tuple[PolyMarket, BookSnapshot]] = []
         for mkt in markets:
             yes_book = book_manager.get_book(mkt.yes_token_id)
             if yes_book is None or yes_book.is_stale:
                 log.debug("No live book for %s", mkt.question[:40])
                 continue
+            live.append((mkt, yes_book))
 
-            # estimate_true_probability is now async (trades fetched non-blocking)
-            try:
-                result_pair = await estimate_true_probability(mkt, yes_book)
-            except Exception as exc:
-                log.error("Signal error for %s: %s", mkt.question[:40], exc)
+        # Run all signal estimates concurrently (each fires one HTTP request)
+        signal_tasks = [estimate_true_probability(mkt, book) for mkt, book in live]
+        signal_results = await asyncio.gather(*signal_tasks, return_exceptions=True)
+
+        for (mkt, _yes_book), result_pair in zip(live, signal_results):
+            if isinstance(result_pair, Exception):
+                log.error("Signal error for %s: %s", mkt.question[:40], result_pair)
                 continue
-
             if result_pair is None:
                 continue
 
@@ -241,12 +273,21 @@ async def strategy_loop(
             if side == OrderSide.SELL:
                 trade_token_id = mkt.no_token_id
                 trade_side     = OrderSide.BUY
-                # true_prob was estimated on YES; flip to NO perspective
-                trade_prob = 1.0 - true_prob
+                trade_prob     = 1.0 - true_prob   # flip to NO perspective
             else:
                 trade_token_id = mkt.yes_token_id
                 trade_side     = side
                 trade_prob     = true_prob
+
+            # Cooldown: skip if this token was traded recently
+            now = time.time()
+            last = last_traded.get(trade_token_id, 0.0)
+            if now - last < TRADE_COOLDOWN_SEC:
+                log.debug(
+                    "COOLDOWN %ds remaining for %s",
+                    int(TRADE_COOLDOWN_SEC - (now - last)), mkt.question[:40],
+                )
+                continue
 
             try:
                 result = executor.place_limit_order(
@@ -261,6 +302,7 @@ async def strategy_loop(
                 continue
 
             if result:
+                last_traded[trade_token_id] = time.time()
                 log.info(
                     "EXECUTED | %s  id=%s  status=%s",
                     mkt.question[:55], result.order_id, result.status,
