@@ -774,8 +774,13 @@ class PolymarketBot:
                         age_min  = (now - pos["entry_time"]) / 60
                         side     = pos["side"]   # "YES" or "NO"
 
-                        # Normalise to the perspective of our side
-                        current_p = mid if side == "YES" else (1.0 - mid)
+                        # mid and entry_p are both measured on the token we hold
+                        # (get_midpoint(token_id) returns that token's own midpoint
+                        # and result["price"] recorded at entry was the same).
+                        # So no side-flip is needed — inverting for NO used to mix
+                        # YES-implied mid against a NO-side entry_price and
+                        # reported ~3x the true P&L, firing TP/SL prematurely.
+                        current_p = mid
                         pnl_c     = (current_p - entry_p) * 100   # cents
 
                         reason = None
