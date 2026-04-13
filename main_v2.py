@@ -28,6 +28,7 @@ log = logging.getLogger(__name__)
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 PRIVATE_KEY      = os.environ["PRIVATE_KEY"]
+FUNDER_ADDRESS   = os.getenv("POLYMARKET_FUNDER")   # proxy wallet holding USDC.e; None = EOA mode
 MIN_LIQUIDITY    = float(os.getenv("MIN_LIQUIDITY",    "10000"))
 MIN_VOLUME_24H   = float(os.getenv("MIN_VOLUME",       "1000"))
 MAX_ORDER_SIZE   = float(os.getenv("MAX_ORDER_SIZE",   "10"))
@@ -258,7 +259,10 @@ async def strategy_loop(
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    log.info("SexyBot V2 starting | DRY_RUN=%s MAX_ORDER=$%.2f", DRY_RUN, MAX_ORDER_SIZE)
+    log.info(
+        "SexyBot V2 starting | DRY_RUN=%s MAX_ORDER=$%.2f FUNDER=%s",
+        DRY_RUN, MAX_ORDER_SIZE, FUNDER_ADDRESS or "(EOA/self)",
+    )
 
     # 1. Discover markets
     log.info("Fetching markets from Gamma API…")
@@ -283,10 +287,11 @@ async def main() -> None:
 
     # 3. Executor
     executor = ClobExecutor(
-        private_key  = PRIVATE_KEY,
-        book_manager = book_manager,
-        gate         = ExecutionGate(spread_max_cents=SPREAD_MAX_CENTS),
-        dry_run      = DRY_RUN,
+        private_key    = PRIVATE_KEY,
+        book_manager   = book_manager,
+        gate           = ExecutionGate(spread_max_cents=SPREAD_MAX_CENTS),
+        dry_run        = DRY_RUN,
+        funder_address = FUNDER_ADDRESS,
     )
 
     # 4. Run WebSocket + strategy concurrently

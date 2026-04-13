@@ -37,29 +37,44 @@ PMUSD_SCALAR = 1_000_000
 
 # CTF Exchange V2 address — key used to look up allowance in API response
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-NEG_RISK_CTF = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+NEG_RISK_CTF = "0xC5d563A36AE78145C45a50134d48A1215220f80a"  # used in _parse_balance allowance lookup
 
 
-def _make_client(private_key: str, neg_risk: bool = False) -> ClobClient:
+def _make_client(private_key: str, funder_address: Optional[str] = None) -> ClobClient:
     """
     Build a ClobClient and derive API credentials via L1 on startup.
-    neg_risk=True switches to the Neg-Risk CTF Exchange contract.
+
+    funder_address: proxy/funder wallet that holds USDC.e and has CTF Exchange
+                    allowances set. When provided, signature_type=1 (POLY_PROXY)
+                    is used so orders are built with maker=funder_address and
+                    balance is read from the funder wallet.
+                    When None, signature_type=0 (EOA) and the signing key's
+                    wallet is used for both signing and funding.
     """
     pk = private_key if private_key.startswith("0x") else f"0x{private_key}"
+
+    if funder_address:
+        sig_type = 1   # POLY_PROXY: signer != funder/maker
+        funder   = funder_address
+    else:
+        sig_type = 0   # EOA: signer == maker
+        funder   = None
+
     client = ClobClient(
         host           = CLOB_HOST,
         chain_id       = POLYGON,
         key            = pk,
-        signature_type = 0,
-        # Neg-risk exchange uses a different contract — pass it as funder
-        # so py_clob_client routes order signing to the correct domain
-        funder         = NEG_RISK_CTF if neg_risk else None,
+        signature_type = sig_type,
+        funder         = funder,
     )
     creds = client.create_or_derive_api_creds()
     client.set_api_creds(creds)
     log.info(
-        "CLOB auth ready | address=%s api_key=%s neg_risk=%s",
-        client.get_address(), creds.api_key[:8] + "…", neg_risk,
+        "CLOB auth ready | signer=%s funder=%s sig_type=%d api_key=%s",
+        client.get_address(),
+        funder_address or "(self)",
+        sig_type,
+        creds.api_key[:8] + "…",
     )
     return client
 
@@ -102,18 +117,17 @@ class ClobExecutor:
 
     def __init__(
         self,
-        private_key:  str,
-        book_manager: BookManager,
+        private_key:    str,
+        book_manager:   BookManager,
         *,
-        gate:     Optional[ExecutionGate] = None,
-        dry_run:  bool = True,
-        neg_risk: bool = False,
+        gate:           Optional[ExecutionGate] = None,
+        dry_run:        bool = True,
+        funder_address: Optional[str] = None,
     ):
-        self._client      = _make_client(private_key, neg_risk=neg_risk)
-        self._books       = book_manager
-        self._gate        = gate or ExecutionGate()
-        self._dry_run     = dry_run
-        self._neg_risk    = neg_risk
+        self._client  = _make_client(private_key, funder_address=funder_address)
+        self._books   = book_manager
+        self._gate    = gate or ExecutionGate()
+        self._dry_run = dry_run
 
         log.info("ClobExecutor ready | address=%s dry_run=%s", self._client.get_address(), dry_run)
 
