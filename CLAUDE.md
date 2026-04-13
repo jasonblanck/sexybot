@@ -2,79 +2,148 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Deployment
+## Infrastructure
 
-The bot runs on a DigitalOcean VPS at `159.65.201.165`. SSH access: `ssh root@159.65.201.165`.
+- **VPS**: DigitalOcean at `159.65.201.165` — always-on, runs the bot 24/7
+- **Service**: `sexybot` (systemd) — auto-starts on boot
+- **Code root**: `/root/polybot/` on the VPS
+- **Dashboard**: nginx serves `index.html` from `/var/www/html/`, proxies API to port 8000
+- **GitHub**: `github.com/jasonblanck/sexybot` — source of truth for all code
 
-**After every file edit, changes are automatically pushed to GitHub (`jasonblanck/sexybot`) via a PostToolUse hook.**
+## Common Commands
 
-To deploy changes to the server after editing locally:
 ```bash
-rsync -avz --exclude='.git' --exclude='.DS_Store' --exclude='.env' \
-  -e "ssh -p 22" \
-  "/Users/jasonblanck/Desktop/untitled folder/" \
-  root@159.65.201.165:/var/www/html/
-```
+# VPS management
+ssh root@159.65.201.165
+systemctl restart sexybot
+systemctl status sexybot
+journalctl -u sexybot -f          # live logs
 
-For `.env` changes (never rsync'd automatically — contains secrets):
-```bash
-scp -P 22 "/Users/jasonblanck/Desktop/untitled folder/.env" root@159.65.201.165:/root/polybot/.env
-```
+# Deploy local changes to VPS
+scp <file> root@159.65.201.165:/root/polybot/<file>
+# Or: git push origin main → ssh into VPS → git pull origin main
 
-## Bot Management (on server)
+# Sync dashboard to nginx web root (after editing index.html)
+ssh root@159.65.201.165 "cp /root/polybot/index.html /var/www/html/index.html"
 
-The bot runs as a systemd service called `sexybot`:
-```bash
-systemctl restart sexybot    # restart
-systemctl status sexybot     # check status
-journalctl -u sexybot -f     # live logs
-tail -f /root/polybot/bot.log  # bot's own log file
-```
-
-The bot's working directory on the server is `/root/polybot/` (not `/var/www/html/`). The frontend (index.html) is served from `/var/www/html/` via nginx.
-
-To start the trading loop after a restart (the bot connects on startup but doesn't trade until started):
-```bash
-curl -X POST http://localhost:8000/start
+# Reload nginx config
+ssh root@159.65.201.165 "nginx -t && systemctl reload nginx"
 ```
 
 ## Architecture
 
-Two components:
-1. **`bot.py`** — FastAPI app + trading logic. Runs on port 8000 via uvicorn. Exposes REST API and WebSocket at `/ws`.
-2. **`index.html`** — Single-file dashboard. Connects to the bot via WebSocket (`ws://<host>/ws`) for real-time updates, with HTTP polling as fallback.
+The bot is split into focused modules — `bot.py` is the FastAPI dashboard/API layer; `main_v2.py` is the standalone trading engine. They are independent processes but share the same codebase.
 
-Nginx (port 80) proxies:
-- `/api/` → `localhost:8000/`
-- `/ws` → `localhost:8000/ws` (WebSocket upgrade)
+| File | Role |
+|---|---|
+| `main_v2.py` | Async trading engine: discovery → WebSocket → signal → execute |
+| `bot.py` | FastAPI app (port 8000): dashboard API, WebSocket feed, manual controls |
+| `executor.py` | CLOB order placement, balance fetch, cancel; wraps `py_clob_client` |
+| `market_maker.py` | Two-sided MM: quote both legs, inventory skew, circuit breaker |
+| `risk.py` | `BalanceInfo`, `ExecutionGate` (EV + spread check), `DrawdownGuard`, `kelly_size` |
+| `orderbook_ws.py` | WebSocket book manager; `BookSnapshot` with `mid`, `vamp`, `obi`, `spread_cents` |
+| `discovery.py` | Fetches markets from Gamma API; `MarketFilter` chain |
+| `redeemer.py` | Claims resolved positions on-chain via Gnosis Safe |
+| `signing.py` | EIP-712 order signing (rarely called directly — `executor.py` uses `py_clob_client`) |
+| `index.html` | Single-file dashboard (Chart.js, vanilla JS, mobile/desktop toggle) |
+| `nginx.conf` | Production nginx config (documented here, deployed to `/etc/nginx/sites-enabled/default`) |
 
-### Bot internals
+### Signal pipeline (momentum strategy)
 
-- `PolymarketBot` class owns all trading state: `trades`, `signals`, `log_lines`, `ws_clients`
-- `connect()` authenticates with Polymarket CLOB using `PRIVATE_KEY`. If `POLYMARKET_API_KEY/SECRET/PASSPHRASE` are set, uses them directly; otherwise derives L2 credentials from the wallet key.
-- `run_loop()` is the async trading loop — must be started via `POST /start` or the `/ws` `{"cmd":"start"}` message
-- Trades and positions are persisted to SQLite at `/root/polybot/trades.db`
-- `DRY_RUN=false` means real orders are placed. `MAX_ORDER_SIZE` caps each order in USDC.
+```
+fetch_markets() → BookManager (WebSocket) → estimate_true_probability()
+    ↳ VAMP fair value  ↳ volume spike detection  ↳ OBI confirmation
+→ kelly_size() → ExecutionGate → place_limit_order()
+→ open_positions → profit-target / stop-loss exits
+```
 
-### Strategies (set via `STRATEGY` in `.env`)
-- `momentum` — buys direction when price deviates >5% from 0.5
-- `meanReversion` — fades extremes when deviation >35%
-- `arbitrage` — exploits YES+NO mispricing >3%
-- `marketMaking` — posts bid/ask quotes around midpoint on illiquid markets
+### Key design decisions
 
-### API endpoints
-- `GET /status` — full bot state (trades, signals, log)
-- `POST /start?interval=30` — start trading loop
-- `POST /stop` — stop and cancel all orders
-- `GET /markets` — top 30 markets by 24h volume
-- `POST /trade` — manual trade
-- `WS /ws` — real-time state pushes + commands (`start`, `stop`, `trade`)
+- **VAMP over simple mid**: `BookSnapshot.vamp` depth-weights top-5 bid/ask levels — more accurate fair value on imbalanced books
+- **Quarter-Kelly sizing**: `kelly_size(prob, price, balance, kelly_fraction=0.25)` scales bets with edge × balance; returns 0 on no-edge
+- **DrawdownGuard**: halts strategy (without restarting) if balance drops `MAX_DRAWDOWN_USD` within `DRAWDOWN_WINDOW` seconds
+- **mutable box pattern**: `markets_box = [markets]` persists list across `strategy_loop` crash-restarts without rebinding the outer variable
+- **bypass_gate**: MM orders skip the EV gate (they earn spread, not edge) but the MM's own reserve guard still enforces the $10 floor
+- **MM inventory skewing**: `record_fill()` is defined but not yet wired to fill events — inventory stays 0, skewing inactive (known gap)
 
-## Environment variables
+## Environment Variables
 
-See `.env.example`. Key vars:
-- `PRIVATE_KEY` — 32-byte hex Polygon wallet key (with `0x` prefix)
-- `POLYMARKET_FUNDER` — proxy wallet address (if using a proxy wallet setup)
-- `DRY_RUN` — set to `false` for live trading
-- `MAX_ORDER_SIZE` — per-trade cap in USDC
-- `DAILY_LOSS_LIMIT` — bot stops trading for the day if total spend exceeds this
+See `.env.example` for all variables with descriptions. Critical ones:
+
+| Variable | Notes |
+|---|---|
+| `PRIVATE_KEY` | 32-byte hex Polygon wallet key (with `0x` prefix) |
+| `POLYMARKET_FUNDER` | Gnosis Safe proxy address; omit for EOA mode |
+| `DRY_RUN` | `true` by default — **must set `false` for live trading** |
+| `STRATEGY` | `momentum` or `market_making` |
+| `ANTHROPIC_API_KEY` | Required for AI market analysis in momentum signal |
+| `MAX_DRAWDOWN_USD` | Kill-switch threshold (default $50 in 10 min) |
+
+The `.env` file lives on the VPS at `/root/polybot/.env` and is **never committed to git**.
+
+## New Machine Setup
+
+All code is in GitHub — setup takes ~10 minutes:
+
+```bash
+# 1. Clone
+git clone https://github.com/jasonblanck/sexybot.git
+cd sexybot
+
+# 2. Python environment
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Pinned packages (must override after pip install)
+pip install 'websockets<16.0.0' 'eth-keyfile<0.9.0'
+
+# 4. Secrets — copy .env from old machine or recreate from .env.example
+cp .env.example .env
+# Fill in real values from 1Password / old machine
+
+# 5. SSH access to VPS
+# Option A: copy id_ed25519 from old Mac (~/.ssh/id_ed25519)
+# Option B: generate new key and add to VPS:
+ssh-keygen -t ed25519 -C "new-macbook"
+ssh-copy-id -i ~/.ssh/id_ed25519.pub root@159.65.201.165
+```
+
+### What to transfer from old Mac
+
+| Item | Location | How |
+|---|---|---|
+| SSH private key | `~/.ssh/id_ed25519` | AirDrop / encrypted USB / 1Password |
+| Local `.env` | `Desktop/JB/untitled folder/.env` | AirDrop / 1Password |
+| GitHub token | embedded in git remote URL | Generate new token on new Mac |
+
+The **bot itself runs on the VPS** — it keeps trading during the Mac transition. Nothing on the Mac is required for the bot to operate.
+
+### GitHub auth on new Mac
+
+The current remote uses an HTTPS token embedded in the URL. On the new Mac, use SSH-based auth instead (more secure, no token rotation needed):
+
+```bash
+# 1. Generate GitHub SSH key (or reuse the VPS key)
+ssh-keygen -t ed25519 -C "github-newmac"
+cat ~/.ssh/id_ed25519.pub   # add this to github.com → Settings → SSH Keys
+
+# 2. Switch remote to SSH
+git remote set-url origin git@github.com:jasonblanck/sexybot.git
+```
+
+## Nginx Proxy Routes
+
+The nginx config (`nginx.conf`) proxies these paths to FastAPI on port 8000:
+
+```
+/status /portfolio /markets /orderbook /weather /fmp
+/start  /stop      /trade    /paper/*   /settings /cancel
+/api/*  → http://127.0.0.1:8000/  (strips /api/ prefix)
+/ws     → WebSocket upgrade
+```
+
+Static files (`index.html`) are served from `/var/www/html/`. After editing `index.html`, sync it manually:
+```bash
+ssh root@159.65.201.165 "cp /root/polybot/index.html /var/www/html/index.html"
+```

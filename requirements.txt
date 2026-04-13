@@ -1,0 +1,61 @@
+# SexyBot — Python dependencies
+# Generated from production venv on VPS (Polygon/Polymarket bot)
+# Install: python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+#
+# Pinned packages that had breaking changes:
+#   websockets  — must be <16.0 (16.x broke py_clob_client's handshake)
+#   eth-keyfile — must be <0.9  (0.9.x broke eth-account compatibility)
+
+# ── Polymarket CLOB ────────────────────────────────────────────────────────────
+py_clob_client==0.34.6
+py_order_utils==0.3.2
+poly_eip712_structs==0.0.1
+py_builder_signing_sdk==0.0.2
+
+# ── Ethereum / Web3 ────────────────────────────────────────────────────────────
+web3==7.15.0
+eth-account==0.13.7
+eth-keys==0.7.0
+eth-keyfile==0.8.1          # pinned — 0.9.x breaks eth-account
+eth_abi==5.2.0
+eth-hash==0.8.0
+eth-utils==6.0.0
+eth-typing==6.0.0
+eth-rlp==2.2.0
+hexbytes==1.3.1
+rlp==4.1.0
+bitarray==3.8.1
+py-ecc==8.0.0
+pycryptodome==3.23.0
+
+# ── Async / HTTP ───────────────────────────────────────────────────────────────
+httpx==0.28.1
+h2==4.3.0
+hpack==4.1.0
+hyperframe==6.1.0
+requests==2.33.1
+urllib3==2.6.3
+aiohttp==3.13.5
+websockets==15.0.1          # pinned — 16.x breaks py_clob_client WS handshake
+
+# ── FastAPI / server ───────────────────────────────────────────────────────────
+fastapi==0.135.3
+uvicorn==0.44.0
+starlette==1.0.0
+
+# ── AI / data APIs ────────────────────────────────────────────────────────────
+anthropic==0.94.0
+tavily-python==0.7.23
+tiktoken==0.12.0
+
+# ── Data validation ────────────────────────────────────────────────────────────
+pydantic==2.13.0
+pydantic_core==2.46.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv==1.2.2
+certifi==2026.2.25
+charset-normalizer==3.4.7
+idna==3.11
+typing_extensions==4.15.0
+annotated-types==0.7.0
