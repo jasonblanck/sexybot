@@ -205,21 +205,25 @@ async def strategy_loop(
     executor:     ClobExecutor,
     book_manager: BookManager,
     markets:      list[PolyMarket],
+    last_traded:  dict[str, float],   # persisted across restarts by caller
+    cycle_count:  list[int],          # [0] mutable int, persisted across restarts
 ) -> None:
     # Give WebSocket connections time to receive initial snapshots for all tokens
     log.info("Waiting 10s for WebSocket order books to populate…")
     await asyncio.sleep(10)
 
-    # Per-token cooldown: token_id → last trade timestamp
-    last_traded: dict[str, float] = {}
-    cycle_count = 0
+    # Build the set of token IDs that have active WS subscriptions (fixed at startup).
+    # Used to filter out new-market results from periodic refreshes that have no WS data.
+    subscribed_yes_ids: set[str] = {mkt.yes_token_id for mkt in markets}
 
     while True:
-        cycle_count += 1
-        log.info("── Scanning %d markets (cycle %d) ──", len(markets), cycle_count)
+        cycle_count[0] += 1
+        log.info("── Scanning %d markets (cycle %d) ──", len(markets), cycle_count[0])
 
-        # Periodically re-discover markets so closed ones drop off and new ones join
-        if cycle_count % MARKET_REFRESH_CYCLES == 0:
+        # Periodically re-discover markets so closed/resolved ones drop off.
+        # Only keep markets whose tokens are already subscribed — new tokens can't
+        # receive WS data since BookManager subscriptions are fixed at startup.
+        if cycle_count[0] % MARKET_REFRESH_CYCLES == 0:
             try:
                 fresh_raw = fetch_markets(
                     min_liquidity=MIN_LIQUIDITY, min_volume=MIN_VOLUME_24H, max_pages=3
@@ -231,15 +235,20 @@ async def strategy_loop(
                     .top(20, key="volume_24h")
                     .results()
                 )
-                if fresh:
-                    markets = fresh
-                    log.info("Markets refreshed — watching %d markets", len(markets))
+                # Drop any new markets — only keep already-subscribed ones
+                still_active = [m for m in fresh if m.yes_token_id in subscribed_yes_ids]
+                if still_active:
+                    markets = still_active
+                log.info(
+                    "Markets refreshed — %d/%d still active",
+                    len(markets), len(subscribed_yes_ids),
+                )
             except Exception as exc:
                 log.warning("Market refresh failed (keeping old list): %s", exc)
 
-        # Fetch balance once per cycle — not once per signal
+        # Fetch balance once per cycle via thread so the event loop stays free
         try:
-            cycle_balance: Optional[BalanceInfo] = executor.get_balance()
+            cycle_balance: Optional[BalanceInfo] = await asyncio.to_thread(executor.get_balance)
         except Exception as exc:
             log.error("Balance fetch failed: %s — skipping cycle", exc)
             await asyncio.sleep(SCAN_INTERVAL)
@@ -350,11 +359,14 @@ async def main() -> None:
     )
 
     # 4. Run WebSocket + strategy concurrently
-    # strategy_loop is isolated — an exception there won't cancel book_manager
+    # strategy_loop is isolated — an exception there won't cancel book_manager.
+    # last_traded and cycle_count live here so they survive strategy_loop restarts.
     async def _strategy_with_restart() -> None:
+        last_traded: dict[str, float] = {}
+        cycle_count: list[int] = [0]   # mutable box so strategy_loop can increment it
         while True:
             try:
-                await strategy_loop(executor, book_manager, markets)
+                await strategy_loop(executor, book_manager, markets, last_traded, cycle_count)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
