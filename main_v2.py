@@ -570,11 +570,14 @@ async def main() -> None:
                     drawdown_guard = drawdown_guard,
                 )
             except DrawdownHalt as exc:
-                # Cancel all outstanding orders before halting
+                # Cancel all outstanding orders before halting.
+                # NOTE: explicit if/else required — `await X if cond else Y` parses
+                # as `(await X) if cond else Y`, so the else branch would be unawaited.
                 try:
-                    await market_maker.cancel_all() if market_maker else asyncio.to_thread(
-                        executor.cancel_all_orders
-                    )
+                    if market_maker:
+                        await market_maker.cancel_all()
+                    else:
+                        await asyncio.to_thread(executor.cancel_all_orders)
                 except Exception:
                     pass
                 log.critical(
