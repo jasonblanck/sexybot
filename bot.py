@@ -1757,7 +1757,7 @@ Rules:
                     ob_data = await asyncio.to_thread(self.get_orderbook_depth, token_id) if token_id else {}
                     predicted_prob = None  # will be set by AI or estimated below
 
-                    if ai_enabled and _ai_failures < 3 and float(signal.get("confidence", 0)) >= 30:
+                    if ai_enabled and _ai_failures < 3 and float(signal.get("confidence", 0)) >= 20:
                         q_lower = question.lower()
                         is_legal = any(x in q_lower for x in ["indicted","trial","court","lawsuit","ruling","judge","convicted","charged","plea","verdict","sentenced"])
                         is_legislative = any(x in q_lower for x in ["bill","act","legislation","congress","senate","pass","signed","law","vote","amendment"])
