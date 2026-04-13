@@ -2,7 +2,8 @@
 executor.py
 Polymarket V2 — Limit Order Execution Pipeline
 
-Flow: gate check → EIP-712 sign → L1 auth headers → POST /order
+Flow: gate check → EIP-712 sign → L1 auth (py_clob_client) → POST /order
+Auth: uses py_clob_client's sign_clob_auth_message (ClobAuth EIP-712 struct)
 """
 
 from __future__ import annotations
@@ -13,9 +14,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 import requests
-from eth_account import Account
-from eth_account.messages import encode_defunct
 from web3 import Web3
+
+# py_clob_client handles the ClobAuth EIP-712 struct for L1 authentication
+from py_clob_client.signer import Signer
+from py_clob_client.headers.headers import create_level_1_headers
 
 from orderbook_ws import BookManager, BookSnapshot
 from risk import BalanceInfo, ExecutionGate, GateVerdict, check_balance
@@ -23,32 +26,21 @@ from signing import LimitOrder, OrderSide, OrderSigner, SignedOrderPayload
 
 log = logging.getLogger(__name__)
 
-CLOB_BASE       = "https://clob.polymarket.com"
-REQUEST_TIMEOUT = 10
+CLOB_BASE        = "https://clob.polymarket.com"
+POLYGON_CHAIN_ID = 137
+REQUEST_TIMEOUT  = 10
 
 
-def build_auth_headers(private_key: str, address: str) -> dict:
+def build_l1_headers(private_key: str) -> dict:
     """
-    Generate L1 authentication headers for the CLOB v2 API.
-    POLY_SIGNATURE = personal_sign(keccak256(timestamp_string))
+    Build L1 authentication headers using the correct ClobAuth EIP-712 struct.
+    The CLOB verifies these on every authenticated request.
     """
-    ts  = str(int(time.time()))
-    pk  = private_key if private_key.startswith("0x") else f"0x{private_key}"
-    acc = Account.from_key(pk)
-
-    msg_hash = encode_defunct(text=ts)
-    signed   = acc.sign_message(msg_hash)
-    sig_hex  = signed.signature.hex()
-    if not sig_hex.startswith("0x"):
-        sig_hex = "0x" + sig_hex
-
-    return {
-        "Content-Type":   "application/json",
-        "POLY_ADDRESS":   Web3.to_checksum_address(address),
-        "POLY_SIGNATURE": sig_hex,
-        "POLY_TIMESTAMP": ts,
-        "POLY_NONCE":     "0",
-    }
+    pk = private_key if private_key.startswith("0x") else f"0x{private_key}"
+    signer = Signer(pk, chain_id=POLYGON_CHAIN_ID)
+    headers = create_level_1_headers(signer)
+    headers["Content-Type"] = "application/json"
+    return headers
 
 
 @dataclass
@@ -70,8 +62,8 @@ class ClobExecutor:
     1. Fetch live BookSnapshot from BookManager
     2. Run ExecutionGate (spread + EV)
     3. Confirm PMUSD balance
-    4. Build + EIP-712 sign order
-    5. POST to CLOB /order with L1 auth
+    4. Build + EIP-712 sign LimitOrder (custom signing.py)
+    5. POST to CLOB /order with ClobAuth L1 headers
     """
 
     def __init__(
@@ -96,7 +88,7 @@ class ClobExecutor:
                  self._address, dry_run, neg_risk)
 
     def get_balance(self) -> BalanceInfo:
-        headers = build_auth_headers(self._pk, self._address)
+        headers = build_l1_headers(self._pk)
         return check_balance(self._address, headers, alert_fn=self._alert)
 
     def place_limit_order(
@@ -112,13 +104,13 @@ class ClobExecutor:
     ) -> OrderResult:
         token_id_str = str(token_id)
 
-        # 1. Book
+        # 1. Book snapshot
         book = self._books.get_book(token_id_str)
         if book is None:
             return OrderResult(success=False, error=f"no live book for token {token_id_str[:16]}…")
 
-        # 2. Gate
-        balance = self.get_balance()
+        # 2. Execution gate
+        balance  = self.get_balance()
         side_str = "BUY" if side == OrderSide.BUY else "SELL"
         verdict: GateVerdict = self._gate.check(
             book=book, true_prob=true_prob, side=side_str,
@@ -128,7 +120,7 @@ class ClobExecutor:
             log.info("GATE BLOCKED: %s", verdict.reject_reason)
             return OrderResult(success=False, error=verdict.reject_reason)
 
-        # 3. Price
+        # 3. Derive price from live book
         if price_override is not None:
             price = price_override
         elif side == OrderSide.BUY:
@@ -137,16 +129,19 @@ class ClobExecutor:
             price = book.best_bid
         price = max(0.001, min(0.999, round(price, 4)))
 
-        # 4. Sign
+        # 4. Build + EIP-712 sign
         signed_order: LimitOrder = self._signer.build_and_sign(
             token_id=token_id_str, side=side, price=price,
             size_pmusd=size_pmusd, expiration=expiration,
         )
-        payload: SignedOrderPayload = self._signer.to_api_payload(signed_order, order_type=order_type)
+        payload: SignedOrderPayload = self._signer.to_api_payload(
+            signed_order, order_type=order_type
+        )
 
         log.info(
             "ORDER BUILT | side=%s price=%.4f size=$%.2f ev=%.4f spread=%.3fc token=%s…",
-            side.name, price, size_pmusd, verdict.ev_net, verdict.spread_cents, token_id_str[:14],
+            side.name, price, size_pmusd, verdict.ev_net, verdict.spread_cents,
+            token_id_str[:14],
         )
 
         if self._dry_run:
@@ -156,11 +151,11 @@ class ClobExecutor:
                 payload=self._as_dict(payload),
             )
 
-        # 5. Submit
+        # 5. Submit to CLOB
         return self._submit(payload)
 
     def _submit(self, payload: SignedOrderPayload) -> OrderResult:
-        headers = build_auth_headers(self._pk, self._address)
+        headers = build_l1_headers(self._pk)
         body    = self._as_dict(payload)
         try:
             resp = self._session.post(
