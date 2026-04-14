@@ -101,6 +101,11 @@ DEEP_ANALYZE_TIMEOUT_S = float(os.getenv("DEEP_ANALYZE_TIMEOUT_S", "45.0"))
 AUTO_APPLY_ENABLED     = os.getenv("AUTO_APPLY_REVIEW", "false").lower() == "true"
 AUTO_APPLY_MIN_CONF    = int(os.getenv("AUTO_APPLY_MIN_CONF", "70"))
 AUTO_APPLY_MAX_DELTA   = float(os.getenv("AUTO_APPLY_MAX_DELTA", "0.25"))   # ±25% of current
+# Weekly scheduled backtest — fires Sundays at ~01:00 UTC (after nightly
+# review has written its latest entry). Operator still has the on-demand
+# RUN button; this just ensures a baseline weekly analysis accumulates
+# even if the operator forgets to click. Opt-out with BACKTEST_WEEKLY=false.
+BACKTEST_WEEKLY_ENABLED = os.getenv("BACKTEST_WEEKLY", "true").lower() == "true"
 # Master emergency kill switch for the entire Claude Max stack. Set
 # CLAUDE_MAX_DISABLE=true in .env and every AI feature no-ops to its safe
 # fallback: regime defaults to normal, analyze_with_claude returns None,
@@ -117,6 +122,7 @@ if CLAUDE_MAX_DISABLED:
     PRETRADE_CHECK_ENABLED  = False
     DEEP_ANALYZE_ENABLED    = False
     AUTO_APPLY_ENABLED      = False
+    BACKTEST_WEEKLY_ENABLED = False
     log.warning("CLAUDE_MAX_DISABLE=true — all Claude Max features are OFF")
 
 try:
@@ -272,6 +278,8 @@ class PolymarketBot:
         self._last_review_at: float = 0.0
         # Brier resolver task handle
         self._brier_resolver_task: Optional[asyncio.Task] = None
+        # Weekly scheduled backtest task handle
+        self._weekly_backtest_task: Optional[asyncio.Task] = None
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -3102,6 +3110,35 @@ class PolymarketBot:
                 log.warning(f"nightly review loop error: {e}")
                 await asyncio.sleep(3600)   # back off 1h on unexpected errors
 
+    async def _weekly_backtest_loop(self):
+        """Background task — runs the backtester every Sunday at ~01:00 UTC
+        (one hour after the nightly review so the latest day's data is
+        already resolved and included). Operator can still trigger on-demand
+        via the dashboard RUN button; this just guarantees baseline weekly
+        analysis accumulates even if nobody clicks."""
+        if not BACKTEST_WEEKLY_ENABLED or not ANTHROPIC_API_KEY:
+            return
+        from datetime import timedelta
+        while self.running:
+            try:
+                now = datetime.utcnow()
+                # weekday(): Monday=0, ..., Sunday=6
+                days_until_sunday = (6 - now.weekday()) % 7
+                next_run = now.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=days_until_sunday)
+                if next_run <= now:
+                    next_run += timedelta(days=7)
+                wait_s = max(60.0, (next_run - now).total_seconds())
+                await asyncio.sleep(wait_s)
+                if not self.running:
+                    break
+                self._log("[BACKTEST] Weekly scheduled run firing")
+                await self.run_backtest_analysis()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning(f"weekly backtest loop error: {e}")
+                await asyncio.sleep(3600)
+
     def analyze(self, market: dict) -> Optional[dict]:
         import json as _j
         raw_prices = market.get("outcomePrices", "[0.5,0.5]")
@@ -4148,6 +4185,11 @@ async def lifespan(app_: FastAPI):
         # calibration data into the nightly review. Independent of Claude.
         bot._brier_resolver_task = asyncio.create_task(bot._brier_resolver_loop())
         log.info("[BRIER] Calibration resolver scheduled (every 6h)")
+        # Weekly scheduled backtester — fires Sundays 01:00 UTC to compound
+        # insights from resolved trades. Operator can still click RUN.
+        if BACKTEST_WEEKLY_ENABLED and ANTHROPIC_API_KEY:
+            bot._weekly_backtest_task = asyncio.create_task(bot._weekly_backtest_loop())
+            log.info("[BACKTEST] Weekly analysis scheduled (Sunday ~01:00 UTC)")
     else:
         log.warning("Could not connect — check .env credentials")
     yield
@@ -4159,6 +4201,8 @@ async def lifespan(app_: FastAPI):
         bot._nightly_review_task.cancel()
     if bot._brier_resolver_task and not bot._brier_resolver_task.done():
         bot._brier_resolver_task.cancel()
+    if bot._weekly_backtest_task and not bot._weekly_backtest_task.done():
+        bot._weekly_backtest_task.cancel()
     if _bot_task and not _bot_task.done():
         _bot_task.cancel()
         try:
@@ -4779,6 +4823,7 @@ def claude_max_health():
                 },
                 "backtester": {
                     "enabled":       bool(ANTHROPIC_API_KEY) and not CLAUDE_MAX_DISABLED,
+                    "weekly_scheduled": BACKTEST_WEEKLY_ENABLED and bool(ANTHROPIC_API_KEY) and not CLAUDE_MAX_DISABLED,
                     "last_run":      _last("SELECT MAX(created_at) FROM backtests"),
                     "total":         _count("SELECT COUNT(*) FROM backtests"),
                 },
