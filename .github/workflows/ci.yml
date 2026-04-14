@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# Auto-deploy is handled by a VPS-side cron job (see scripts/deploy-pull.sh) —
+# the VPS polls GitHub for new commits on main every minute and pulls +
+# restarts itself when it sees a change. That approach has zero secrets,
+# zero SSH key management, and zero copy-paste pitfalls. Previous
+# GitHub-Actions-SSH-based deploy attempt was removed for being too fragile
+# to set up reliably (private key base64 copy-paste kept truncating).
+
 jobs:
   syntax:
     name: syntax check
@@ -55,64 +62,3 @@ jobs:
           }
           process.exit(fail);
           "
-
-  deploy:
-    name: deploy to VPS
-    runs-on: ubuntu-latest
-    # Only deploy on push to main (never on PRs). Waits for `syntax` to
-    # succeed — a broken build never hits production.
-    needs: syntax
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    steps:
-      - name: Decode base64-encoded SSH key
-        # The key is stored as a single-line base64 blob to dodge all
-        # whitespace/line-ending mishaps that come from pasting multi-line
-        # PEM into the Secrets UI. We decode it to a file, set 0600
-        # permissions, and hand the plain path to the ssh action. No key
-        # material ever lands in the workflow output.
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.VPS_SSH_KEY_B64 }}" | base64 -d > ~/.ssh/vps_key
-          chmod 600 ~/.ssh/vps_key
-          # Sanity-check: must end with an OpenSSH private key footer
-          if ! tail -1 ~/.ssh/vps_key | grep -q "PRIVATE KEY-----"; then
-            echo "ERROR: decoded key does not end with a PRIVATE KEY footer"
-            echo "Check that VPS_SSH_KEY_B64 is a valid base64 encoding of the private key"
-            exit 1
-          fi
-
-      - name: SSH into VPS, pull main, restart sexybot
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: 159.65.201.165
-          username: root
-          key_path: /home/runner/.ssh/vps_key
-          port: 22
-          script_stop: true
-          script: |
-            set -euo pipefail
-            cd /root/polybot
-            echo "── Before deploy ──"
-            git rev-parse --short HEAD
-            git fetch origin main
-            # reset --hard so local drift (accidental edits on the VPS)
-            # can't block the pull. The workflow trusts main.
-            git reset --hard origin/main
-            echo "── After pull ──"
-            git rev-parse --short HEAD
-            echo "── Restarting sexybot ──"
-            systemctl restart sexybot
-            # Sync dashboard HTML to nginx web root and reload
-            if [ -f index.html ]; then
-              cp index.html /var/www/html/index.html
-              nginx -t && systemctl reload nginx || true
-            fi
-            # Wait briefly and verify the service is healthy
-            sleep 3
-            if ! systemctl is-active --quiet sexybot; then
-              echo "❌ sexybot failed to start after deploy"
-              journalctl -u sexybot -n 60 --no-pager
-              exit 1
-            fi
-            echo "✅ sexybot active. Recent log:"
-            journalctl -u sexybot -n 20 --no-pager
