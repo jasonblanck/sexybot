@@ -84,6 +84,15 @@ NIGHTLY_REVIEW_ENABLED  = os.getenv("NIGHTLY_REVIEW",  "true").lower() == "true"
 PRETRADE_CHECK_ENABLED = os.getenv("PRETRADE_CHECK", "true").lower() == "true"
 PRETRADE_MIN_USD       = float(os.getenv("PRETRADE_MIN_USD", "3.0"))
 PRETRADE_TIMEOUT_S     = float(os.getenv("PRETRADE_TIMEOUT_S", "4.0"))
+# Deep analysis: for trades above DEEP_ANALYZE_MIN_USD, fire a second pass
+# with a stronger model + server-side web_search to catch signals that the
+# fast pass missed. Expensive (~10-30s latency, $0.10-0.50/call) so only
+# fires on meaningful size. The whole point of Claude Max — insurance on
+# your biggest trades paid for by your smallest.
+DEEP_ANALYZE_ENABLED   = os.getenv("DEEP_ANALYZE", "true").lower() == "true"
+DEEP_ANALYZE_MIN_USD   = float(os.getenv("DEEP_ANALYZE_MIN_USD", "20.0"))
+DEEP_ANALYZE_MODEL     = os.getenv("DEEP_ANALYZE_MODEL", "claude-opus-4-6")
+DEEP_ANALYZE_TIMEOUT_S = float(os.getenv("DEEP_ANALYZE_TIMEOUT_S", "45.0"))
 
 try:
     from paper import PolymarketPaperHandler, paper_resolution_oracle as _paper_oracle
@@ -139,6 +148,21 @@ _TOOL_PRETRADE = {
             "reason":          {"type": "string"},
         },
         "required": ["proceed", "size_multiplier", "reason"],
+    },
+}
+_TOOL_DEEP = {
+    "name": "submit_deep_verdict",
+    "description": "Submit the deep-analysis verdict for a high-value trade.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "verdict":         {"type": "string", "enum": ["proceed", "downsize", "abort"]},
+            "size_multiplier": {"type": "number", "description": "0.0 for abort, 0.5-0.75 for downsize, 1.0 for proceed"},
+            "probability":     {"type": "integer", "description": "Refined 0-100 integer probability of our side winning"},
+            "reasoning":       {"type": "string", "description": "Two-sentence justification grounded in the evidence you examined"},
+            "evidence_used":   {"type": "array", "items": {"type": "string"}, "description": "Short list of the specific news / search findings / data points that informed the verdict"},
+        },
+        "required": ["verdict", "size_multiplier", "probability", "reasoning", "evidence_used"],
     },
 }
 _TOOL_REVIEW = {
@@ -315,6 +339,24 @@ class PolymarketBot:
                 proceed         INTEGER,      -- 1 = proceeded, 0 = aborted
                 reason          TEXT,
                 created_at      TEXT NOT NULL
+            )""")
+            # Deep-analysis audit log — every Opus + web_search pass gets
+            # recorded with the initial-signal vs deep-verdict delta so the
+            # operator can see whether the $0.30 insurance actually paid off.
+            self.db.execute("""CREATE TABLE IF NOT EXISTS deep_analyses (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                market              TEXT,
+                our_side            TEXT,
+                planned_amount_usdc REAL,
+                initial_probability INTEGER,
+                verdict             TEXT,       -- proceed | downsize | abort
+                size_multiplier     REAL,
+                refined_probability INTEGER,
+                reasoning           TEXT,
+                evidence_used       TEXT,       -- JSON array of strings
+                model               TEXT,
+                latency_s           REAL,
+                created_at          TEXT NOT NULL
             )""")
             # Indexes on frequent WHERE-clause columns. Without these,
             # get_daily_loss and brier-stats queries scan the whole table
@@ -2168,6 +2210,204 @@ class PolymarketBot:
             log.debug(f"pretrade_check error ({e}) — proceeding at full size")
             return {"proceed": True, "size_multiplier": 1.0, "reason": "check failed (fail-open)"}
 
+    # ── Deep analysis for high-value trades (Claude Max) ────────────────────
+    # Only fires when Kelly suggests a bet >= DEEP_ANALYZE_MIN_USD. Uses
+    # Opus 4.6 with adaptive thinking + the server-side web_search tool so
+    # Claude can search the web for real-time news on the exact market
+    # question. Returns a verdict that can override the fast-pass decision:
+    # abort (0x), downsize (0.5-0.75x), or proceed (1x). Treats each big
+    # trade as a real research problem rather than a pattern match.
+    async def deep_analyze_market(
+        self,
+        *,
+        market_question: str,
+        our_side: str,
+        planned_amount_usdc: float,
+        entry_price: float,
+        initial_probability: int,
+        initial_reasoning: str,
+        orderbook: Optional[dict] = None,
+    ) -> Optional[dict]:
+        """Returns {verdict, size_multiplier, probability, reasoning,
+        evidence_used} or None if disabled / failed. Fails open on timeout
+        or error: None return means 'skip deep analysis, keep original
+        decision' — never worse than not running deep analysis at all."""
+        if not DEEP_ANALYZE_ENABLED or not ANTHROPIC_API_KEY:
+            return None
+        if planned_amount_usdc < DEEP_ANALYZE_MIN_USD:
+            return None
+        try:
+            import anthropic
+            if self._anthropic_client is None:
+                self._anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            client = self._anthropic_client
+
+            # Feed calibration data as context — Claude can see whether our
+            # past predictions at similar confidence levels hit or missed.
+            brier = self.get_brier_stats() or {}
+            realized = self.get_realized_pnl_summary() or {}
+            reg = self._regime_cache or {}
+            ob  = orderbook or {}
+            ctx = (
+                f"HIGH-VALUE TRADE REQUESTING DEEP VERIFICATION\n"
+                f"\n"
+                f"Market: {market_question[:300]}\n"
+                f"Planned: BUY {our_side}  ${planned_amount_usdc:.2f}  @ {entry_price:.3f}\n"
+                f"Fast-pass said: probability={initial_probability}%, "
+                f"reasoning={initial_reasoning[:400]}\n"
+                f"\n"
+                f"Current book: bid={ob.get('best_bid')} ask={ob.get('best_ask')} "
+                f"spread={ob.get('spread')} liquid={ob.get('liquid')} obi={ob.get('obi')}\n"
+                f"Regime: {reg.get('regime','normal')} — {reg.get('reasoning','')[:140]}\n"
+                f"\n"
+                f"Our past calibration (Brier score, lower = better):\n"
+                f"  all-time: {brier.get('avg_brier_score')} over "
+                f"{brier.get('resolved',0)} resolved\n"
+                f"  30d:      {brier.get('avg_brier_30d')} over "
+                f"{brier.get('resolved_30d',0)} resolved\n"
+                f"  by side:  {brier.get('by_side', {})}\n"
+                f"Realized P&L 30d: {realized.get('last_30d', {})}\n"
+                f"\n"
+                f"Your job: use web_search to find the latest news / developments / "
+                f"polling / court filings / price action relevant to this market. "
+                f"Then decide whether to PROCEED (the fast pass was right), "
+                f"DOWNSIZE (weaken the probability or size), or ABORT (evidence "
+                f"against the trade). Submit your verdict via submit_deep_verdict. "
+                f"Take the full budget of your research — this is a significant "
+                f"bet and we can afford 20-30s of your time."
+            )
+            system = (
+                "You are the senior analyst reviewing a high-value Polymarket "
+                "trade that a faster model already approved. You have access "
+                "to web_search for real-time news. Be rigorous but decisive:\n"
+                "- PROCEED if the evidence you find is consistent with the "
+                "  fast pass's conclusion and no adverse catalyst is visible.\n"
+                "- DOWNSIZE (size_multiplier 0.5-0.75) if the case is weaker "
+                "  than the fast pass suggests but not actually bad — e.g. "
+                "  conflicting signals, thin evidence, resolution far away.\n"
+                "- ABORT (size_multiplier 0.0) if you find evidence that "
+                "  actively contradicts the trade — breaking news the fast "
+                "  pass missed, a court ruling that flips the base rate, a "
+                "  clear reversal pattern. Protect capital.\n"
+                "\n"
+                "Calibration matters. If the market is close to priced-in, "
+                "the edge is noise — DOWNSIZE. Overconfidence is expensive; "
+                "humility is free.\n"
+                "\n"
+                "Submit exactly one submit_deep_verdict tool call when done."
+            )
+
+            t0 = time.time()
+            # Server-side web_search + the submit tool. tool_choice=auto so
+            # Claude can search first and submit at the end — forcing the
+            # submit tool would prevent searching at all.
+            try:
+                msg = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.messages.create,
+                        model=DEEP_ANALYZE_MODEL,
+                        max_tokens=4000,
+                        thinking={"type": "adaptive"} if ("sonnet" in DEEP_ANALYZE_MODEL or "opus" in DEEP_ANALYZE_MODEL) else None,
+                        system=system,
+                        messages=[{"role": "user", "content": ctx}],
+                        tools=[
+                            {"type": "web_search_20250305", "name": "web_search"},
+                            _TOOL_DEEP,
+                        ],
+                    ),
+                    timeout=DEEP_ANALYZE_TIMEOUT_S,
+                )
+            except TypeError:
+                # thinking=None passed literally to older SDK? Fall back without it.
+                msg = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.messages.create,
+                        model=DEEP_ANALYZE_MODEL,
+                        max_tokens=4000,
+                        system=system,
+                        messages=[{"role": "user", "content": ctx}],
+                        tools=[
+                            {"type": "web_search_20250305", "name": "web_search"},
+                            _TOOL_DEEP,
+                        ],
+                    ),
+                    timeout=DEEP_ANALYZE_TIMEOUT_S,
+                )
+            latency = round(time.time() - t0, 2)
+
+            if msg.stop_reason == "refusal":
+                log.warning("Deep analysis refused by model")
+                return None
+
+            d = _extract_tool_input(msg, _TOOL_DEEP["name"])
+            if d is None:
+                # No verdict — treat as no-op (keep original decision)
+                log.debug("Deep analysis didn't emit submit_deep_verdict")
+                return None
+
+            verdict = str(d.get("verdict", "proceed")).lower()
+            if verdict not in ("proceed", "downsize", "abort"):
+                verdict = "proceed"
+            mult = float(d.get("size_multiplier", 1.0))
+            mult = max(0.0, min(1.0, mult))
+            if verdict == "abort":
+                mult = 0.0
+            try:
+                refined_prob = int(d.get("probability", initial_probability))
+            except (TypeError, ValueError):
+                refined_prob = initial_probability
+            refined_prob = max(0, min(100, refined_prob))
+            reasoning = str(d.get("reasoning", ""))[:1000]
+            evidence = d.get("evidence_used", []) or []
+            if not isinstance(evidence, list):
+                evidence = []
+
+            # Persist for audit
+            try:
+                import json as _j
+                with self.db:
+                    self.db.execute(
+                        "INSERT INTO deep_analyses (market, our_side, planned_amount_usdc, "
+                        "initial_probability, verdict, size_multiplier, refined_probability, "
+                        "reasoning, evidence_used, model, latency_s, created_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (market_question[:300], our_side, planned_amount_usdc,
+                         int(initial_probability), verdict, mult, refined_prob,
+                         reasoning, _j.dumps([str(e)[:200] for e in evidence][:10]),
+                         DEEP_ANALYZE_MODEL, latency,
+                         datetime.utcnow().isoformat()),
+                    )
+            except Exception as e:
+                log.debug(f"deep_analyses insert failed: {e}")
+
+            emoji = {"proceed": "✅", "downsize": "🟠", "abort": "🛑"}.get(verdict, "•")
+            self._log(
+                f"{emoji} DEEP [{verdict.upper()}] {market_question[:40]}  "
+                f"{initial_probability}%→{refined_prob}%  mult×{mult:.2f}  "
+                f"({latency}s)  —  {reasoning[:140]}",
+                "warning" if verdict == "abort" else "info",
+            )
+            if verdict == "abort" and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                asyncio.create_task(asyncio.to_thread(
+                    self.send_telegram,
+                    f"🛑 DEEP ANALYSIS ABORTED ${planned_amount_usdc:.2f} trade\n"
+                    f"{market_question[:80]}\nReason: {reasoning[:300]}"
+                ))
+            return {
+                "verdict":          verdict,
+                "size_multiplier":  mult,
+                "probability":      refined_prob,
+                "reasoning":        reasoning,
+                "evidence_used":    evidence,
+                "latency_s":        latency,
+            }
+        except asyncio.TimeoutError:
+            log.warning(f"Deep analysis timeout (>{DEEP_ANALYZE_TIMEOUT_S}s) — keeping original decision")
+            return None
+        except Exception as e:
+            log.warning(f"Deep analysis error: {e} — keeping original decision")
+            return None
+
     # ── Nightly strategy review (Claude Max) ───────────────────────────────
     # Once per 24h, feed Claude the day's trades, Brier calibration, regime
     # log, and current parameters. Claude writes a review to the DB with
@@ -3014,6 +3254,39 @@ class PolymarketBot:
                                 if amt < 1.0:
                                     sig_record["skip_reason"] = f"pretrade downsized below $1: {pre['reason']}"
                                     continue
+
+                            # Deep analysis for high-value trades (Opus + web
+                            # search). Non-null return means Claude reviewed
+                            # the trade with real-time news access; it can
+                            # override the pretrade decision. None = disabled
+                            # / below threshold / failed — keep fast decision.
+                            deep = await self.deep_analyze_market(
+                                market_question     = mkt_name,
+                                our_side            = our_side,
+                                planned_amount_usdc = amt,
+                                entry_price         = entry_price,
+                                initial_probability = int(round(p_true * 100)),
+                                initial_reasoning   = signal.get("ai_reasoning", ""),
+                                orderbook           = ob_data,
+                            )
+                            if deep is not None:
+                                if deep["verdict"] == "abort" or deep["size_multiplier"] <= 0.01:
+                                    self._log(
+                                        f"🛑 DEEP ABORT | {mkt_name[:40]}  —  {deep['reasoning'][:160]}",
+                                        "warning",
+                                    )
+                                    sig_record["skip_reason"] = f"deep abort: {deep['reasoning'][:140]}"
+                                    continue
+                                if deep["size_multiplier"] < 1.0:
+                                    adj_amt = round(amt * deep["size_multiplier"], 2)
+                                    self._log(
+                                        f"🟠 DEEP DOWNSIZE | {mkt_name[:40]}  "
+                                        f"${amt:.2f} → ${adj_amt:.2f}  —  {deep['reasoning'][:120]}"
+                                    )
+                                    amt = adj_amt
+                                    if amt < 1.0:
+                                        sig_record["skip_reason"] = f"deep downsized below $1"
+                                        continue
                             result = await self._execute_order(signal["token_id"], "BUY", amt, mkt_name)
                             cycle_cash -= amt
                             if result and result.get("status") not in ("error", None):
@@ -3865,6 +4138,60 @@ async def trigger_trade_resolve(limit: int = 100):
     limit = max(1, min(limit, 1000))
     settled = await bot.resolve_trade_outcomes(limit=limit)
     return JSONResponse({"ok": True, "settled": settled})
+
+
+@app.get("/deep/recent")
+def deep_recent(limit: int = 20):
+    """Recent deep-analysis verdicts on high-value trades."""
+    limit = max(1, min(limit, 100))
+    try:
+        rows = bot.db.execute(
+            "SELECT market, our_side, planned_amount_usdc, initial_probability, "
+            "verdict, size_multiplier, refined_probability, reasoning, "
+            "evidence_used, model, latency_s, created_at FROM deep_analyses "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        summary = bot.db.execute(
+            "SELECT "
+            "  SUM(CASE WHEN verdict='abort'    THEN 1 ELSE 0 END) AS aborts,"
+            "  SUM(CASE WHEN verdict='downsize' THEN 1 ELSE 0 END) AS downsizes,"
+            "  SUM(CASE WHEN verdict='proceed'  THEN 1 ELSE 0 END) AS proceeds,"
+            "  SUM(planned_amount_usdc * (1.0 - size_multiplier)) AS usd_protected "
+            "FROM deep_analyses WHERE created_at >= datetime('now','-7 days')"
+        ).fetchone()
+        import json as _j
+        return JSONResponse({
+            "enabled": DEEP_ANALYZE_ENABLED and bool(ANTHROPIC_API_KEY),
+            "threshold_usd": DEEP_ANALYZE_MIN_USD,
+            "model":         DEEP_ANALYZE_MODEL,
+            "last_7d": {
+                "aborts":        int(summary[0] or 0) if summary else 0,
+                "downsizes":     int(summary[1] or 0) if summary else 0,
+                "proceeds":      int(summary[2] or 0) if summary else 0,
+                "usd_protected": round(float(summary[3] or 0.0), 2) if summary else 0.0,
+            },
+            "entries": [
+                {
+                    "market":              r[0],
+                    "our_side":            r[1],
+                    "planned_amount_usdc": r[2],
+                    "initial_probability": r[3],
+                    "verdict":             r[4],
+                    "size_multiplier":     r[5],
+                    "refined_probability": r[6],
+                    "reasoning":           r[7],
+                    "evidence_used":       _j.loads(r[8]) if r[8] else [],
+                    "model":               r[9],
+                    "latency_s":           r[10],
+                    "at":                  r[11],
+                }
+                for r in rows
+            ],
+        })
+    except Exception as e:
+        log.warning(f"/deep/recent error: {e}")
+        return JSONResponse({"enabled": False, "entries": [], "error": "internal error"}, status_code=500)
 
 
 @app.get("/pretrade/recent")

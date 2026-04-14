@@ -278,6 +278,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
         <div class="stat-row" id="regime-reasoning-row" style="display:none"><span class="stat-lbl" style="font-size:9px;color:var(--text3)">Why</span><span class="stat-val" id="regime-reasoning" style="font-size:10px;color:var(--text2);text-align:right;max-width:200px;overflow:hidden;text-overflow:ellipsis"></span></div>
         <div class="stat-row" id="pretrade-row" style="display:none"><span class="stat-lbl">Pretrade catches (24h)</span><span class="stat-val" id="pretrade-state" title="Abort = gate refused the trade; downsize = gate reduced the amount">—</span></div>
         <div class="stat-row" id="realized-pnl-row" style="display:none"><span class="stat-lbl">Realized P&L (30d)</span><span class="stat-val" id="realized-pnl-state" title="Actual profit/loss on resolved positions — gross payout minus cost">—</span></div>
+        <div class="stat-row" id="deep-row" style="display:none"><span class="stat-lbl">Deep verdicts (7d)</span><span class="stat-val" id="deep-state" title="Opus+web_search verifications on high-value trades">—</span></div>
       </div>
     </div>
     <div class="panel" id="reviews-panel">
@@ -1290,6 +1291,27 @@ async function fetchRegime(){
     if(d.reasoning&&why){why.textContent=d.reasoning;if(row)row.style.display='';}
   }catch(e){}
 }
+/* ── DEEP ANALYSIS verdicts ── */
+async function fetchDeep(){
+  try{
+    const r=await fetch(`${BOT}/deep/recent?limit=1`);if(!r.ok)return;
+    const d=await r.json();
+    const row=document.getElementById('deep-row');
+    const el=document.getElementById('deep-state');
+    if(!d||!d.enabled||!el||!row)return;
+    const s=d.last_7d||{};
+    const total=(s.aborts||0)+(s.downsizes||0)+(s.proceeds||0);
+    if(total===0){row.style.display='none';return;}
+    row.style.display='';
+    const parts=[];
+    if(s.aborts>0)parts.push(`<span class="r">${s.aborts}✗</span>`);
+    if(s.downsizes>0)parts.push(`<span class="y">${s.downsizes}↓</span>`);
+    if(s.proceeds>0)parts.push(`<span class="g">${s.proceeds}✓</span>`);
+    const prot=Number(s.usd_protected||0);
+    const tail=prot>0?` <span style="font-size:10px;color:var(--text3)" title="USD prevented from being deployed on aborted/downsized trades">$${prot.toFixed(0)} saved</span>`:'';
+    el.innerHTML=parts.join(' ')+tail;
+  }catch(e){}
+}
 /* ── REALIZED P&L ── */
 async function fetchRealizedPnl(){
   try{
@@ -1394,7 +1416,7 @@ async function applyReview(reviewId,idx,btn){
   }
 }
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();
 setInterval(fetchBot,15000);
 setInterval(fetchPortfolio,30000);
 setInterval(fetchMarkets,60000);
@@ -1409,6 +1431,7 @@ setInterval(fetchRegime,60000);
 setInterval(fetchReviews,600000);
 setInterval(fetchPretrade,90000);
 setInterval(fetchRealizedPnl,180000);
+setInterval(fetchDeep,120000);
 connectWS();
 // Handle initial hash
 (()=>{const pg=location.hash.slice(1);if(pg&&pg!=='dashboard')showPage(pg);})();
