@@ -2358,37 +2358,36 @@ class PolymarketBot:
             t0 = time.time()
             # Server-side web_search + the submit tool. tool_choice=auto so
             # Claude can search first and submit at the end — forcing the
-            # submit tool would prevent searching at all.
+            # submit tool would prevent searching at all. Build kwargs
+            # conditionally so we never pass thinking=None (the SDK/API
+            # will reject None; some older SDKs don't tolerate it at all).
+            deep_kwargs = {
+                "model":    DEEP_ANALYZE_MODEL,
+                "max_tokens": 4000,
+                "system":   system,
+                "messages": [{"role": "user", "content": ctx}],
+                "tools": [
+                    {"type": "web_search_20260209", "name": "web_search"},
+                    _TOOL_DEEP,
+                ],
+            }
+            if "sonnet" in DEEP_ANALYZE_MODEL or "opus" in DEEP_ANALYZE_MODEL:
+                deep_kwargs["thinking"] = {"type": "adaptive"}
             try:
                 msg = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.messages.create,
-                        model=DEEP_ANALYZE_MODEL,
-                        max_tokens=4000,
-                        thinking={"type": "adaptive"} if ("sonnet" in DEEP_ANALYZE_MODEL or "opus" in DEEP_ANALYZE_MODEL) else None,
-                        system=system,
-                        messages=[{"role": "user", "content": ctx}],
-                        tools=[
-                            {"type": "web_search_20250305", "name": "web_search"},
-                            _TOOL_DEEP,
-                        ],
-                    ),
+                    asyncio.to_thread(client.messages.create, **deep_kwargs),
                     timeout=DEEP_ANALYZE_TIMEOUT_S,
                 )
             except TypeError:
-                # thinking=None passed literally to older SDK? Fall back without it.
+                # Older SDK rejected a kwarg. Retry with the fallback
+                # web_search version (_20250305) and no thinking.
+                deep_kwargs.pop("thinking", None)
+                deep_kwargs["tools"] = [
+                    {"type": "web_search_20250305", "name": "web_search"},
+                    _TOOL_DEEP,
+                ]
                 msg = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.messages.create,
-                        model=DEEP_ANALYZE_MODEL,
-                        max_tokens=4000,
-                        system=system,
-                        messages=[{"role": "user", "content": ctx}],
-                        tools=[
-                            {"type": "web_search_20250305", "name": "web_search"},
-                            _TOOL_DEEP,
-                        ],
-                    ),
+                    asyncio.to_thread(client.messages.create, **deep_kwargs),
                     timeout=DEEP_ANALYZE_TIMEOUT_S,
                 )
             latency = round(time.time() - t0, 2)
@@ -2551,7 +2550,7 @@ class PolymarketBot:
                 "system": system,
                 "messages": [{"role": "user", "content": ctx}],
                 "tools": [
-                    {"type": "code_execution_20250522", "name": "code_execution"},
+                    {"type": "code_execution_20260120", "name": "code_execution"},
                     _TOOL_BACKTEST,
                 ],
             }
