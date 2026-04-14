@@ -101,6 +101,23 @@ DEEP_ANALYZE_TIMEOUT_S = float(os.getenv("DEEP_ANALYZE_TIMEOUT_S", "45.0"))
 AUTO_APPLY_ENABLED     = os.getenv("AUTO_APPLY_REVIEW", "false").lower() == "true"
 AUTO_APPLY_MIN_CONF    = int(os.getenv("AUTO_APPLY_MIN_CONF", "70"))
 AUTO_APPLY_MAX_DELTA   = float(os.getenv("AUTO_APPLY_MAX_DELTA", "0.25"))   # ±25% of current
+# Master emergency kill switch for the entire Claude Max stack. Set
+# CLAUDE_MAX_DISABLE=true in .env and every AI feature no-ops to its safe
+# fallback: regime defaults to normal, analyze_with_claude returns None,
+# pretrade proceeds at full size, deep analysis is skipped, nightly review
+# and backtester refuse to run. The bot keeps trading on its rule-based
+# strategies alone. Use this if Anthropic is having an outage, if you spot
+# a bad pattern, or if you just want to run the legacy path for a day.
+CLAUDE_MAX_DISABLED    = os.getenv("CLAUDE_MAX_DISABLE", "false").lower() == "true"
+if CLAUDE_MAX_DISABLED:
+    # Force every AI feature off — keeps downstream code paths safe
+    # without having to check CLAUDE_MAX_DISABLED everywhere.
+    REGIME_DETECTOR_ENABLED = False
+    NIGHTLY_REVIEW_ENABLED  = False
+    PRETRADE_CHECK_ENABLED  = False
+    DEEP_ANALYZE_ENABLED    = False
+    AUTO_APPLY_ENABLED      = False
+    log.warning("CLAUDE_MAX_DISABLE=true — all Claude Max features are OFF")
 
 try:
     from paper import PolymarketPaperHandler, paper_resolution_oracle as _paper_oracle
@@ -1716,7 +1733,7 @@ class PolymarketBot:
         Use Claude claude-haiku-4-5 to intelligently score a market using all available context.
         Returns enhanced signal dict or None to skip.
         """
-        if not ANTHROPIC_API_KEY:
+        if not ANTHROPIC_API_KEY or CLAUDE_MAX_DISABLED:
             return None
         try:
             import anthropic
@@ -2460,7 +2477,7 @@ class PolymarketBot:
     async def run_backtest_analysis(self) -> Optional[dict]:
         """Run a Claude-driven backtest of the bot's recent performance.
         Returns the report dict, persisted to the backtests table."""
-        if not ANTHROPIC_API_KEY:
+        if not ANTHROPIC_API_KEY or CLAUDE_MAX_DISABLED:
             return None
         try:
             import anthropic, io, csv as _csv
@@ -4498,6 +4515,97 @@ async def trigger_trade_resolve(limit: int = 100):
     limit = max(1, min(limit, 1000))
     settled = await bot.resolve_trade_outcomes(limit=limit)
     return JSONResponse({"ok": True, "settled": settled})
+
+
+@app.get("/health/claude")
+def claude_max_health():
+    """Single-pane-of-glass health check for every Claude Max feature.
+    Returns which features are enabled, when they last ran, recent
+    outcome counts, and any obvious error signals. The dashboard reads
+    this once a minute so the operator can tell at a glance whether
+    anything is wrong."""
+    try:
+        now_iso = datetime.utcnow().isoformat()
+        # Last-run timestamps from audit tables
+        def _last(sql: str) -> Optional[str]:
+            try:
+                row = bot.db.execute(sql).fetchone()
+                return row[0] if row and row[0] else None
+            except Exception:
+                return None
+        # Counts
+        def _count(sql: str) -> int:
+            try:
+                row = bot.db.execute(sql).fetchone()
+                return int(row[0] or 0) if row else 0
+            except Exception:
+                return 0
+
+        health = {
+            "ts":                 now_iso,
+            "master_disabled":    CLAUDE_MAX_DISABLED,
+            "anthropic_api_key":  bool(ANTHROPIC_API_KEY),
+            "model": {
+                "analysis":        CLAUDE_MODEL,
+                "fast":            CLAUDE_FAST_MODEL,
+                "deep":            DEEP_ANALYZE_MODEL,
+                "adaptive_think":  CLAUDE_ADAPTIVE_THINK,
+            },
+            "bot_running":        bot.running,
+            "features": {
+                "regime_detector": {
+                    "enabled":      REGIME_DETECTOR_ENABLED and bool(ANTHROPIC_API_KEY) and not CLAUDE_MAX_DISABLED,
+                    "current":      (bot._regime_cache or {}).get("regime", "normal"),
+                    "last_run":     (bot._regime_cache or {}).get("assessed_at"),
+                    "hostile_24h":  _count("SELECT COUNT(*) FROM regime_log WHERE regime='hostile' AND created_at >= datetime('now','-24 hours')"),
+                },
+                "pretrade_check": {
+                    "enabled":      PRETRADE_CHECK_ENABLED and bool(ANTHROPIC_API_KEY) and not CLAUDE_MAX_DISABLED,
+                    "min_usd":      PRETRADE_MIN_USD,
+                    "timeout_s":    PRETRADE_TIMEOUT_S,
+                    "aborts_24h":    _count("SELECT COUNT(*) FROM pretrade_log WHERE proceed=0 AND created_at >= datetime('now','-24 hours')"),
+                    "downsizes_24h": _count("SELECT COUNT(*) FROM pretrade_log WHERE proceed=1 AND size_multiplier<1.0 AND created_at >= datetime('now','-24 hours')"),
+                },
+                "deep_analyze": {
+                    "enabled":       DEEP_ANALYZE_ENABLED and bool(ANTHROPIC_API_KEY) and not CLAUDE_MAX_DISABLED,
+                    "min_usd":       DEEP_ANALYZE_MIN_USD,
+                    "timeout_s":     DEEP_ANALYZE_TIMEOUT_S,
+                    "aborts_7d":     _count("SELECT COUNT(*) FROM deep_analyses WHERE verdict='abort'    AND created_at >= datetime('now','-7 days')"),
+                    "downsizes_7d":  _count("SELECT COUNT(*) FROM deep_analyses WHERE verdict='downsize' AND created_at >= datetime('now','-7 days')"),
+                    "proceeds_7d":   _count("SELECT COUNT(*) FROM deep_analyses WHERE verdict='proceed'  AND created_at >= datetime('now','-7 days')"),
+                    "last_run":      _last("SELECT MAX(created_at) FROM deep_analyses"),
+                },
+                "nightly_review": {
+                    "enabled":       NIGHTLY_REVIEW_ENABLED and bool(ANTHROPIC_API_KEY) and not CLAUDE_MAX_DISABLED,
+                    "last_run":      _last("SELECT MAX(created_at) FROM strategy_reviews"),
+                    "total":         _count("SELECT COUNT(*) FROM strategy_reviews"),
+                },
+                "auto_apply": {
+                    "enabled":       AUTO_APPLY_ENABLED and not CLAUDE_MAX_DISABLED,
+                    "min_confidence": AUTO_APPLY_MIN_CONF,
+                    "max_delta":     AUTO_APPLY_MAX_DELTA,
+                },
+                "brier_resolver": {
+                    "enabled":       True,   # Independent of Claude
+                    "resolved":      _count("SELECT COUNT(*) FROM brier_scores WHERE resolved=1"),
+                    "pending":       _count("SELECT COUNT(*) FROM brier_scores WHERE resolved=0"),
+                },
+                "trade_resolver": {
+                    "enabled":       True,
+                    "resolved":      _count("SELECT COUNT(*) FROM trades WHERE resolved=1 AND dry_run=0"),
+                    "pending":       _count("SELECT COUNT(*) FROM trades WHERE resolved=0 AND dry_run=0 AND status IN ('matched','filled','simulated') AND order_type='market'"),
+                },
+                "backtester": {
+                    "enabled":       bool(ANTHROPIC_API_KEY) and not CLAUDE_MAX_DISABLED,
+                    "last_run":      _last("SELECT MAX(created_at) FROM backtests"),
+                    "total":         _count("SELECT COUNT(*) FROM backtests"),
+                },
+            },
+        }
+        return JSONResponse(health)
+    except Exception as e:
+        log.warning(f"/health/claude error: {e}")
+        return JSONResponse({"error": "internal error"}, status_code=500)
 
 
 @app.get("/backtest")

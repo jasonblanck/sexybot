@@ -279,6 +279,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
         <div class="stat-row" id="pretrade-row" style="display:none"><span class="stat-lbl">Pretrade catches (24h)</span><span class="stat-val" id="pretrade-state" title="Abort = gate refused the trade; downsize = gate reduced the amount">—</span></div>
         <div class="stat-row" id="realized-pnl-row" style="display:none"><span class="stat-lbl">Realized P&L (30d)</span><span class="stat-val" id="realized-pnl-state" title="Actual profit/loss on resolved positions — gross payout minus cost">—</span></div>
         <div class="stat-row" id="deep-row" style="display:none"><span class="stat-lbl">Deep verdicts (7d)</span><span class="stat-val" id="deep-state" title="Opus+web_search verifications on high-value trades">—</span></div>
+        <div class="stat-row" id="claude-max-row"><span class="stat-lbl">Claude Max</span><span class="stat-val" id="claude-max-state" title="Overall status of the Claude Max stack — click logs for details">—</span></div>
       </div>
     </div>
     <div class="panel" id="backtest-panel">
@@ -1299,6 +1300,21 @@ async function fetchRegime(){
     if(d.reasoning&&why){why.textContent=d.reasoning;if(row)row.style.display='';}
   }catch(e){}
 }
+/* ── CLAUDE MAX overall health ── */
+async function fetchClaudeMax(){
+  try{
+    const r=await fetch(`${BOT}/health/claude`);if(!r.ok)return;
+    const d=await r.json();
+    const el=document.getElementById('claude-max-state');if(!el)return;
+    if(d.master_disabled){el.innerHTML='<span class="r">● DISABLED</span> <span style="font-size:10px;color:var(--text3)">rule-based only</span>';return;}
+    if(!d.anthropic_api_key){el.innerHTML='<span class="r">● NO API KEY</span>';return;}
+    const f=d.features||{};
+    const active=Object.values(f).filter(x=>x.enabled).length;
+    const total=Object.keys(f).length;
+    const cls=active===total?'g':active>0?'y':'r';
+    el.innerHTML=`<span class="${cls}">● ${active}/${total} active</span>`;
+  }catch(e){}
+}
 /* ── DEEP ANALYSIS verdicts ── */
 async function fetchDeep(){
   try{
@@ -1464,7 +1480,7 @@ async function applyReview(reviewId,idx,btn){
   }
 }
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();fetchClaudeMax();
 setInterval(fetchBot,15000);
 setInterval(fetchPortfolio,30000);
 setInterval(fetchMarkets,60000);
@@ -1480,6 +1496,7 @@ setInterval(fetchReviews,600000);
 setInterval(fetchPretrade,90000);
 setInterval(fetchRealizedPnl,180000);
 setInterval(fetchDeep,120000);
+setInterval(fetchClaudeMax,60000);
 connectWS();
 // Handle initial hash
 (()=>{const pg=location.hash.slice(1);if(pg&&pg!=='dashboard')showPage(pg);})();
