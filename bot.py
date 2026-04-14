@@ -4292,6 +4292,17 @@ async def start_bot(interval: float = 30.0):
     global _bot_task
     if bot.running:
         return {"ok": False, "message": "Already running"}
+    # If lifespan's bot.connect() failed on startup (bad API response,
+    # network blip, expired L2 creds), bot.client is still None and
+    # launching run_loop would immediately crash. Retry connect() here
+    # so /start is a true recovery path. Requires .env / keys to be
+    # valid — if they're not, connect() returns False and we fail loud.
+    if bot.client is None:
+        if not bot.connect():
+            raise HTTPException(
+                status_code=503,
+                detail="connect() failed — check .env credentials / Polymarket reachability",
+            )
     interval = max(10.0, min(interval, 300.0))  # clamp to [10s, 5min]
     bot.running = True  # set before task creation to prevent double-start race
     _bot_task = asyncio.create_task(bot.run_loop(interval=interval))
