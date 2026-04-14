@@ -192,6 +192,20 @@ class PolymarketBot:
                 vol_state  TEXT,
                 created_at TEXT NOT NULL
             )""")
+            # Pre-trade sanity check outcomes — observability into which
+            # trades the last-mile gate rejected or scaled down. Lets the
+            # operator and the nightly review see the pattern of catches.
+            self.db.execute("""CREATE TABLE IF NOT EXISTS pretrade_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                market          TEXT,
+                our_side        TEXT,
+                amount_usdc     REAL,
+                entry_price     REAL,
+                size_multiplier REAL,
+                proceed         INTEGER,      -- 1 = proceeded, 0 = aborted
+                reason          TEXT,
+                created_at      TEXT NOT NULL
+            )""")
             # Indexes on frequent WHERE-clause columns. Without these,
             # get_daily_loss and brier-stats queries scan the whole table
             # as trades/brier_scores grow — latency creeps up over weeks.
@@ -200,6 +214,7 @@ class PolymarketBot:
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_brier_resolved ON brier_scores(resolved)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_reviews_date  ON strategy_reviews(review_date)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_regime_time   ON regime_log(created_at)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_pretrade_time ON pretrade_log(created_at)")
             # Purge idempotency keys older than 24h on startup
             self.db.execute(
                 "DELETE FROM idempotency_keys WHERE datetime(created) < datetime('now', '-24 hours')"
@@ -1342,6 +1357,18 @@ class PolymarketBot:
             if govtrack:
                 ctx_parts.append(f"LEGISLATION: {govtrack}")
 
+            # Current trading regime — lets Claude weight calibration against
+            # system-level risk posture. In cautious/hostile regimes it should
+            # demand more evidence and default to SKIP on close calls.
+            reg = self._regime_cache or {}
+            reg_name = reg.get("regime", "normal")
+            if reg_name and reg_name != "normal":
+                ctx_parts.append(
+                    f"TRADING REGIME: {reg_name.upper()} — "
+                    f"{reg.get('reasoning', '')[:140]}. "
+                    f"Be more conservative; default to SKIP on close calls."
+                )
+
             context = "\n".join(ctx_parts)
 
             # Stable instructions live in `system` and are marked for prompt
@@ -1646,6 +1673,7 @@ class PolymarketBot:
             edge_add = max(0.0, min(0.20, edge_add))
             reasoning = str(decision.get("reasoning", ""))[:300]
 
+            prev_regime = (self._regime_cache or {}).get("regime", "normal")
             self._regime_cache = {
                 "regime":           regime,
                 "kelly_multiplier": kmult,
@@ -1654,6 +1682,20 @@ class PolymarketBot:
                 "assessed_at":      datetime.utcnow().isoformat(),
             }
             self._regime_cache_time = time.time()
+            # Telegram alert on *transition* to hostile. Only on the edge, not
+            # repeated every assessment, so the operator isn't spammed during
+            # sustained hostile periods. Also alert on transition OUT of
+            # hostile back to normal so they know when the coast clears.
+            if regime == "hostile" and prev_regime != "hostile" and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                asyncio.create_task(asyncio.to_thread(
+                    self.send_telegram,
+                    f"🛑 REGIME → HOSTILE\nNew trades halted for the cycle.\n{reasoning[:300]}"
+                ))
+            elif prev_regime == "hostile" and regime != "hostile" and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                asyncio.create_task(asyncio.to_thread(
+                    self.send_telegram,
+                    f"✅ REGIME → {regime.upper()}\nTrading resumed. {reasoning[:200]}"
+                ))
             # Persist for auditing
             try:
                 with self.db:
@@ -1714,11 +1756,16 @@ class PolymarketBot:
             liquid   = ob.get("liquid")
             obi      = ob.get("obi", 0)
 
+            reg = self._regime_cache or {}
+            reg_name = reg.get("regime", "normal")
             ctx = (
                 f"MARKET: {market_question[:180]}\n"
                 f"PLANNED TRADE: BUY {our_side}  ${amount_usdc:.2f}  @ {entry_price:.3f}\n"
                 f"ORDER BOOK NOW: bid={best_bid} ask={best_ask} spread={spread} "
                 f"liquid={liquid} obi={obi} (>0 = YES-side pressure)\n"
+                f"REGIME: {reg_name}"
+                + (f" ({reg.get('reasoning','')[:80]})" if reg_name != "normal" else "")
+                + "\n"
                 + (f"PRIOR AI REASONING: {ai_reasoning[:400]}\n" if ai_reasoning else "")
             )
 
@@ -1769,6 +1816,23 @@ class PolymarketBot:
             if not proceed:
                 mult = 0.0
             reason = str(d.get("reason", ""))[:200]
+            # Persist the outcome for observability — dashboard + nightly review
+            # both read this to see what the gate caught. We only log meaningful
+            # outcomes (aborts and downsizes); full-size proceeds are the vast
+            # majority and would just fill the table.
+            try:
+                if (not proceed) or mult < 1.0:
+                    with self.db:
+                        self.db.execute(
+                            "INSERT INTO pretrade_log (market, our_side, amount_usdc, "
+                            "entry_price, size_multiplier, proceed, reason, created_at) "
+                            "VALUES (?,?,?,?,?,?,?,?)",
+                            (market_question[:200], our_side, amount_usdc,
+                             entry_price, mult, 1 if proceed else 0, reason,
+                             datetime.utcnow().isoformat()),
+                        )
+            except Exception as e:
+                log.debug(f"pretrade_log insert failed: {e}")
             return {"proceed": proceed, "size_multiplier": mult, "reason": reason}
         except asyncio.TimeoutError:
             log.debug("pretrade_check timeout — proceeding at full size")
@@ -2888,6 +2952,13 @@ async def lifespan(app_: FastAPI):
         if NIGHTLY_REVIEW_ENABLED and ANTHROPIC_API_KEY:
             bot._nightly_review_task = asyncio.create_task(bot._nightly_review_loop())
             log.info("[NIGHTLY REVIEW] Daily strategy review scheduled (~00:05 UTC)")
+        # Bootstrap regime at startup so the first scan cycle already has a
+        # real assessment instead of the default "normal". Fire-and-forget —
+        # don't block startup on the Claude call; even a multi-second Sonnet
+        # round-trip will finish well before the first scan cycle (30s).
+        if REGIME_DETECTOR_ENABLED and ANTHROPIC_API_KEY:
+            asyncio.create_task(bot.assess_market_regime(force=True))
+            log.info("[REGIME] Bootstrap assessment kicked off at startup")
     else:
         log.warning("Could not connect — check .env credentials")
     yield
@@ -3410,6 +3481,47 @@ async def trigger_regime_assessment():
     """Force a regime re-assessment (bypasses the 10-minute cache)."""
     result = await bot.assess_market_regime(force=True)
     return JSONResponse(result)
+
+
+@app.get("/pretrade/recent")
+def pretrade_recent(limit: int = 20):
+    """Recent pre-trade check catches (aborts and downsizes).
+    Full-size proceeds are not logged — the table shows what the gate caught."""
+    limit = max(1, min(limit, 100))
+    try:
+        rows = bot.db.execute(
+            "SELECT market, our_side, amount_usdc, entry_price, size_multiplier, "
+            "proceed, reason, created_at FROM pretrade_log "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        summary = bot.db.execute(
+            "SELECT "
+            "  SUM(CASE WHEN proceed=0 THEN 1 ELSE 0 END) AS aborts,"
+            "  SUM(CASE WHEN proceed=1 AND size_multiplier<1.0 THEN 1 ELSE 0 END) AS downsizes "
+            "FROM pretrade_log WHERE created_at >= datetime('now','-24 hours')"
+        ).fetchone()
+        return JSONResponse({
+            "enabled": PRETRADE_CHECK_ENABLED and bool(ANTHROPIC_API_KEY),
+            "last_24h_aborts":    int(summary[0] or 0) if summary else 0,
+            "last_24h_downsizes": int(summary[1] or 0) if summary else 0,
+            "entries": [
+                {
+                    "market":          r[0],
+                    "our_side":        r[1],
+                    "amount_usdc":     r[2],
+                    "entry_price":     r[3],
+                    "size_multiplier": r[4],
+                    "proceed":         bool(r[5]),
+                    "reason":          r[6],
+                    "at":              r[7],
+                }
+                for r in rows
+            ],
+        })
+    except Exception as e:
+        log.warning(f"/pretrade/recent error: {e}")
+        return JSONResponse({"enabled": False, "entries": [], "error": "internal error"}, status_code=500)
 
 
 @app.post("/reviews/{review_id}/apply", dependencies=[Depends(require_api_key)])
