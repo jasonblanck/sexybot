@@ -274,6 +274,14 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
         <div class="stat-row"><span class="stat-lbl">Status</span><span class="stat-val" id="bstatus">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Volatility</span><span class="stat-val" id="vol-state">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Gas (Polygon)</span><span class="stat-val" id="gas-state">—</span></div>
+        <div class="stat-row"><span class="stat-lbl">Regime (Claude)</span><span class="stat-val" id="regime-state" title="Claude risk-officer verdict; hostile halts new trades">—</span></div>
+        <div class="stat-row" id="regime-reasoning-row" style="display:none"><span class="stat-lbl" style="font-size:9px;color:var(--text3)">Why</span><span class="stat-val" id="regime-reasoning" style="font-size:10px;color:var(--text2);text-align:right;max-width:200px;overflow:hidden;text-overflow:ellipsis"></span></div>
+      </div>
+    </div>
+    <div class="panel" id="reviews-panel">
+      <div class="panel-title">NIGHTLY REVIEW (CLAUDE)</div>
+      <div id="review-body" style="font-size:11px;color:var(--text2);padding:4px 0">
+        <div style="color:var(--text3)">No reviews yet. First review runs at 00:05 UTC after the bot has real trades in the last 24h.</div>
       </div>
     </div>
     <div class="panel">
@@ -1264,8 +1272,44 @@ function psCalc(){
 /* ══════════════════════════════════════════════════════
    INIT
 ══════════════════════════════════════════════════════ */
+/* ── REGIME (Claude risk officer) ── */
+async function fetchRegime(){
+  try{
+    const r=await fetch(`${BOT}/regime`);if(!r.ok)return;
+    const d=await r.json();if(!d||!d.enabled)return;
+    const reg=(d.regime||'normal').toLowerCase();
+    const cls={normal:'g',cautious:'y',hostile:'r'}[reg]||'y';
+    const label=reg.toUpperCase();
+    const km=typeof d.kelly_multiplier==='number'?d.kelly_multiplier.toFixed(2):'1.00';
+    const el=document.getElementById('regime-state');
+    if(el)el.innerHTML=`<span class="${cls}">● ${label}</span> <span style="font-size:10px;color:var(--text3)">k×${km}</span>`;
+    const why=document.getElementById('regime-reasoning');
+    const row=document.getElementById('regime-reasoning-row');
+    if(d.reasoning&&why){why.textContent=d.reasoning;if(row)row.style.display='';}
+  }catch(e){}
+}
+/* ── NIGHTLY REVIEWS ── */
+async function fetchReviews(){
+  try{
+    const r=await fetch(`${BOT}/reviews?limit=1`);if(!r.ok)return;
+    const d=await r.json();
+    const box=document.getElementById('review-body');if(!box)return;
+    const rev=(d.reviews||[])[0];
+    if(!rev){
+      if(!d.enabled){box.innerHTML='<div style="color:var(--text3);font-size:10px">Nightly review disabled (set NIGHTLY_REVIEW=true and ANTHROPIC_API_KEY in .env)</div>';}
+      return;
+    }
+    const recs=rev.recommendations||[];
+    const pnlCls=(rev.pnl||0)>=0?'g':'r';
+    const recHtml=recs.length?recs.map(x=>`<li style="margin:3px 0"><b>${safeHtml(x.param||'')}</b>: ${safeHtml(String(x.current||''))} → <span class="y">${safeHtml(String(x.suggested||''))}</span><br><span style="font-size:10px;color:var(--text3)">${safeHtml(x.rationale||'')}</span></li>`).join(''):'<li style="color:var(--text3);font-size:10px">No changes recommended.</li>';
+    box.innerHTML=
+      `<div style="color:var(--text3);font-size:10px">${safeHtml(rev.review_date||'')} · ${rev.trades_count||0} trades · gross $<span class="${pnlCls}">${Number(rev.pnl||0).toFixed(2)}</span> · match ${Number(rev.win_rate||0).toFixed(0)}%</div>`+
+      `<div style="margin:6px 0;color:var(--text);font-size:11px">${safeHtml(rev.summary||'')}</div>`+
+      `<ul style="margin:4px 0 0 14px;padding:0">${recHtml}</ul>`;
+  }catch(e){}
+}
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();
 setInterval(fetchBot,15000);
 setInterval(fetchPortfolio,30000);
 setInterval(fetchMarkets,60000);
@@ -1276,6 +1320,8 @@ setInterval(fetchCrypto,30000);
 setInterval(fetchIndices,60000);
 setInterval(fetchMarketData,60000);
 setInterval(fetchPaperPortfolio,30000);
+setInterval(fetchRegime,60000);
+setInterval(fetchReviews,600000);
 connectWS();
 // Handle initial hash
 (()=>{const pg=location.hash.slice(1);if(pg&&pg!=='dashboard')showPage(pg);})();
