@@ -3365,81 +3365,122 @@ class PolymarketBot:
                     cycle_cash = await asyncio.to_thread(self.get_balance, True)
                     self._log(f"Cash: ${cycle_cash:.2f}")
 
+                # ── Phase 1: rule-based candidate collection (fast, no I/O) ──
+                import json as _j
+                _candidates: list = []
                 for mkt in markets:
                     if not self.running:
                         break
-
-                    # ── Stage 1: fast rule-based filter ──────────────────────
                     signal = self.analyze(mkt)
                     if not signal:
                         continue
-
                     question = mkt.get("question", "")
-                    import json as _j
                     raw_prices = mkt.get("outcomePrices", "[0.5,0.5]")
                     prices = _j.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
                     yes_p = float(prices[0]) if prices else 0.5
-
-                    # ── Stage 2: AI deep analysis (if available & confidence ≥ 30) ──
                     token_id = signal.get("token_id", "")
-                    ob_data = await asyncio.to_thread(self.get_orderbook_depth, token_id) if token_id else {}
-                    predicted_prob = None  # will be set by AI or estimated below
+                    _candidates.append({
+                        "mkt": mkt, "signal": signal, "question": question,
+                        "yes_p": yes_p, "token_id": token_id,
+                    })
 
-                    if ai_enabled and _ai_failures < 3 and float(signal.get("confidence", 0)) >= 20:
-                        q_lower = question.lower()
-                        is_legal = any(x in q_lower for x in ["indicted","trial","court","lawsuit","ruling","judge","convicted","charged","plea","verdict","sentenced"])
-                        is_legislative = any(x in q_lower for x in ["bill","act","legislation","congress","senate","pass","signed","law","vote","amendment"])
-                        # Fan out research fetches in parallel — each was
-                        # previously awaited sequentially, so per-market AI
-                        # prep stacked up 4-5 HTTP round trips worst case.
-                        # Most of them are cached after the first call, but
-                        # the uncached first call dominated the critical path.
-                        _research_tasks: dict = {
-                            "crypto": asyncio.to_thread(self.get_crypto_prices),
-                            "news":   asyncio.to_thread(self.get_news_headlines, question[:60]),
-                        }
-                        if TAVILY_API_KEY:
-                            _research_tasks["tavily"] = asyncio.to_thread(self.get_tavily_research, question[:80])
-                        if is_legal:
-                            _research_tasks["court"] = asyncio.to_thread(self.get_courtlistener_data, question[:60])
-                        if is_legislative:
-                            _research_tasks["govtrack"] = asyncio.to_thread(self.get_govtrack_data, question[:60])
-                        _keys = list(_research_tasks.keys())
-                        _vals = await asyncio.gather(*_research_tasks.values(), return_exceptions=True)
-                        research = {"orderbook": ob_data}
-                        for _k, _v in zip(_keys, _vals):
-                            research[_k] = "" if isinstance(_v, Exception) else _v
-                        # Ensure optional keys exist even when not fetched —
-                        # analyze_with_claude reads them with .get() but some
-                        # downstream paths treat missing keys differently.
-                        research.setdefault("tavily",   "")
-                        research.setdefault("court",    "")
-                        research.setdefault("govtrack", "")
-                        ai = await self.analyze_with_claude(mkt, yes_p, research)
-                        if ai is None:
-                            _ai_failures += 1
-                            if _ai_failures >= 3:
-                                self._log("AI circuit breaker: 3 consecutive failures — skipping AI for rest of cycle", "warning")
-                        if ai:
-                            if ai.get("action") == "SKIP":
-                                self._log(f"AI SKIP: {question[:50]} — {ai.get('reasoning','')}")
-                                continue
-                            signal["confidence"] = ai.get("confidence", signal["confidence"])
-                            signal["ai_reasoning"] = ai.get("reasoning", "")
-                            signal["ai_risk"] = ai.get("risk", "medium")
-                            predicted_prob = ai.get("probability")  # explicit probability for Kelly
-                            # AI can flip the side if it disagrees
-                            if ai.get("side") == "YES" and "NO" in signal.get("signal",""):
-                                raw_ids = mkt.get("clobTokenIds", "[]")
-                                ids = _j.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
-                                signal["token_id"] = ids[0] if ids else token_id
-                                signal["signal"] = "BUY YES"
-                            elif ai.get("side") == "NO" and "YES" in signal.get("signal",""):
-                                raw_ids = mkt.get("clobTokenIds", "[]")
-                                ids = _j.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
-                                signal["token_id"] = ids[1] if len(ids) > 1 else token_id
-                                signal["signal"] = "BUY NO"
-                            self._log(f"AI [{ai.get('risk','?').upper()}] prob={predicted_prob}% conf={ai.get('confidence')}% — {ai.get('reasoning','')[:70]}")
+                # ── Phase 2: parallel AI enrichment across all candidates ──
+                # Previously each market's AI prep (orderbook + research +
+                # analyze_with_claude) was awaited sequentially, so a cycle
+                # with N qualifying markets blocked for N × (3-8s) just to
+                # reach the decision stage. Now all N fire at once and we
+                # join at phase 3 — typical 5-market cycle goes from 15-40s
+                # of AI latency down to a single 3-8s window.
+                async def _enrich_candidate(c: dict):
+                    """Fetch orderbook + research + call AI for one candidate.
+                    Returns (ob_data, ai_result). Never raises — any failure
+                    returns empty/None so phase 3 can fall through to the
+                    non-AI code path."""
+                    tid = c["token_id"]
+                    try:
+                        ob = await asyncio.to_thread(self.get_orderbook_depth, tid) if tid else {}
+                    except Exception:
+                        ob = {}
+                    ai_res = None
+                    if ai_enabled and float(c["signal"].get("confidence", 0)) >= 20:
+                        try:
+                            _q_lower = c["question"].lower()
+                            _is_legal = any(x in _q_lower for x in ["indicted","trial","court","lawsuit","ruling","judge","convicted","charged","plea","verdict","sentenced"])
+                            _is_legislative = any(x in _q_lower for x in ["bill","act","legislation","congress","senate","pass","signed","law","vote","amendment"])
+                            _tasks: dict = {
+                                "crypto": asyncio.to_thread(self.get_crypto_prices),
+                                "news":   asyncio.to_thread(self.get_news_headlines, c["question"][:60]),
+                            }
+                            if TAVILY_API_KEY:
+                                _tasks["tavily"] = asyncio.to_thread(self.get_tavily_research, c["question"][:80])
+                            if _is_legal:
+                                _tasks["court"] = asyncio.to_thread(self.get_courtlistener_data, c["question"][:60])
+                            if _is_legislative:
+                                _tasks["govtrack"] = asyncio.to_thread(self.get_govtrack_data, c["question"][:60])
+                            _k = list(_tasks.keys())
+                            _v = await asyncio.gather(*_tasks.values(), return_exceptions=True)
+                            _research = {"orderbook": ob}
+                            for _kk, _vv in zip(_k, _v):
+                                _research[_kk] = "" if isinstance(_vv, Exception) else _vv
+                            _research.setdefault("tavily", "")
+                            _research.setdefault("court", "")
+                            _research.setdefault("govtrack", "")
+                            ai_res = await self.analyze_with_claude(c["mkt"], c["yes_p"], _research)
+                        except Exception as _e:
+                            log.debug(f"enrich candidate error: {_e}")
+                            ai_res = None
+                    return ob, ai_res
+
+                _enriched: list = []
+                if _candidates:
+                    _enriched = await asyncio.gather(
+                        *[_enrich_candidate(c) for c in _candidates],
+                        return_exceptions=True,
+                    )
+
+                # ── Phase 3: sequential execution — shared state (cycle_cash,
+                # self.signals, self._managed_positions, has_position DB
+                # writes) requires serialized processing. Reads AI result
+                # from the pre-computed batch.
+                for _c_idx, c in enumerate(_candidates):
+                    if not self.running:
+                        break
+                    mkt      = c["mkt"]
+                    signal   = c["signal"]
+                    question = c["question"]
+                    yes_p    = c["yes_p"]
+                    token_id = c["token_id"]
+                    _er = _enriched[_c_idx] if _c_idx < len(_enriched) else None
+                    if isinstance(_er, Exception) or _er is None:
+                        ob_data, ai = {}, None
+                    else:
+                        ob_data, ai = _er
+                    predicted_prob = None
+
+                    if ai is None and ai_enabled and float(signal.get("confidence", 0)) >= 20:
+                        _ai_failures += 1
+                        if _ai_failures >= 3:
+                            self._log("AI circuit breaker: 3+ failures this cycle", "warning")
+                    if ai:
+                        if ai.get("action") == "SKIP":
+                            self._log(f"AI SKIP: {question[:50]} — {ai.get('reasoning','')}")
+                            continue
+                        signal["confidence"]   = ai.get("confidence", signal["confidence"])
+                        signal["ai_reasoning"] = ai.get("reasoning", "")
+                        signal["ai_risk"]      = ai.get("risk", "medium")
+                        predicted_prob         = ai.get("probability")
+                        # AI can flip the side if it disagrees with the rule-based signal.
+                        if ai.get("side") == "YES" and "NO" in signal.get("signal",""):
+                            raw_ids = mkt.get("clobTokenIds", "[]")
+                            ids = _j.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+                            signal["token_id"] = ids[0] if ids else token_id
+                            signal["signal"]   = "BUY YES"
+                        elif ai.get("side") == "NO" and "YES" in signal.get("signal",""):
+                            raw_ids = mkt.get("clobTokenIds", "[]")
+                            ids = _j.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+                            signal["token_id"] = ids[1] if len(ids) > 1 else token_id
+                            signal["signal"]   = "BUY NO"
+                        self._log(f"AI [{ai.get('risk','?').upper()}] prob={predicted_prob}% conf={ai.get('confidence')}% — {ai.get('reasoning','')[:70]}")
 
                     # ── OBI check: skip if order book strongly opposes our direction ──
                     obi = ob_data.get("obi", 0)
