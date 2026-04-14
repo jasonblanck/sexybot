@@ -231,8 +231,27 @@ class PolymarketBot:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 market TEXT, side TEXT, amount REAL, price REAL,
                 shares REAL, order_type TEXT, status TEXT,
-                order_id TEXT, dry_run INTEGER, time TEXT
+                order_id TEXT, dry_run INTEGER, time TEXT,
+                token_id TEXT,
+                resolved INTEGER DEFAULT 0,
+                won INTEGER DEFAULT NULL,
+                realized_pnl REAL DEFAULT NULL,
+                resolved_at TEXT DEFAULT NULL
             )""")
+            # Idempotent column additions for DBs that existed before these
+            # columns were introduced — SQLite's ALTER TABLE ADD COLUMN is
+            # not IF-NOT-EXISTS-aware, so we tolerate the duplicate-column error.
+            for _col_ddl in (
+                "ALTER TABLE trades ADD COLUMN token_id TEXT",
+                "ALTER TABLE trades ADD COLUMN resolved INTEGER DEFAULT 0",
+                "ALTER TABLE trades ADD COLUMN won INTEGER DEFAULT NULL",
+                "ALTER TABLE trades ADD COLUMN realized_pnl REAL DEFAULT NULL",
+                "ALTER TABLE trades ADD COLUMN resolved_at TEXT DEFAULT NULL",
+            ):
+                try:
+                    self.db.execute(_col_ddl)
+                except sqlite3.OperationalError:
+                    pass   # column already exists
             self.db.execute("""CREATE TABLE IF NOT EXISTS positions (
                 token_id TEXT PRIMARY KEY, market TEXT,
                 side TEXT, shares REAL, cost REAL, time TEXT
@@ -334,7 +353,9 @@ class PolymarketBot:
                 log.warning("PAPER_MODE=true but paper.py not found — paper trading disabled")
 
     def _trade_row(self, trade: dict) -> tuple:
-        """Return the values tuple for a trades INSERT. Single source of truth for column order."""
+        """Return the values tuple for a trades INSERT. Single source of truth for column order.
+        Includes token_id (needed by the trade outcome resolver) so that
+        get_midpoint() can later settle the P&L of the winning/losing side."""
         return (
             trade.get("market", ""), trade.get("side", ""),
             trade.get("amount_usdc", trade.get("amount", 0)),
@@ -342,14 +363,15 @@ class PolymarketBot:
             trade.get("type", "market"), trade.get("status", ""),
             trade.get("order_id", ""), 1 if trade.get("dry_run") else 0,
             trade.get("time", ""),
+            trade.get("token_id", ""),
         )
 
     def save_trade(self, trade: dict):
         try:
             with self.db:
                 self.db.execute("""INSERT INTO trades
-                    (market,side,amount,price,shares,order_type,status,order_id,dry_run,time)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)""", self._trade_row(trade))
+                    (market,side,amount,price,shares,order_type,status,order_id,dry_run,time,token_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""", self._trade_row(trade))
         except Exception as e:
             log.warning(f"DB save failed: {e}")
 
@@ -360,8 +382,8 @@ class PolymarketBot:
         try:
             with self.db:
                 self.db.execute("""INSERT INTO trades
-                    (market,side,amount,price,shares,order_type,status,order_id,dry_run,time)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)""", self._trade_row(trade))
+                    (market,side,amount,price,shares,order_type,status,order_id,dry_run,time,token_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""", self._trade_row(trade))
                 if position_args:
                     tid, market, side, shares, cost = position_args
                     self.db.execute("""INSERT OR REPLACE INTO positions
@@ -1426,7 +1448,9 @@ class PolymarketBot:
     async def _brier_resolver_loop(self):
         """Background task — every 6h scans up to 50 unresolved predictions
         and settles the ones whose markets have closed. First pass fires
-        ~10 minutes after startup so we don't hammer the CLOB during boot."""
+        ~10 minutes after startup so we don't hammer the CLOB during boot.
+        Also runs the trade-outcome resolver on the same cadence so the
+        nightly review gets real realized-P&L context."""
         if not ANTHROPIC_API_KEY:
             # The Brier loop is independent of Claude; keep running regardless.
             pass
@@ -1438,6 +1462,7 @@ class PolymarketBot:
         while self.running:
             try:
                 await self.resolve_brier_predictions(limit=50)
+                await self.resolve_trade_outcomes(limit=100)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1446,6 +1471,115 @@ class PolymarketBot:
                 await asyncio.sleep(6 * 3600)
             except asyncio.CancelledError:
                 break
+
+    async def resolve_trade_outcomes(self, limit: int = 100) -> int:
+        """Settle realized P&L on filled, real (non-dry-run) trades whose
+        markets have resolved. Uses the same CLOB-midpoint technique as
+        the Brier resolver — a resolved market has its winning token at
+        ~$1 and losing at ~$0. We only log one row per (trade side, token),
+        so this is safe to call repeatedly; already-resolved rows are
+        filtered by resolved=0.
+
+        P&L calculation: for a BUY of `shares` tokens at `entry_price`:
+          cost    = shares × entry_price   (what we paid)
+          payout  = shares × (1 if our side won else 0)   (Polymarket pays $1/share)
+          pnl     = payout − cost
+
+        Returns the number of trades settled this pass."""
+        try:
+            rows = self.db.execute(
+                "SELECT id, token_id, price, shares, side FROM trades "
+                "WHERE resolved=0 AND dry_run=0 AND token_id IS NOT NULL "
+                "AND token_id != '' AND shares > 0 "
+                "AND status IN ('matched','filled','simulated') "
+                "AND order_type='market' "
+                "ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
+            if not rows:
+                return 0
+            settled = 0
+            for trade_id, token_id, entry_price, shares, side in rows:
+                try:
+                    mid = await asyncio.to_thread(self.get_midpoint, token_id)
+                except Exception:
+                    continue
+                if mid is None:
+                    continue
+                # side is "BUY"/"SELL"/"YES"/"NO" — the token_id stored is the
+                # token we actually acquired. A resolved market drives the
+                # token we hold to ~$1 (won) or ~$0 (lost). SELL trades exit
+                # a position, so they're effectively P&L on the residual — we
+                # only settle BUY trades here. SELL-only exits get omitted
+                # from realized P&L but still appear in the trades ledger.
+                if str(side).upper() not in ("BUY", "YES", "NO"):
+                    continue
+                if mid >= 0.99:
+                    won = 1
+                elif mid <= 0.01:
+                    won = 0
+                else:
+                    continue   # still trading
+                try:
+                    entry = float(entry_price or 0.0)
+                    qty   = float(shares or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if qty <= 0 or not (0 < entry < 1):
+                    continue
+                cost    = qty * entry
+                payout  = qty if won else 0.0
+                pnl     = round(payout - cost, 4)
+                with self.db:
+                    self.db.execute(
+                        "UPDATE trades SET resolved=1, won=?, realized_pnl=?, "
+                        "resolved_at=? WHERE id=?",
+                        (won, pnl, datetime.utcnow().isoformat(), trade_id),
+                    )
+                settled += 1
+            if settled:
+                self._log(f"[TRADE OUTCOMES] Settled {settled} trade(s) this pass")
+            return settled
+        except Exception as e:
+            log.warning(f"resolve_trade_outcomes error: {e}")
+            return 0
+
+    def get_realized_pnl_summary(self) -> dict:
+        """Aggregate realized P&L stats across time windows. Used by the
+        dashboard and fed into the nightly review's context."""
+        try:
+            def _row_for(window_sql: str) -> dict:
+                row = self.db.execute(
+                    "SELECT COUNT(*), SUM(realized_pnl), "
+                    "SUM(CASE WHEN won=1 THEN 1 ELSE 0 END), "
+                    "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) "
+                    f"FROM trades WHERE resolved=1 AND dry_run=0 {window_sql}"
+                ).fetchone()
+                total = int(row[0] or 0) if row else 0
+                pnl   = round(float(row[1] or 0.0), 2) if row else 0.0
+                wins  = int(row[2] or 0) if row else 0
+                profit = int(row[3] or 0) if row else 0
+                return {
+                    "trades":          total,
+                    "pnl":             pnl,
+                    "wins":            wins,
+                    "profitable":      profit,
+                    "win_rate":        round(wins / total * 100, 1) if total else 0.0,
+                    "profitable_rate": round(profit / total * 100, 1) if total else 0.0,
+                }
+            return {
+                "all_time":   _row_for(""),
+                "last_7d":    _row_for("AND resolved_at >= datetime('now','-7 days')"),
+                "last_30d":   _row_for("AND resolved_at >= datetime('now','-30 days')"),
+                "unresolved": int(self.db.execute(
+                    "SELECT COUNT(*) FROM trades WHERE resolved=0 AND dry_run=0 "
+                    "AND status IN ('matched','filled','simulated') "
+                    "AND order_type='market'"
+                ).fetchone()[0] or 0),
+            }
+        except Exception as e:
+            log.debug(f"get_realized_pnl_summary error: {e}")
+            return {}
 
     def get_courtlistener_data(self, query: str) -> str:
         """Search CourtListener for relevant court dockets/opinions (free API)."""
@@ -2089,13 +2223,24 @@ class PolymarketBot:
                     f"[{status}]  {(mkt or '')[:60]}"
                 )
 
+            # Realized P&L — the single most important context for a
+            # postmortem. The brier resolver + trade outcome resolver feed
+            # this; on day 0 it's empty and the review has to lean on gross
+            # volume, but within a week it's the real ground truth.
+            realized = self.get_realized_pnl_summary()
+
             ctx = (
                 f"PERIOD: last 24h ending {cutoff_iso}\n"
                 f"Strategy: {STRATEGY}   Dry run: {DRY_RUN}   Paper: {PAPER_MODE}\n"
                 f"Current params: MAX_ORDER_SIZE=${MAX_ORDER_SIZE}  "
                 f"DAILY_LOSS_LIMIT=${DAILY_LOSS_LIMIT}\n"
-                f"Trades: {trades_count}  matched/filled: {len(matched)}  "
+                f"Trades last 24h: {trades_count}  matched/filled: {len(matched)}  "
                 f"gross deployed: ${gross}  match rate: {win_rate}%\n"
+                f"REALIZED P&L (from resolved trades):\n"
+                f"  7d:  {realized.get('last_7d', {})}\n"
+                f"  30d: {realized.get('last_30d', {})}\n"
+                f"  All: {realized.get('all_time', {})}\n"
+                f"  Unresolved trades pending outcome: {realized.get('unresolved', 0)}\n"
                 f"Brier stats: {brier}\n"
                 f"Regime distribution: {regime_summary}\n"
                 f"\nTrade ledger (newest last):\n" +
@@ -3703,6 +3848,22 @@ async def trigger_brier_resolve(limit: int = 50):
     Returns the number of predictions settled this pass."""
     limit = max(1, min(limit, 500))
     settled = await bot.resolve_brier_predictions(limit=limit)
+    return JSONResponse({"ok": True, "settled": settled})
+
+
+@app.get("/pnl/realized")
+def get_realized_pnl():
+    """Realized P&L summary across 7d / 30d / all-time from trades
+    whose markets have resolved. Computed from (payout − cost) per
+    resolved position."""
+    return JSONResponse(bot.get_realized_pnl_summary())
+
+
+@app.post("/pnl/resolve", dependencies=[Depends(require_api_key)])
+async def trigger_trade_resolve(limit: int = 100):
+    """Force an immediate pass of the trade outcome resolver."""
+    limit = max(1, min(limit, 1000))
+    settled = await bot.resolve_trade_outcomes(limit=limit)
     return JSONResponse({"ok": True, "settled": settled})
 
 

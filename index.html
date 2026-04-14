@@ -277,6 +277,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
         <div class="stat-row"><span class="stat-lbl">Regime (Claude)</span><span class="stat-val" id="regime-state" title="Claude risk-officer verdict; hostile halts new trades">—</span></div>
         <div class="stat-row" id="regime-reasoning-row" style="display:none"><span class="stat-lbl" style="font-size:9px;color:var(--text3)">Why</span><span class="stat-val" id="regime-reasoning" style="font-size:10px;color:var(--text2);text-align:right;max-width:200px;overflow:hidden;text-overflow:ellipsis"></span></div>
         <div class="stat-row" id="pretrade-row" style="display:none"><span class="stat-lbl">Pretrade catches (24h)</span><span class="stat-val" id="pretrade-state" title="Abort = gate refused the trade; downsize = gate reduced the amount">—</span></div>
+        <div class="stat-row" id="realized-pnl-row" style="display:none"><span class="stat-lbl">Realized P&L (30d)</span><span class="stat-val" id="realized-pnl-state" title="Actual profit/loss on resolved positions — gross payout minus cost">—</span></div>
       </div>
     </div>
     <div class="panel" id="reviews-panel">
@@ -1289,6 +1290,24 @@ async function fetchRegime(){
     if(d.reasoning&&why){why.textContent=d.reasoning;if(row)row.style.display='';}
   }catch(e){}
 }
+/* ── REALIZED P&L ── */
+async function fetchRealizedPnl(){
+  try{
+    const r=await fetch(`${BOT}/pnl/realized`);if(!r.ok)return;
+    const d=await r.json();
+    const row=document.getElementById('realized-pnl-row');
+    const el=document.getElementById('realized-pnl-state');
+    if(!el||!row)return;
+    const s30=d.last_30d||{};
+    if((s30.trades||0)===0){row.style.display='none';return;}
+    row.style.display='';
+    const pnl=Number(s30.pnl||0);
+    const wr=Number(s30.profitable_rate||0);
+    const cls=pnl>=0?'g':'r';
+    const sign=pnl>=0?'+':'';
+    el.innerHTML=`<span class="${cls}">${sign}$${pnl.toFixed(2)}</span> <span style="font-size:10px;color:var(--text3)">${s30.trades||0}tr · ${wr.toFixed(0)}%wr</span>`;
+  }catch(e){}
+}
 /* ── PRE-TRADE catches (Claude gate) ── */
 async function fetchPretrade(){
   try{
@@ -1375,7 +1394,7 @@ async function applyReview(reviewId,idx,btn){
   }
 }
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();
 setInterval(fetchBot,15000);
 setInterval(fetchPortfolio,30000);
 setInterval(fetchMarkets,60000);
@@ -1389,6 +1408,7 @@ setInterval(fetchPaperPortfolio,30000);
 setInterval(fetchRegime,60000);
 setInterval(fetchReviews,600000);
 setInterval(fetchPretrade,90000);
+setInterval(fetchRealizedPnl,180000);
 connectWS();
 // Handle initial hash
 (()=>{const pg=location.hash.slice(1);if(pg&&pg!=='dashboard')showPage(pg);})();
