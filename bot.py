@@ -302,7 +302,13 @@ class PolymarketBot:
                 resolved INTEGER DEFAULT 0,
                 won INTEGER DEFAULT NULL,
                 realized_pnl REAL DEFAULT NULL,
-                resolved_at TEXT DEFAULT NULL
+                resolved_at TEXT DEFAULT NULL,
+                strategy TEXT,
+                category TEXT,
+                ai_probability INTEGER,
+                ai_confidence INTEGER,
+                ai_risk TEXT,
+                regime_at_entry TEXT
             )""")
             # Idempotent column additions for DBs that existed before these
             # columns were introduced — SQLite's ALTER TABLE ADD COLUMN is
@@ -313,6 +319,17 @@ class PolymarketBot:
                 "ALTER TABLE trades ADD COLUMN won INTEGER DEFAULT NULL",
                 "ALTER TABLE trades ADD COLUMN realized_pnl REAL DEFAULT NULL",
                 "ALTER TABLE trades ADD COLUMN resolved_at TEXT DEFAULT NULL",
+                # Attribution columns — populated at signal/trade time so the
+                # nightly review can attribute realized P&L by strategy, by
+                # market category, by confidence band, and by the regime we
+                # were in when entering. Without these, every trade looks
+                # the same and the review can only recommend global changes.
+                "ALTER TABLE trades ADD COLUMN strategy TEXT",
+                "ALTER TABLE trades ADD COLUMN category TEXT",
+                "ALTER TABLE trades ADD COLUMN ai_probability INTEGER",
+                "ALTER TABLE trades ADD COLUMN ai_confidence INTEGER",
+                "ALTER TABLE trades ADD COLUMN ai_risk TEXT",
+                "ALTER TABLE trades ADD COLUMN regime_at_entry TEXT",
             ):
                 try:
                     self.db.execute(_col_ddl)
@@ -425,6 +442,8 @@ class PolymarketBot:
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_reviews_date  ON strategy_reviews(review_date)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_regime_time   ON regime_log(created_at)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_pretrade_time ON pretrade_log(created_at)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_trades_category ON trades(category)")
             # Purge idempotency keys older than 24h on startup
             self.db.execute(
                 "DELETE FROM idempotency_keys WHERE datetime(created) < datetime('now', '-24 hours')"
@@ -454,8 +473,13 @@ class PolymarketBot:
 
     def _trade_row(self, trade: dict) -> tuple:
         """Return the values tuple for a trades INSERT. Single source of truth for column order.
-        Includes token_id (needed by the trade outcome resolver) so that
-        get_midpoint() can later settle the P&L of the winning/losing side."""
+        Includes token_id (needed by the trade outcome resolver) plus the
+        attribution columns (strategy, category, ai_probability, ai_confidence,
+        ai_risk, regime_at_entry) — without these the nightly review can't
+        say 'momentum is losing, volumeSpike is winning' or 'crypto trades
+        outperform political ones'. The caller is expected to populate them
+        on the trade dict before save; missing values default to sensible
+        nulls so legacy callers don't break."""
         return (
             trade.get("market", ""), trade.get("side", ""),
             trade.get("amount_usdc", trade.get("amount", 0)),
@@ -464,14 +488,25 @@ class PolymarketBot:
             trade.get("order_id", ""), 1 if trade.get("dry_run") else 0,
             trade.get("time", ""),
             trade.get("token_id", ""),
+            trade.get("strategy"),
+            trade.get("category"),
+            trade.get("ai_probability"),
+            trade.get("ai_confidence"),
+            trade.get("ai_risk"),
+            trade.get("regime_at_entry"),
         )
+
+    _TRADE_INSERT_SQL = (
+        "INSERT INTO trades "
+        "(market,side,amount,price,shares,order_type,status,order_id,dry_run,time,"
+        "token_id,strategy,category,ai_probability,ai_confidence,ai_risk,regime_at_entry) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    )
 
     def save_trade(self, trade: dict):
         try:
             with self.db:
-                self.db.execute("""INSERT INTO trades
-                    (market,side,amount,price,shares,order_type,status,order_id,dry_run,time,token_id)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""", self._trade_row(trade))
+                self.db.execute(self._TRADE_INSERT_SQL, self._trade_row(trade))
         except Exception as e:
             log.warning(f"DB save failed: {e}")
 
@@ -481,9 +516,7 @@ class PolymarketBot:
         A crash between the two writes can no longer leave them out of sync."""
         try:
             with self.db:
-                self.db.execute("""INSERT INTO trades
-                    (market,side,amount,price,shares,order_type,status,order_id,dry_run,time,token_id)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""", self._trade_row(trade))
+                self.db.execute(self._TRADE_INSERT_SQL, self._trade_row(trade))
                 if position_args:
                     tid, market, side, shares, cost = position_args
                     self.db.execute("""INSERT OR REPLACE INTO positions
@@ -491,6 +524,56 @@ class PolymarketBot:
                         (tid, market, side, shares, cost, datetime.utcnow().isoformat()))
         except Exception as e:
             log.warning(f"DB transaction failed: {e}")
+
+    # ── Market category classifier ─────────────────────────────────────────
+    # Heuristic classifier mapping a market question to a coarse category.
+    # Intentionally rule-based (not AI) so every trade gets categorized
+    # instantly and deterministically — tying Claude to this would add
+    # latency and cost on every signal. The categories are designed to
+    # partition Polymarket cleanly enough that attribution queries show
+    # real patterns without being so fine-grained that each bucket has one
+    # trade.
+    _CATEGORY_KEYWORDS = {
+        "politics": ["election","senate","congress","president","presidential","vp","governor",
+                     "senator","mayor","prime minister","pm ","parliament","republican","democrat",
+                     "gop ","liberal","conservative","campaign","primary","caucus","cabinet",
+                     "house of representatives","supreme court","impeach"],
+        "crypto":   ["bitcoin","ethereum","btc","eth","solana","sol ","crypto","blockchain",
+                     "polygon","matic","usdt","usdc","defi","nft","stablecoin","altcoin",
+                     "dogecoin","xrp","cardano","ada ","chainlink","link "],
+        "sports":   ["super bowl","world cup","world series","nba","nfl","mlb","nhl","mls",
+                     "champions league","playoffs","tournament","olympics","formula 1","f1 ",
+                     "boxing","mma","ufc","grand slam","open championship","masters","fifa",
+                     "quarterback","qb ","team "],
+        "macro":    ["fed ","federal reserve","fomc","interest rate","rate hike","rate cut",
+                     "cpi","ppi","inflation","gdp","recession","jobs report","unemployment",
+                     "nonfarm payroll","payrolls","jobless","labor market","dollar index",
+                     "dxy","yield curve","treasury","bond","tariff","trade war","pce"],
+        "legal":    ["indicted","indictment","trial","court","lawsuit","ruling","judge",
+                     "convicted","charged","plea","verdict","sentenced","supreme court",
+                     "appellate","docket","hearing","prosecutor","defendant"],
+        "weather":  ["hurricane","tornado","earthquake","storm","snowfall","rainfall",
+                     "temperature","heat wave","flood","wildfire","drought","meteorologic"],
+    }
+
+    @classmethod
+    def classify_market(cls, question: str) -> str:
+        """Return coarse market category ('politics', 'crypto', 'sports',
+        'macro', 'legal', 'weather', or 'other'). Case-insensitive substring
+        match against curated keyword lists."""
+        if not question:
+            return "other"
+        q = question.lower()
+        # Legal checks before politics — "Supreme Court" matches both lists,
+        # but a court-ruling market is more usefully bucketed as legal.
+        if any(k in q for k in cls._CATEGORY_KEYWORDS["legal"]):
+            return "legal"
+        for cat, kws in cls._CATEGORY_KEYWORDS.items():
+            if cat == "legal":
+                continue
+            if any(k in q for k in kws):
+                return cat
+        return "other"
 
     def get_daily_loss(self) -> float:
         try:
@@ -623,7 +706,20 @@ class PolymarketBot:
 
     # ── Orders ────────────────────────────────────────────────────────────────
 
-    def place_market_order(self, token_id: str, side: str, amount_usdc: float, market: str = "") -> dict:
+    def place_market_order(
+        self,
+        token_id: str,
+        side: str,
+        amount_usdc: float,
+        market: str = "",
+        *,
+        attribution: Optional[dict] = None,
+    ) -> dict:
+        """Place a market order. `attribution` is an optional dict of
+        (strategy, category, ai_probability, ai_confidence, ai_risk,
+        regime_at_entry) merged into the persisted trade row so the
+        nightly review can break down realized P&L by each dimension.
+        Safe to omit for manual/legacy callers."""
         price = self.get_midpoint(token_id) or 0.5
         result = {
             "token_id": token_id,
@@ -638,6 +734,13 @@ class PolymarketBot:
             "status": None,
             "order_id": None,
         }
+        if attribution:
+            # Merge only known attribution keys — guards against stray fields
+            # accidentally poisoning the trade dict shape.
+            for k in ("strategy","category","ai_probability","ai_confidence",
+                      "ai_risk","regime_at_entry"):
+                if k in attribution and attribution[k] is not None:
+                    result[k] = attribution[k]
         if DRY_RUN:
             result["status"] = "simulated"
             self._log(f"[DRY RUN] {side} ${amount_usdc:.2f} @ {price:.4f} — token {token_id[:16]}…")
@@ -662,7 +765,15 @@ class PolymarketBot:
         self._save_trade_and_position(result, pos_args)
         return result
 
-    def place_limit_order(self, token_id: str, side: str, price: float, size: float) -> dict:
+    def place_limit_order(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        *,
+        attribution: Optional[dict] = None,
+    ) -> dict:
         result = {
             "token_id": token_id,
             "side": side,
@@ -674,6 +785,11 @@ class PolymarketBot:
             "status": None,
             "order_id": None,
         }
+        if attribution:
+            for k in ("strategy","category","ai_probability","ai_confidence",
+                      "ai_risk","regime_at_entry"):
+                if k in attribution and attribution[k] is not None:
+                    result[k] = attribution[k]
         if DRY_RUN:
             result["status"] = "simulated"
             self._log(f"[DRY RUN] LIMIT {side} {size}@{price:.4f} — token {token_id[:16]}…")
@@ -694,20 +810,40 @@ class PolymarketBot:
         self.save_trade(result)  # persist limit orders — was missing, lost on restart
         return result
 
-    async def _execute_order(self, token_id: str, side: str, amount: float, market: str = "",
-                              order_type: str = "market", price: float = 0.0, size: float = 0.0) -> dict:
+    async def _execute_order(
+        self,
+        token_id: str,
+        side: str,
+        amount: float,
+        market: str = "",
+        order_type: str = "market",
+        price: float = 0.0,
+        size: float = 0.0,
+        *,
+        attribution: Optional[dict] = None,
+    ) -> dict:
         """
         Safety wrapper: routes execution to paper handler or live CLOB.
         All automated trading in run_loop goes through this method — never
         calls place_market_order / place_limit_order directly.
+        `attribution` flows to the live path so the trade row gets tagged
+        with strategy/category/ai_*/regime. Paper mode ignores it (paper
+        trades have a separate table and don't participate in the nightly
+        review's realized-P&L attribution).
         """
         if PAPER_MODE and self.paper:
             if order_type == "limit":
                 return await asyncio.to_thread(self.paper.execute_limit_order, token_id, side, price, size, market)
             return await asyncio.to_thread(self.paper.execute_market_order, token_id, side, amount, market)
         if order_type == "limit":
-            return await asyncio.to_thread(self.place_limit_order, token_id, side, price, size)
-        return await asyncio.to_thread(self.place_market_order, token_id, side, amount, market)
+            return await asyncio.to_thread(
+                self.place_limit_order, token_id, side, price, size,
+                attribution=attribution,
+            )
+        return await asyncio.to_thread(
+            self.place_market_order, token_id, side, amount, market,
+            attribution=attribution,
+        )
 
     def cancel_all_orders(self):
         if DRY_RUN:
@@ -1645,8 +1781,11 @@ class PolymarketBot:
             return 0
 
     def get_realized_pnl_summary(self) -> dict:
-        """Aggregate realized P&L stats across time windows. Used by the
-        dashboard and fed into the nightly review's context."""
+        """Aggregate realized P&L stats across time windows, plus per-strategy
+        and per-category breakdowns. Used by the dashboard and fed into the
+        nightly review's context so recommendations can be grounded in
+        actual attribution ('momentum loses money on crypto markets') rather
+        than vague global changes."""
         try:
             def _row_for(window_sql: str) -> dict:
                 row = self.db.execute(
@@ -1667,10 +1806,36 @@ class PolymarketBot:
                     "win_rate":        round(wins / total * 100, 1) if total else 0.0,
                     "profitable_rate": round(profit / total * 100, 1) if total else 0.0,
                 }
+
+            def _breakdown(group_col: str, window_sql: str = "AND resolved_at >= datetime('now','-30 days')") -> dict:
+                """Return {group_value: {trades, pnl, profitable_rate}} for the column."""
+                rows = self.db.execute(
+                    f"SELECT COALESCE({group_col}, 'unknown') AS g, COUNT(*), "
+                    f"SUM(realized_pnl), "
+                    f"SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) "
+                    f"FROM trades WHERE resolved=1 AND dry_run=0 {window_sql} "
+                    f"GROUP BY g ORDER BY SUM(realized_pnl) DESC"
+                ).fetchall()
+                out = {}
+                for r in rows:
+                    g = str(r[0] or "unknown")
+                    n = int(r[1] or 0)
+                    pnl = round(float(r[2] or 0.0), 2)
+                    profit = int(r[3] or 0)
+                    out[g] = {
+                        "trades":          n,
+                        "pnl":             pnl,
+                        "profitable_rate": round(profit / n * 100, 1) if n else 0.0,
+                    }
+                return out
+
             return {
                 "all_time":   _row_for(""),
                 "last_7d":    _row_for("AND resolved_at >= datetime('now','-7 days')"),
                 "last_30d":   _row_for("AND resolved_at >= datetime('now','-30 days')"),
+                "by_strategy_30d": _breakdown("strategy"),
+                "by_category_30d": _breakdown("category"),
+                "by_regime_30d":   _breakdown("regime_at_entry"),
                 "unresolved": int(self.db.execute(
                     "SELECT COUNT(*) FROM trades WHERE resolved=0 AND dry_run=0 "
                     "AND status IN ('matched','filled','simulated') "
@@ -2796,6 +2961,10 @@ class PolymarketBot:
                 f"  30d: {realized.get('last_30d', {})}\n"
                 f"  All: {realized.get('all_time', {})}\n"
                 f"  Unresolved trades pending outcome: {realized.get('unresolved', 0)}\n"
+                f"ATTRIBUTION (30d, resolved only — use this to drive targeted recs):\n"
+                f"  By strategy:  {realized.get('by_strategy_30d', {})}\n"
+                f"  By category:  {realized.get('by_category_30d', {})}\n"
+                f"  By regime:    {realized.get('by_regime_30d', {})}\n"
                 f"Brier stats: {brier}\n"
                 f"Regime distribution: {regime_summary}\n"
                 f"\nTrade ledger (newest last):\n" +
@@ -3577,10 +3746,21 @@ class PolymarketBot:
                         # Use asyncio.to_thread so blocking network I/O (CLOB API calls) in
                         # place_market_order / place_limit_order don't stall the event loop.
                         result = None
+                        # Shared attribution dict used by every strategy's
+                        # execution path. Momentum/signal path overrides with
+                        # post-AI values further down.
+                        _attribution_base = {
+                            "strategy":        signal.get("strategy", ""),
+                            "category":        self.classify_market(question),
+                            "ai_probability":  int(round(float(predicted_prob))) if predicted_prob is not None else None,
+                            "ai_confidence":   int(float(signal.get("confidence") or 0)) or None,
+                            "ai_risk":         signal.get("ai_risk", "") or None,
+                            "regime_at_entry": (self._regime_cache or {}).get("regime", "normal"),
+                        }
                         if signal["strategy"] == "arbitrage" and "BUY" in signal["signal"]:
-                            await self._execute_order(signal["token_id"], "BUY", amt / 2, mkt_name)
+                            await self._execute_order(signal["token_id"], "BUY", amt / 2, mkt_name, attribution=_attribution_base)
                             if signal.get("no_token_id"):
-                                await self._execute_order(signal["no_token_id"], "BUY", amt / 2, mkt_name)
+                                await self._execute_order(signal["no_token_id"], "BUY", amt / 2, mkt_name, attribution=_attribution_base)
                             cycle_cash -= amt
                             sig_record["traded"] = True
                         elif signal["strategy"] == "marketMaking":
@@ -3591,10 +3771,10 @@ class PolymarketBot:
                             ask = signal.get("ask") or 0
                             if bid and bid > 0:
                                 bid_size = round(amt / bid, 4)
-                                await self._execute_order(signal["token_id"], "BUY", amt, mkt_name, "limit", bid, bid_size)
+                                await self._execute_order(signal["token_id"], "BUY", amt, mkt_name, "limit", bid, bid_size, attribution=_attribution_base)
                             if ask and ask > 0:
                                 ask_size = round(amt / ask, 4)
-                                await self._execute_order(signal["token_id"], "SELL", amt, mkt_name, "limit", ask, ask_size)
+                                await self._execute_order(signal["token_id"], "SELL", amt, mkt_name, "limit", ask, ask_size, attribution=_attribution_base)
                             cycle_cash -= amt
                             sig_record["traded"] = True
                         elif "BUY" in signal.get("signal", ""):
@@ -3663,7 +3843,10 @@ class PolymarketBot:
                                     if amt < 1.0:
                                         sig_record["skip_reason"] = f"deep downsized below $1"
                                         continue
-                            result = await self._execute_order(signal["token_id"], "BUY", amt, mkt_name)
+                            result = await self._execute_order(
+                                signal["token_id"], "BUY", amt, mkt_name,
+                                attribution=_attribution_base,
+                            )
                             cycle_cash -= amt
                             if result and result.get("status") not in ("error", None):
                                 sig_record["traded"] = True
