@@ -18,16 +18,21 @@ ssh root@159.65.201.165
 systemctl restart sexybot
 systemctl status sexybot
 journalctl -u sexybot -f          # live logs
+tail -f /var/log/sexybot-deploy.log  # auto-deploy log (cron writes here on every deploy)
 
-# Deploy local changes to VPS
-scp <file> root@159.65.201.165:/root/polybot/<file>
-# Or: git push origin main → ssh into VPS → git pull origin main
+# Deploy local changes to VPS — just push to main. The VPS cron pulls + restarts within 60s.
+git push origin main
+# Confirm deploy landed:
+tail -1 /var/log/sexybot-deploy.log   # on VPS
 
-# Sync dashboard to nginx web root (after editing index.html)
-ssh root@159.65.201.165 "cp /root/polybot/index.html /var/www/html/index.html"
+# Manual override if you need to bypass the cron (e.g. hotfix a syntax error locally)
+ssh root@159.65.201.165 "cd /root/polybot && /root/polybot/deploy-pull.sh"
 
-# Reload nginx config
+# Reload nginx config (rare — only if you edited nginx.conf)
 ssh root@159.65.201.165 "nginx -t && systemctl reload nginx"
+
+# Emergency kill switch — drops the bot to rule-based strategies, no Claude calls
+ssh root@159.65.201.165 "echo 'CLAUDE_MAX_DISABLE=true' >> /root/polybot/.env && systemctl restart sexybot"
 ```
 
 ## Architecture
@@ -75,62 +80,122 @@ See `.env.example` for all variables with descriptions. Critical ones:
 | `PRIVATE_KEY` | 32-byte hex Polygon wallet key (with `0x` prefix) |
 | `POLYMARKET_FUNDER` | Gnosis Safe proxy address; omit for EOA mode |
 | `DRY_RUN` | `true` by default — **must set `false` for live trading** |
-| `STRATEGY` | `momentum` or `market_making` |
-| `ANTHROPIC_API_KEY` | Required for AI market analysis in momentum signal |
+| `STRATEGY` | `momentum`, `market_making`, `econFlow`, etc. |
+| `ANTHROPIC_API_KEY` | Required for every Claude Max feature (regime, nightly, deep, etc.) |
+| `API_SECRET_KEY` | Protects dashboard write endpoints — the one the frontend prompts for |
 | `MAX_DRAWDOWN_USD` | Kill-switch threshold (default $50 in 10 min) |
+| `CLAUDE_MODEL` / `CLAUDE_FAST_MODEL` | Sonnet 4.6 / Haiku 4.5 |
+| `CLAUDE_MAX_DISABLE` | Emergency off switch for all AI features — set `true` and restart to drop to rule-based only |
+| `REGIME_DETECTOR` / `NIGHTLY_REVIEW` / `PRETRADE_CHECK` / `DEEP_ANALYZE` / `BACKTEST_WEEKLY` | Per-feature toggles |
+| `DEEP_ANALYZE_MIN_USD` | Trade size threshold for Opus + web_search verification |
+| `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID` | Required for operator alerts (hostile regime, deep abort, nightly review) |
 
-The `.env` file lives on the VPS at `/root/polybot/.env` and is **never committed to git**.
+The `.env` file lives on the VPS at `/root/polybot/.env` and is **never committed to git**. It also typically lives on the operator's dev Mac for local testing — same contents.
 
-## New Machine Setup
+## Auto-Deploy (VPS cron pull)
 
-All code is in GitHub — setup takes ~10 minutes:
+The VPS pulls `main` from GitHub every minute via cron and restarts sexybot + nginx on any change.
 
 ```bash
-# 1. Clone
-git clone https://github.com/jasonblanck/sexybot.git
+# Installed script
+/root/polybot/deploy-pull.sh
+
+# Cron entry (run `crontab -l` to verify)
+* * * * * /root/polybot/deploy-pull.sh
+
+# Deploy log (one line per deploy, nothing when there's no change)
+/var/log/sexybot-deploy.log
+```
+
+Flow: merge PR → `main` updates → within ≤60s the cron tick pulls, resets, copies `index.html` to nginx root, reloads nginx, restarts sexybot, logs the deploy. Failures are captured in `/var/log/sexybot-deploy.log`. To reinstall if it ever gets removed, see `scripts/deploy-pull.sh` header for the install commands.
+
+## New Mac / New Machine Setup
+
+**The bot runs on the VPS, not your Mac.** Migrating Macs does not require any downtime; the bot keeps trading the entire time.
+
+### What to transfer from the old Mac
+
+| Item | Path on old Mac | Why |
+|---|---|---|
+| SSH private key | `~/.ssh/id_ed25519` (+ `.pub`) | Needed for `ssh root@159.65.201.165` and GitHub SSH auth |
+| `known_hosts` (optional) | `~/.ssh/known_hosts` | Skips the "do you trust this host" prompt on first connect |
+| Local `.env` (optional) | `<wherever your local sexybot dir is>/.env` | Only needed if you want to run the bot locally for dev; contains the same contents as the VPS .env |
+
+Transfer via: AirDrop / encrypted USB / 1Password / iCloud Drive. Do NOT email the `.env` or private key in plaintext.
+
+### Setup on the new Mac
+
+```bash
+# 1. Xcode command line tools (git + ssh + compilers)
+xcode-select --install
+
+# 2. Restore SSH keys
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+# Move the transferred key files into ~/.ssh/
+mv ~/Desktop/id_ed25519* ~/.ssh/  # wherever you parked them
+chmod 600 ~/.ssh/id_ed25519
+chmod 644 ~/.ssh/id_ed25519.pub
+
+# 3. Test VPS + GitHub access
+ssh root@159.65.201.165 "echo ok"
+ssh -T git@github.com   # should say "Hi jasonblanck!"
+
+# 4. Clone the repo
+cd ~/Desktop   # or wherever you want the local dev copy
+git clone git@github.com:jasonblanck/sexybot.git
 cd sexybot
 
-# 2. Python environment
+# 5. Drop the .env back in (if you want to run locally)
+mv ~/Desktop/.env .env
+
+# 6. OPTIONAL — local Python env for dev/testing. NOT required for the
+#    bot to run (bot runs on VPS). Only needed if you want to `python3
+#    main_v2.py` or `python3 bot.py` on the Mac.
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+pip install 'websockets<16.0.0' 'eth-keyfile<0.9.0'   # pinned per requirements comments
 
-# 3. Pinned packages (must override after pip install)
-pip install 'websockets<16.0.0' 'eth-keyfile<0.9.0'
-
-# 4. Secrets — copy .env from old machine or recreate from .env.example
-cp .env.example .env
-# Fill in real values from 1Password / old machine
-
-# 5. SSH access to VPS
-# Option A: copy id_ed25519 from old Mac (~/.ssh/id_ed25519)
-# Option B: generate new key and add to VPS:
-ssh-keygen -t ed25519 -C "new-macbook"
-ssh-copy-id -i ~/.ssh/id_ed25519.pub root@159.65.201.165
+# 7. Bookmark the dashboard
+open https://159.65.201.165/
 ```
 
-### What to transfer from old Mac
+After this, your dev loop is: edit locally → commit + push to main → cron auto-deploys within 60s. No SSH needed for normal development.
 
-| Item | Location | How |
-|---|---|---|
-| SSH private key | `~/.ssh/id_ed25519` | AirDrop / encrypted USB / 1Password |
-| Local `.env` | `Desktop/JB/untitled folder/.env` | AirDrop / 1Password |
-| GitHub token | embedded in git remote URL | Generate new token on new Mac |
+### If the SSH key from the old Mac isn't available (lost, not transferred)
 
-The **bot itself runs on the VPS** — it keeps trading during the Mac transition. Nothing on the Mac is required for the bot to operate.
-
-### GitHub auth on new Mac
-
-The current remote uses an HTTPS token embedded in the URL. On the new Mac, use SSH-based auth instead (more secure, no token rotation needed):
+Generate new keys on the new Mac and enroll them:
 
 ```bash
-# 1. Generate GitHub SSH key (or reuse the VPS key)
-ssh-keygen -t ed25519 -C "github-newmac"
-cat ~/.ssh/id_ed25519.pub   # add this to github.com → Settings → SSH Keys
+# New SSH key
+ssh-keygen -t ed25519 -C "new-macbook"
 
-# 2. Switch remote to SSH
-git remote set-url origin git@github.com:jasonblanck/sexybot.git
+# Enroll with GitHub — paste the .pub content at:
+# https://github.com/settings/keys
+cat ~/.ssh/id_ed25519.pub
+
+# Enroll with the VPS — use the DigitalOcean web console (Cloud → Droplet → Access → Launch Console)
+# to paste the .pub content into /root/.ssh/authorized_keys:
+#   echo "<paste pub key here>" >> /root/.ssh/authorized_keys
 ```
+
+### What's on the VPS that is NOT in git (and worth backing up)
+
+These live on the VPS filesystem and would be lost if the droplet died. Periodically back up to a safe location:
+
+| File | What | Why it matters |
+|---|---|---|
+| `/root/polybot/.env` | All API keys + wallet private key | **Losing `PRIVATE_KEY` loses access to the wallet funds** |
+| `/root/polybot/trades.db` | SQLite DB: trades, brier_scores, strategy_reviews, regime_log, pretrade_log, deep_analyses, backtests, positions | Losing this loses all attribution / calibration history |
+| `/var/log/sexybot-deploy.log` | Auto-deploy audit trail | Nice to have, not critical |
+
+Quick backup command (run on VPS, outputs a single tarball):
+```bash
+tar -czf /tmp/sexybot-backup-$(date +%Y%m%d).tgz \
+    /root/polybot/.env /root/polybot/trades.db 2>/dev/null
+ls -lh /tmp/sexybot-backup-*.tgz
+```
+Then `scp` it to your Mac or to another safe location.
 
 ## Nginx Proxy Routes
 
@@ -139,11 +204,10 @@ The nginx config (`nginx.conf`) proxies these paths to FastAPI on port 8000:
 ```
 /status /portfolio /markets /orderbook /weather /fmp
 /start  /stop      /trade    /paper/*   /settings /cancel
-/api/*  → http://127.0.0.1:8000/  (strips /api/ prefix)
+/regime /reviews   /pretrade /pnl       /brier    /deep
+/backtest /health
+/api/*  → http://127.0.0.1:8000/  (strips /api/ prefix — used for /macro, /market-data, /research)
 /ws     → WebSocket upgrade
 ```
 
-Static files (`index.html`) are served from `/var/www/html/`. After editing `index.html`, sync it manually:
-```bash
-ssh root@159.65.201.165 "cp /root/polybot/index.html /var/www/html/index.html"
-```
+Static files (`index.html`) are served from `/var/www/html/`. The auto-deploy cron syncs it on every commit; no manual sync needed.
