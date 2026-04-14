@@ -55,3 +55,47 @@ jobs:
           }
           process.exit(fail);
           "
+
+  deploy:
+    name: deploy to VPS
+    runs-on: ubuntu-latest
+    # Only deploy on push to main (never on PRs). Waits for `syntax` to
+    # succeed — a broken build never hits production.
+    needs: syntax
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: SSH into VPS, pull main, restart sexybot
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: 159.65.201.165
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd /root/polybot
+            echo "── Before deploy ──"
+            git rev-parse --short HEAD
+            git fetch origin main
+            # reset --hard so local drift (accidental edits on the VPS)
+            # can't block the pull. The workflow trusts main.
+            git reset --hard origin/main
+            echo "── After pull ──"
+            git rev-parse --short HEAD
+            echo "── Restarting sexybot ──"
+            systemctl restart sexybot
+            # Sync dashboard HTML to nginx web root and reload
+            if [ -f index.html ]; then
+              cp index.html /var/www/html/index.html
+              nginx -t && systemctl reload nginx || true
+            fi
+            # Wait briefly and verify the service is healthy
+            sleep 3
+            if ! systemctl is-active --quiet sexybot; then
+              echo "❌ sexybot failed to start after deploy"
+              journalctl -u sexybot -n 60 --no-pager
+              exit 1
+            fi
+            echo "✅ sexybot active. Recent log:"
+            journalctl -u sexybot -n 20 --no-pager
