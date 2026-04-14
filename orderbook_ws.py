@@ -171,24 +171,24 @@ class ClobWebSocket:
 
     async def run(self) -> None:
         self._running = True
-        delay = RECONNECT_DELAY
+        self._backoff = RECONNECT_DELAY
         while self._running:
             try:
                 await self._connect_and_consume()
-                delay = RECONNECT_DELAY
+                self._backoff = RECONNECT_DELAY
             except (ConnectionClosed, WebSocketException, OSError) as exc:
                 if not self._running:
                     break
                 self._reconnects += 1
-                log.warning("WS disconnected (reconnect #%d, retry in %.1fs): %s", self._reconnects, delay, exc)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, RECONNECT_MAX)
+                log.warning("WS disconnected (reconnect #%d, retry in %.1fs): %s", self._reconnects, self._backoff, exc)
+                await asyncio.sleep(self._backoff)
+                self._backoff = min(self._backoff * 2, RECONNECT_MAX)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 log.exception("Unexpected WS error: %s", exc)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, RECONNECT_MAX)
+                await asyncio.sleep(self._backoff)
+                self._backoff = min(self._backoff * 2, RECONNECT_MAX)
 
     async def _connect_and_consume(self) -> None:
         log.info("WS connecting → %s", WS_URL)
@@ -202,6 +202,9 @@ class ClobWebSocket:
             self._ws = ws
             log.info("WS connected — subscribing to %d token(s)", len(self.token_ids))
             await self._subscribe(ws)
+            # Subscribe succeeded — reset backoff so a later drop doesn't
+            # inherit a 60 s retry delay from a previous short outage.
+            self._backoff = RECONNECT_DELAY
             async for raw in ws:
                 try:
                     msg = json.loads(raw)

@@ -274,6 +274,26 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
         <div class="stat-row"><span class="stat-lbl">Status</span><span class="stat-val" id="bstatus">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Volatility</span><span class="stat-val" id="vol-state">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Gas (Polygon)</span><span class="stat-val" id="gas-state">—</span></div>
+        <div class="stat-row"><span class="stat-lbl">Regime (Claude)</span><span class="stat-val" id="regime-state" title="Claude risk-officer verdict; hostile halts new trades">—</span></div>
+        <div class="stat-row" id="regime-reasoning-row" style="display:none"><span class="stat-lbl" style="font-size:9px;color:var(--text3)">Why</span><span class="stat-val" id="regime-reasoning" style="font-size:10px;color:var(--text2);text-align:right;max-width:200px;overflow:hidden;text-overflow:ellipsis"></span></div>
+        <div class="stat-row" id="pretrade-row" style="display:none"><span class="stat-lbl">Pretrade catches (24h)</span><span class="stat-val" id="pretrade-state" title="Abort = gate refused the trade; downsize = gate reduced the amount">—</span></div>
+        <div class="stat-row" id="realized-pnl-row" style="display:none"><span class="stat-lbl">Realized P&L (30d)</span><span class="stat-val" id="realized-pnl-state" title="Actual profit/loss on resolved positions — gross payout minus cost">—</span></div>
+        <div class="stat-row" id="deep-row" style="display:none"><span class="stat-lbl">Deep verdicts (7d)</span><span class="stat-val" id="deep-state" title="Opus+web_search verifications on high-value trades">—</span></div>
+        <div class="stat-row" id="claude-max-row"><span class="stat-lbl">Claude Max</span><span class="stat-val" id="claude-max-state" title="Overall status of the Claude Max stack — click logs for details">—</span></div>
+      </div>
+    </div>
+    <div class="panel" id="backtest-panel">
+      <div class="panel-title" style="display:flex;justify-content:space-between;align-items:center">BACKTEST (CLAUDE)
+        <button onclick="runBacktest(this)" style="padding:3px 10px;font-size:9px;background:#1a3a2a;color:#00cc66;border:1px solid #00cc6640;border-radius:3px;cursor:pointer;font-family:var(--mono)">RUN</button>
+      </div>
+      <div id="backtest-body" style="font-size:11px;color:var(--text2);padding:4px 0">
+        <div style="color:var(--text3);font-size:10px">No backtest yet. Click RUN to have Claude analyze your trade history with pandas.</div>
+      </div>
+    </div>
+    <div class="panel" id="reviews-panel">
+      <div class="panel-title">NIGHTLY REVIEW (CLAUDE)</div>
+      <div id="review-body" style="font-size:11px;color:var(--text2);padding:4px 0">
+        <div style="color:var(--text3)">No reviews yet. First review runs at 00:05 UTC after the bot has real trades in the last 24h.</div>
       </div>
     </div>
     <div class="panel">
@@ -989,11 +1009,13 @@ async function fetchIndices(){
 }
 
 /* ── WEBSOCKET ── */
-const WS_API_KEY=sessionStorage.getItem('sb_key')||'';
 function connectWS(){
+  // Read the API key on every (re)connect so a key saved via saveSettings
+  // after page load is picked up without a full refresh.
+  const wsKey=sessionStorage.getItem('sb_key')||'';
   const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+'/ws');
   ws.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.connected||d.error||(!d.hasOwnProperty('running')&&!d.trades))return;applyState(d);}catch(err){}};
-  ws.onopen=()=>{if(WS_API_KEY)ws.send(JSON.stringify({cmd:'auth',key:WS_API_KEY}));};
+  ws.onopen=()=>{if(wsKey)ws.send(JSON.stringify({cmd:'auth',key:wsKey}));};
   ws.onclose=()=>setTimeout(connectWS,3000);
   ws.onerror=()=>ws.close();
 }
@@ -1204,8 +1226,24 @@ async function saveSettings(){
 ══════════════════════════════════════════════════════ */
 async function confirmKill(){
   document.getElementById('kill-overlay').style.display='none';
-  const key=sessionStorage.getItem('sb_key')||'';
-  try{await fetch(`${BOT}/stop`,{method:'POST',headers:key?{'X-API-Key':key}:{}});}catch(e){}
+  // /stop requires an API key — prompt if missing so the request isn't silently rejected.
+  const key=sessionStorage.getItem('sb_key')||prompt('Enter API key to stop the bot:','')||'';
+  if(!key){
+    document.getElementById('kill-status').textContent='kill cancelled — API key required';
+    return;
+  }
+  sessionStorage.setItem('sb_key',key);
+  try{
+    const r=await fetch(`${BOT}/stop`,{method:'POST',headers:{'X-API-Key':key}});
+    if(!r.ok){
+      let detail='';try{const d=await r.json();detail=d.detail||'';}catch(e){}
+      document.getElementById('kill-status').textContent=`kill failed (HTTP ${r.status})${detail?': '+detail:''}`;
+      return;
+    }
+  }catch(e){
+    document.getElementById('kill-status').textContent='kill failed — bot unreachable';
+    return;
+  }
   document.getElementById('kill-status').textContent='bot stopped';
   document.getElementById('sdot').className='dot off';
   document.getElementById('stext').textContent='stopped';
@@ -1246,8 +1284,203 @@ function psCalc(){
 /* ══════════════════════════════════════════════════════
    INIT
 ══════════════════════════════════════════════════════ */
+/* ── REGIME (Claude risk officer) ── */
+async function fetchRegime(){
+  try{
+    const r=await fetch(`${BOT}/regime`);if(!r.ok)return;
+    const d=await r.json();if(!d||!d.enabled)return;
+    const reg=(d.regime||'normal').toLowerCase();
+    const cls={normal:'g',cautious:'y',hostile:'r'}[reg]||'y';
+    const label=reg.toUpperCase();
+    const km=typeof d.kelly_multiplier==='number'?d.kelly_multiplier.toFixed(2):'1.00';
+    const el=document.getElementById('regime-state');
+    if(el)el.innerHTML=`<span class="${cls}">● ${label}</span> <span style="font-size:10px;color:var(--text3)">k×${km}</span>`;
+    const why=document.getElementById('regime-reasoning');
+    const row=document.getElementById('regime-reasoning-row');
+    if(d.reasoning&&why){why.textContent=d.reasoning;if(row)row.style.display='';}
+  }catch(e){}
+}
+/* ── CLAUDE MAX overall health ── */
+async function fetchClaudeMax(){
+  try{
+    const r=await fetch(`${BOT}/health/claude`);if(!r.ok)return;
+    const d=await r.json();
+    const el=document.getElementById('claude-max-state');if(!el)return;
+    if(d.master_disabled){el.innerHTML='<span class="r">● DISABLED</span> <span style="font-size:10px;color:var(--text3)">rule-based only</span>';return;}
+    if(!d.anthropic_api_key){el.innerHTML='<span class="r">● NO API KEY</span>';return;}
+    const f=d.features||{};
+    const active=Object.values(f).filter(x=>x.enabled).length;
+    const total=Object.keys(f).length;
+    const cls=active===total?'g':active>0?'y':'r';
+    el.innerHTML=`<span class="${cls}">● ${active}/${total} active</span>`;
+  }catch(e){}
+}
+/* ── DEEP ANALYSIS verdicts ── */
+async function fetchDeep(){
+  try{
+    const r=await fetch(`${BOT}/deep/recent?limit=1`);if(!r.ok)return;
+    const d=await r.json();
+    const row=document.getElementById('deep-row');
+    const el=document.getElementById('deep-state');
+    if(!d||!d.enabled||!el||!row)return;
+    const s=d.last_7d||{};
+    const total=(s.aborts||0)+(s.downsizes||0)+(s.proceeds||0);
+    if(total===0){row.style.display='none';return;}
+    row.style.display='';
+    const parts=[];
+    if(s.aborts>0)parts.push(`<span class="r">${s.aborts}✗</span>`);
+    if(s.downsizes>0)parts.push(`<span class="y">${s.downsizes}↓</span>`);
+    if(s.proceeds>0)parts.push(`<span class="g">${s.proceeds}✓</span>`);
+    const prot=Number(s.usd_protected||0);
+    const tail=prot>0?` <span style="font-size:10px;color:var(--text3)" title="USD prevented from being deployed on aborted/downsized trades">$${prot.toFixed(0)} saved</span>`:'';
+    el.innerHTML=parts.join(' ')+tail;
+  }catch(e){}
+}
+/* ── BACKTEST ── */
+async function fetchBacktest(){
+  try{
+    const r=await fetch(`${BOT}/backtest`);if(!r.ok)return;
+    const d=await r.json();
+    const box=document.getElementById('backtest-body');if(!box)return;
+    const rep=d.report;
+    if(!rep){return;}
+    const findings=rep.key_findings||[];
+    const recs=rep.recommendations||[];
+    const findHtml=findings.length?findings.slice(0,8).map(f=>`<li style="margin:3px 0;font-size:10px">${safeHtml(String(f))}</li>`).join(''):'';
+    const recHtml=recs.length?recs.slice(0,5).map(r=>`<li style="margin:3px 0;font-size:10px;color:var(--text)">${safeHtml(String(r))}</li>`).join(''):'';
+    const ts=rep.created_at?new Date(rep.created_at+'Z').toLocaleString():'—';
+    box.innerHTML=
+      `<div style="color:var(--text3);font-size:10px">${safeHtml(ts)} · ${rep.trades_analyzed||0} trades · ${Number(rep.latency_s||0).toFixed(1)}s · ${safeHtml(rep.model||'')}</div>`+
+      `<div style="margin:6px 0;color:var(--text);font-size:11px">${safeHtml(rep.summary||'')}</div>`+
+      (findHtml?`<div style="font-size:10px;color:var(--text3);margin-top:6px">Findings:</div><ul style="margin:2px 0 0 14px;padding:0">${findHtml}</ul>`:'')+
+      (recHtml?`<div style="font-size:10px;color:var(--text3);margin-top:6px">Recommendations:</div><ul style="margin:2px 0 0 14px;padding:0">${recHtml}</ul>`:'');
+  }catch(e){}
+}
+async function runBacktest(btn){
+  const key=sessionStorage.getItem('sb_key')||prompt('Enter API key to run backtest:','')||'';
+  if(!key)return;
+  sessionStorage.setItem('sb_key',key);
+  if(btn){btn.disabled=true;btn.textContent='RUNNING…';}
+  try{
+    const r=await fetch(`${BOT}/backtest/run`,{method:'POST',headers:{'X-API-Key':key}});
+    const d=await r.json();
+    if(r.ok&&d.ok){
+      if(btn){btn.disabled=false;btn.textContent='RUN';}
+      fetchBacktest();
+    }else{
+      if(btn){btn.disabled=false;btn.textContent='RUN';}
+      alert('Backtest: '+(d.message||d.detail||'failed'));
+    }
+  }catch(e){
+    if(btn){btn.disabled=false;btn.textContent='RUN';}
+    alert('Network error');
+  }
+}
+/* ── REALIZED P&L ── */
+async function fetchRealizedPnl(){
+  try{
+    const r=await fetch(`${BOT}/pnl/realized`);if(!r.ok)return;
+    const d=await r.json();
+    const row=document.getElementById('realized-pnl-row');
+    const el=document.getElementById('realized-pnl-state');
+    if(!el||!row)return;
+    const s30=d.last_30d||{};
+    if((s30.trades||0)===0){row.style.display='none';return;}
+    row.style.display='';
+    const pnl=Number(s30.pnl||0);
+    const wr=Number(s30.profitable_rate||0);
+    const cls=pnl>=0?'g':'r';
+    const sign=pnl>=0?'+':'';
+    el.innerHTML=`<span class="${cls}">${sign}$${pnl.toFixed(2)}</span> <span style="font-size:10px;color:var(--text3)">${s30.trades||0}tr · ${wr.toFixed(0)}%wr</span>`;
+  }catch(e){}
+}
+/* ── PRE-TRADE catches (Claude gate) ── */
+async function fetchPretrade(){
+  try{
+    const r=await fetch(`${BOT}/pretrade/recent?limit=1`);if(!r.ok)return;
+    const d=await r.json();
+    const row=document.getElementById('pretrade-row');
+    const el=document.getElementById('pretrade-state');
+    if(!d||!d.enabled||!el||!row)return;
+    const a=Number(d.last_24h_aborts||0);
+    const ds=Number(d.last_24h_downsizes||0);
+    if(a===0 && ds===0){row.style.display='none';return;}
+    row.style.display='';
+    const parts=[];
+    if(a>0)parts.push(`<span class="r">${a} abort${a===1?'':'s'}</span>`);
+    if(ds>0)parts.push(`<span class="y">${ds} downsize${ds===1?'':'s'}</span>`);
+    el.innerHTML=parts.join(' · ');
+  }catch(e){}
+}
+/* ── NIGHTLY REVIEWS ── */
+let _latestReview=null;
+async function fetchReviews(){
+  try{
+    const r=await fetch(`${BOT}/reviews?limit=1`);if(!r.ok)return;
+    const d=await r.json();
+    const box=document.getElementById('review-body');if(!box)return;
+    const rev=(d.reviews||[])[0];
+    _latestReview=rev;
+    if(!rev){
+      if(!d.enabled){box.innerHTML='<div style="color:var(--text3);font-size:10px">Nightly review disabled (set NIGHTLY_REVIEW=true and ANTHROPIC_API_KEY in .env)</div>';}
+      return;
+    }
+    // Parse the applied log to know which recommendations were already
+    // applied (so we can disable the button).
+    const appliedSet=new Set();
+    if(rev.applied){
+      const applied=String(rev.applied||'');
+      applied.split('\n').forEach(line=>{
+        try{const obj=JSON.parse(line);if(typeof obj.index==='number')appliedSet.add(obj.index);}catch(e){}
+      });
+    }
+    const recs=rev.recommendations||[];
+    const pnlCls=(rev.pnl||0)>=0?'g':'r';
+    const applyable=new Set(['MAX_ORDER_SIZE','DAILY_LOSS_LIMIT','STRATEGY','PAUSE']);
+    const recHtml=recs.length?recs.map((x,i)=>{
+      const param=String(x.param||'').toUpperCase();
+      const isApplied=appliedSet.has(i);
+      const canApply=applyable.has(param) && !isApplied;
+      const btn=canApply
+        ? `<button onclick="applyReview(${rev.id},${i},this)" style="margin-left:6px;padding:2px 8px;font-size:9px;background:#1a3a2a;color:#00cc66;border:1px solid #00cc6640;border-radius:3px;cursor:pointer;font-family:var(--mono)">APPLY</button>`
+        : isApplied
+          ? `<span style="margin-left:6px;font-size:9px;color:var(--text3)">[applied]</span>`
+          : `<span style="margin-left:6px;font-size:9px;color:var(--text3)">[read-only]</span>`;
+      return `<li style="margin:6px 0"><b>${safeHtml(param)}</b>: ${safeHtml(String(x.current||''))} → <span class="y">${safeHtml(String(x.suggested||''))}</span>${btn}<br><span style="font-size:10px;color:var(--text3)">${safeHtml(x.rationale||'')}</span></li>`;
+    }).join(''):'<li style="color:var(--text3);font-size:10px">No changes recommended.</li>';
+    box.innerHTML=
+      `<div style="color:var(--text3);font-size:10px">${safeHtml(rev.review_date||'')} · ${rev.trades_count||0} trades · gross $<span class="${pnlCls}">${Number(rev.pnl||0).toFixed(2)}</span> · match ${Number(rev.win_rate||0).toFixed(0)}%</div>`+
+      `<div style="margin:6px 0;color:var(--text);font-size:11px">${safeHtml(rev.summary||'')}</div>`+
+      `<ul style="margin:4px 0 0 14px;padding:0">${recHtml}</ul>`;
+  }catch(e){}
+}
+async function applyReview(reviewId,idx,btn){
+  const key=sessionStorage.getItem('sb_key')||prompt('Enter API key to apply this change:','')||'';
+  if(!key)return;
+  sessionStorage.setItem('sb_key',key);
+  if(btn){btn.disabled=true;btn.textContent='APPLYING…';}
+  try{
+    const r=await fetch(`${BOT}/reviews/${reviewId}/apply`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-API-Key':key},
+      body:JSON.stringify({index:idx})
+    });
+    const d=await r.json();
+    if(r.ok){
+      if(btn){btn.textContent='✓ APPLIED';btn.style.background='#1a2a3a';btn.style.color='#66aaff';}
+      // refresh review panel so the applied flag updates from the server
+      fetchReviews();
+    }else{
+      if(btn){btn.disabled=false;btn.textContent='APPLY';}
+      alert('Apply failed: '+(d.detail||d.error||r.status));
+    }
+  }catch(e){
+    if(btn){btn.disabled=false;btn.textContent='APPLY';}
+    alert('Apply failed: network error');
+  }
+}
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();fetchClaudeMax();
 setInterval(fetchBot,15000);
 setInterval(fetchPortfolio,30000);
 setInterval(fetchMarkets,60000);
@@ -1258,6 +1491,12 @@ setInterval(fetchCrypto,30000);
 setInterval(fetchIndices,60000);
 setInterval(fetchMarketData,60000);
 setInterval(fetchPaperPortfolio,30000);
+setInterval(fetchRegime,60000);
+setInterval(fetchReviews,600000);
+setInterval(fetchPretrade,90000);
+setInterval(fetchRealizedPnl,180000);
+setInterval(fetchDeep,120000);
+setInterval(fetchClaudeMax,60000);
 connectWS();
 // Handle initial hash
 (()=>{const pg=location.hash.slice(1);if(pg&&pg!=='dashboard')showPage(pg);})();

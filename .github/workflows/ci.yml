@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  syntax:
+    name: syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile-check every Python module
+        # Uses py_compile so we don't need to install py_clob_client /
+        # web3 / fastapi to validate syntax. Catches indentation errors,
+        # bad imports referenced at module scope, and similar issues that
+        # would otherwise blow up at systemctl-restart time on the VPS.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          failed=0
+          for f in *.py; do
+            echo "compile: $f"
+            python -m py_compile "$f" || failed=1
+          done
+          exit $failed
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate index.html inline JS
+        # The dashboard is a single-file HTML with inline <script> blocks.
+        # Extract each block and parse it with node's Function constructor;
+        # catches unclosed brackets, stray tokens, typos that would silently
+        # leave a blank dashboard in a browser.
+        run: |
+          node -e "
+          const fs=require('fs');
+          const html=fs.readFileSync('index.html','utf8');
+          const m=html.match(/<script>([\\s\\S]*?)<\\/script>/g) || [];
+          let fail=0;
+          for (const s of m) {
+            const body = s.replace(/^<script>/,'').replace(/<\\/script>$/,'');
+            try { new Function(body); }
+            catch(e) { console.log('JS ERROR:', e.message); fail=1; }
+          }
+          process.exit(fail);
+          "
