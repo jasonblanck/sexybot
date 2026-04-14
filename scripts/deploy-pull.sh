@@ -46,6 +46,8 @@ git reset --hard origin/main >>/var/log/sexybot-deploy.log 2>&1
 
 # Sync dashboard HTML to nginx web root (ok if file doesn't exist)
 cp index.html /var/www/html/index.html 2>/dev/null || true
+# Sync login page (retro Bloomberg × Matrix auth gate)
+cp login.html /var/www/html/login.html 2>/dev/null || true
 
 # Reload nginx only if its config still validates
 nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true

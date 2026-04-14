@@ -24,7 +24,7 @@ except ImportError as e:
 
 try:
     import uvicorn
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request, status
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
     from fastapi.security import APIKeyHeader
@@ -55,6 +55,11 @@ if not API_SECRET_KEY:
     import secrets as _sec
     API_SECRET_KEY = _sec.token_hex(24)
     log.warning(f"API_SECRET_KEY not set — generated ephemeral key (set in .env to persist): {API_SECRET_KEY[:6]}…")
+# Dashboard-view password (separate from API_SECRET_KEY which guards writes).
+# The login page at /login.html POSTs to /auth/login with this. On success the
+# server sets an HttpOnly signed cookie; read endpoints require that cookie.
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "SEXYBOT")
+SESSION_TTL_SEC    = int(os.getenv("SESSION_TTL_SEC", "604800"))  # 7 days
 FRED_API_KEY       = os.getenv("FRED_API_KEY", "")
 OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY", "")
 FMP_API_KEY        = os.getenv("FMP_API_KEY", "")
@@ -4249,6 +4254,112 @@ def _sec_compare(a: str, b: str) -> bool:
     """Constant-time comparison to prevent timing attacks."""
     import hmac
     return hmac.compare_digest(a.encode(), b.encode())
+
+
+# ── Dashboard session auth (cookie) ────────────────────────────────────────────
+# Signed HMAC session token: base64(timestamp_secs).base64(hmac_sha256).
+# Stateless — no server-side session table. Rotates automatically when
+# API_SECRET_KEY changes. Gate applied at the middleware level below.
+import base64 as _b64
+import hmac as _hmac
+import hashlib as _hashlib
+
+SESSION_COOKIE_NAME = "sb_session"
+
+def _make_session_token() -> str:
+    ts = str(int(time.time())).encode()
+    sig = _hmac.new(API_SECRET_KEY.encode(), ts, _hashlib.sha256).digest()
+    return f"{_b64.urlsafe_b64encode(ts).decode()}.{_b64.urlsafe_b64encode(sig).decode()}"
+
+def _verify_session_token(token: Optional[str]) -> bool:
+    if not token or "." not in token:
+        return False
+    try:
+        ts_b64, sig_b64 = token.split(".", 1)
+        ts_bytes = _b64.urlsafe_b64decode(ts_b64.encode())
+        sig_bytes = _b64.urlsafe_b64decode(sig_b64.encode())
+        expected = _hmac.new(API_SECRET_KEY.encode(), ts_bytes, _hashlib.sha256).digest()
+        if not _hmac.compare_digest(sig_bytes, expected):
+            return False
+        # Check expiry
+        ts = int(ts_bytes.decode())
+        if time.time() - ts > SESSION_TTL_SEC:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+# Routes that do NOT require a valid session cookie. Everything else
+# gets gated by the middleware below. /health is public so uptime
+# monitors work; /auth/* obviously; /ws is gated by its own handshake;
+# the kill/start/stop/settings endpoints all use X-API-Key instead.
+_AUTH_EXEMPT_EXACT = {
+    "/health", "/health/claude",
+    "/auth/login", "/auth/logout", "/auth/check",
+    "/login", "/login.html",
+    "/favicon.ico",
+    "/ws",
+}
+
+@app.middleware("http")
+async def _session_gate(request, call_next):
+    path = request.url.path
+    # Fast path: exempt routes
+    if path in _AUTH_EXEMPT_EXACT:
+        return await call_next(request)
+    # Write endpoints already require X-API-Key — skip cookie check so
+    # operator tooling (curl) still works without a browser session.
+    if request.headers.get("x-api-key"):
+        return await call_next(request)
+    # Everything else needs a valid session cookie
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not _verify_session_token(token):
+        # JSON 401 for XHR, so the dashboard can catch it and redirect;
+        # no HTML redirect (a browser hitting `/markets` directly is rare
+        # and a 401 is more honest than a redirect for an API call).
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "auth required", "login_url": "/login.html"},
+        )
+    return await call_next(request)
+
+
+@app.post("/auth/login")
+async def auth_login(body: dict):
+    """Validate password, issue session cookie on success."""
+    pw = str(body.get("password", ""))
+    if not _sec_compare(pw, DASHBOARD_PASSWORD):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    token = _make_session_token()
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        key      = SESSION_COOKIE_NAME,
+        value    = token,
+        max_age  = SESSION_TTL_SEC,
+        httponly = True,
+        secure   = True,
+        samesite = "lax",
+        path     = "/",
+    )
+    return resp
+
+
+@app.post("/auth/logout")
+async def auth_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    return resp
+
+
+@app.get("/auth/check")
+async def auth_check(request: Request):
+    """Cheap probe the dashboard calls on load to decide whether to
+    redirect to /login.html."""
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if _verify_session_token(token):
+        return {"ok": True}
+    raise HTTPException(status_code=401, detail="auth required")
 
 
 @app.exception_handler(Exception)

@@ -730,12 +730,41 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
   <div style="display:flex;gap:8px;">
     <button id="start-btn" onclick="startBot()" style="background:#00cc8815;border:1px solid #00cc8860;color:#00cc88;padding:6px 20px;border-radius:3px;font-family:'DM Mono',monospace;font-size:11px;font-weight:700;letter-spacing:2px;cursor:pointer;">▶ START</button>
     <button onclick="document.getElementById('kill-overlay').style.display='flex'" style="background:#ff335515;border:1px solid #ff335560;color:#ff3355;padding:6px 20px;border-radius:3px;font-family:'DM Mono',monospace;font-size:11px;font-weight:700;letter-spacing:2px;cursor:pointer;">☠ KILL</button>
+    <button onclick="logoutBot()" style="background:#66666615;border:1px solid #66666660;color:#999;padding:6px 14px;border-radius:3px;font-family:'DM Mono',monospace;font-size:11px;font-weight:700;letter-spacing:2px;cursor:pointer;">⏻ EXIT</button>
   </div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
 const BOT=`${location.protocol}//${location.host}`;
+
+// ─── Auth gate ─────────────────────────────────────────────────
+// Server enforces the session cookie on every read endpoint; this
+// is a UX shortcut that redirects to the retro login page before
+// the rest of the dashboard starts hammering APIs that would 401.
+// Also globally intercepts fetch() so any later 401 (session
+// expired mid-session) bounces the user back to /login.html.
+(async function _authGate(){
+  try {
+    const r = await fetch('/auth/check', {credentials:'same-origin'});
+    if (!r.ok) { window.location.replace('/login.html'); }
+  } catch (e) { /* network flake — let later calls retry */ }
+})();
+(function _wrapFetch(){
+  const _origFetch = window.fetch;
+  window.fetch = async function(...args){
+    const res = await _origFetch.apply(this, args);
+    if (res && res.status === 401) {
+      // Avoid redirect loop if the 401 was itself the login call
+      const url = (typeof args[0] === 'string') ? args[0] : (args[0] && args[0].url) || '';
+      if (!url.includes('/auth/')) {
+        window.location.replace('/login.html');
+      }
+    }
+    return res;
+  };
+})();
+
 let pnlChart=null,allTrades=[],activeFilter='1D',_totalPnl=0;
 let _allSignals=[],_actFilter='all',_logFilter='all',_allLogs=[];
 
@@ -1283,6 +1312,15 @@ async function startBot(){
   }catch(e){
     document.getElementById('kill-status').textContent='start failed — bot unreachable';
   }
+}
+
+/* ══════════════════════════════════════════════════════
+   LOGOUT — clears session cookie and bounces to /login.html
+══════════════════════════════════════════════════════ */
+async function logoutBot(){
+  try { await fetch('/auth/logout', {method:'POST', credentials:'same-origin'}); }
+  catch (e) { /* ignore */ }
+  window.location.replace('/login.html');
 }
 
 /* ══════════════════════════════════════════════════════
