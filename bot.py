@@ -165,6 +165,23 @@ _TOOL_DEEP = {
         "required": ["verdict", "size_multiplier", "probability", "reasoning", "evidence_used"],
     },
 }
+_TOOL_BACKTEST = {
+    "name": "submit_backtest_report",
+    "description": "Submit the statistical analysis of historical trade data.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary":         {"type": "string", "description": "2-4 sentence narrative of what the data shows"},
+            "key_findings":    {"type": "array",  "items": {"type": "string"}, "description": "Bullet list of discovered patterns"},
+            "recommendations": {"type": "array",  "items": {"type": "string"}, "description": "Concrete actionable tweaks, each one sentence"},
+            "stats": {
+                "type": "object",
+                "description": "Free-form numeric stats your analysis produced (win rates by segment, P&L by hour, etc.)",
+            },
+        },
+        "required": ["summary", "key_findings", "recommendations"],
+    },
+}
 _TOOL_REVIEW = {
     "name": "submit_strategy_review",
     "description": "Submit the nightly strategy review and recommendations.",
@@ -338,6 +355,22 @@ class PolymarketBot:
                 size_multiplier REAL,
                 proceed         INTEGER,      -- 1 = proceeded, 0 = aborted
                 reason          TEXT,
+                created_at      TEXT NOT NULL
+            )""")
+            # Backtest reports — Claude analyzes historical trades via
+            # server-side code_execution and writes a structured report.
+            # On-demand only (not scheduled) because it's expensive.
+            self.db.execute("""CREATE TABLE IF NOT EXISTS backtests (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                period_start    TEXT,
+                period_end      TEXT,
+                trades_analyzed INTEGER,
+                summary         TEXT,
+                key_findings    TEXT,     -- JSON array
+                recommendations TEXT,     -- JSON array
+                stats           TEXT,     -- JSON object (free-form)
+                model           TEXT,
+                latency_s       REAL,
                 created_at      TEXT NOT NULL
             )""")
             # Deep-analysis audit log — every Opus + web_search pass gets
@@ -2408,6 +2441,179 @@ class PolymarketBot:
             log.warning(f"Deep analysis error: {e} — keeping original decision")
             return None
 
+    # ── Backtester (Claude Max + Code Execution) ───────────────────────────
+    # On-demand analysis of historical trades. Claude gets the trade ledger as
+    # CSV text plus the server-side code_execution tool, then writes Python
+    # (pandas, numpy, matplotlib are pre-installed) to compute whatever
+    # statistical analysis it thinks is most informative — P&L distribution,
+    # win rate by market type, profitability by hour, correlation between
+    # Brier calibration and realized P&L, etc. Submits a structured report
+    # via submit_backtest_report when done.
+    async def run_backtest_analysis(self) -> Optional[dict]:
+        """Run a Claude-driven backtest of the bot's recent performance.
+        Returns the report dict, persisted to the backtests table."""
+        if not ANTHROPIC_API_KEY:
+            return None
+        try:
+            import anthropic, io, csv as _csv
+            if self._anthropic_client is None:
+                self._anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            client = self._anthropic_client
+
+            # Pull up to the last 500 resolved real trades from the last 90 days.
+            rows = self.db.execute(
+                "SELECT time, market, side, amount, price, shares, status, "
+                "resolved, won, realized_pnl, resolved_at, order_type "
+                "FROM trades "
+                "WHERE dry_run=0 AND time >= datetime('now','-90 days') "
+                "ORDER BY id DESC LIMIT 500"
+            ).fetchall()
+            if not rows:
+                self._log("[BACKTEST] No real trades in last 90 days — skipping")
+                return None
+
+            # Format as CSV text for the prompt. Compact but lets Claude parse
+            # it directly in the code-execution container with pandas.
+            buf = io.StringIO()
+            w = _csv.writer(buf)
+            w.writerow(["time","market","side","amount","price","shares",
+                        "status","resolved","won","realized_pnl","resolved_at","order_type"])
+            for r in rows:
+                w.writerow([
+                    r[0], (r[1] or "")[:100], r[2], r[3], r[4], r[5],
+                    r[6], r[7], r[8], r[9], r[10], r[11],
+                ])
+            csv_text = buf.getvalue()
+
+            # Also include calibration + realized-P&L context so Claude can
+            # compare the bot's predictions to actual outcomes.
+            brier = self.get_brier_stats() or {}
+            realized = self.get_realized_pnl_summary() or {}
+            ctx = (
+                "BACKTEST DATA FOR ANALYSIS\n"
+                f"Rows: {len(rows)} trades (last 90 days, real/non-dry-run)\n"
+                f"Calibration context: {brier}\n"
+                f"Realized P&L summary: {realized}\n"
+                "\n"
+                "TRADES CSV (first line is header):\n"
+                f"{csv_text}"
+            )
+            system = (
+                "You are a quantitative analyst reviewing a Polymarket trading "
+                "bot's recent history. You have access to the code_execution "
+                "tool — use it. Write Python with pandas/numpy to compute:\n"
+                "\n"
+                "1. P&L distribution and central moments (mean, std, skew).\n"
+                "2. Win rate and expected value per trade.\n"
+                "3. P&L by time-of-day / day-of-week if patterns exist.\n"
+                "4. P&L by side (YES vs NO buys) — detects directional bias.\n"
+                "5. Correlation between Brier calibration and realized P&L.\n"
+                "6. Tail analysis: biggest win, biggest loss, drawdown runs.\n"
+                "7. Any other patterns you spot from the data.\n"
+                "\n"
+                "When you're done analyzing, submit a structured report via "
+                "submit_backtest_report with your key findings and concrete, "
+                "testable recommendations. Put numeric results in the stats "
+                "object — the operator reads those on the dashboard. Focus on "
+                "findings that could change trading decisions; vague "
+                "observations waste the operator's time."
+            )
+
+            t0 = time.time()
+            kwargs = {
+                "model": CLAUDE_MODEL,
+                "max_tokens": 8000,
+                "system": system,
+                "messages": [{"role": "user", "content": ctx}],
+                "tools": [
+                    {"type": "code_execution_20250522", "name": "code_execution"},
+                    _TOOL_BACKTEST,
+                ],
+            }
+            if CLAUDE_ADAPTIVE_THINK and ("sonnet" in CLAUDE_MODEL or "opus" in CLAUDE_MODEL):
+                kwargs["thinking"] = {"type": "adaptive"}
+            try:
+                msg = await asyncio.to_thread(client.messages.create, **kwargs)
+            except TypeError:
+                # Older SDK rejected some kwarg (thinking or code_execution);
+                # retry with only the submit tool.
+                log.warning("[BACKTEST] SDK rejected code_execution; retrying text-only")
+                msg = await asyncio.to_thread(
+                    client.messages.create,
+                    model=CLAUDE_MODEL,
+                    max_tokens=4000,
+                    system=system,
+                    messages=[{"role": "user", "content": ctx}],
+                    tools=[_TOOL_BACKTEST],
+                    tool_choice={"type": "tool", "name": _TOOL_BACKTEST["name"]},
+                )
+            except Exception as api_err:
+                log.warning(f"[BACKTEST] primary call failed ({api_err}); retrying without code_execution")
+                msg = await asyncio.to_thread(
+                    client.messages.create,
+                    model=CLAUDE_FAST_MODEL,
+                    max_tokens=3000,
+                    system=system,
+                    messages=[{"role": "user", "content": ctx}],
+                    tools=[_TOOL_BACKTEST],
+                    tool_choice={"type": "tool", "name": _TOOL_BACKTEST["name"]},
+                )
+            latency = round(time.time() - t0, 2)
+
+            if getattr(msg, "stop_reason", None) == "refusal":
+                log.warning("[BACKTEST] Claude refused")
+                return None
+
+            decision = _extract_tool_input(msg, _TOOL_BACKTEST["name"])
+            if decision is None:
+                log.warning("[BACKTEST] no submit_backtest_report in response")
+                return None
+
+            summary   = str(decision.get("summary", ""))[:3000]
+            findings  = decision.get("key_findings", []) or []
+            recs      = decision.get("recommendations", []) or []
+            stats     = decision.get("stats", {}) or {}
+            if not isinstance(findings, list): findings = []
+            if not isinstance(recs, list):     recs = []
+            if not isinstance(stats, dict):    stats = {}
+
+            # Range of analyzed data
+            times = [r[0] for r in rows if r[0]]
+            period_start = min(times) if times else ""
+            period_end   = max(times) if times else ""
+
+            import json as _j
+            now_iso = datetime.utcnow().isoformat()
+            with self.db:
+                self.db.execute(
+                    "INSERT INTO backtests (period_start, period_end, "
+                    "trades_analyzed, summary, key_findings, recommendations, "
+                    "stats, model, latency_s, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (period_start, period_end, len(rows), summary,
+                     _j.dumps([str(f)[:400] for f in findings][:20]),
+                     _j.dumps([str(r)[:400] for r in recs][:10]),
+                     _j.dumps(stats), CLAUDE_MODEL, latency, now_iso),
+                )
+
+            self._log(f"[BACKTEST] done in {latency}s — {len(findings)} findings, {len(recs)} recs")
+            if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                await asyncio.to_thread(
+                    self.send_telegram,
+                    f"📈 Backtest complete ({len(rows)} trades, {latency}s)\n{summary[:400]}"
+                )
+            return {
+                "summary":         summary,
+                "key_findings":    findings,
+                "recommendations": recs,
+                "stats":           stats,
+                "trades_analyzed": len(rows),
+                "latency_s":       latency,
+            }
+        except Exception as e:
+            log.warning(f"run_backtest_analysis error: {e}")
+            return None
+
     # ── Nightly strategy review (Claude Max) ───────────────────────────────
     # Once per 24h, feed Claude the day's trades, Brier calibration, regime
     # log, and current parameters. Claude writes a review to the DB with
@@ -4138,6 +4344,48 @@ async def trigger_trade_resolve(limit: int = 100):
     limit = max(1, min(limit, 1000))
     settled = await bot.resolve_trade_outcomes(limit=limit)
     return JSONResponse({"ok": True, "settled": settled})
+
+
+@app.get("/backtest")
+def get_latest_backtest():
+    """Most recent backtest report (summary + findings + recs + stats)."""
+    try:
+        row = bot.db.execute(
+            "SELECT id, period_start, period_end, trades_analyzed, summary, "
+            "key_findings, recommendations, stats, model, latency_s, created_at "
+            "FROM backtests ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return JSONResponse({"report": None})
+        import json as _j
+        return JSONResponse({
+            "report": {
+                "id":              row[0],
+                "period_start":    row[1],
+                "period_end":      row[2],
+                "trades_analyzed": row[3],
+                "summary":         row[4],
+                "key_findings":    _j.loads(row[5]) if row[5] else [],
+                "recommendations": _j.loads(row[6]) if row[6] else [],
+                "stats":           _j.loads(row[7]) if row[7] else {},
+                "model":           row[8],
+                "latency_s":       row[9],
+                "created_at":      row[10],
+            }
+        })
+    except Exception as e:
+        log.warning(f"/backtest error: {e}")
+        return JSONResponse({"report": None, "error": "internal error"}, status_code=500)
+
+
+@app.post("/backtest/run", dependencies=[Depends(require_api_key)])
+async def trigger_backtest():
+    """Run a backtest on demand. Blocks until Claude finishes analyzing
+    (typically 20-90s with code_execution). Returns the report."""
+    result = await bot.run_backtest_analysis()
+    if result is None:
+        return JSONResponse({"ok": False, "message": "backtest skipped (no trades or error)"})
+    return JSONResponse({"ok": True, **result})
 
 
 @app.get("/deep/recent")

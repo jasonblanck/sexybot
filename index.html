@@ -281,6 +281,14 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
         <div class="stat-row" id="deep-row" style="display:none"><span class="stat-lbl">Deep verdicts (7d)</span><span class="stat-val" id="deep-state" title="Opus+web_search verifications on high-value trades">—</span></div>
       </div>
     </div>
+    <div class="panel" id="backtest-panel">
+      <div class="panel-title" style="display:flex;justify-content:space-between;align-items:center">BACKTEST (CLAUDE)
+        <button onclick="runBacktest(this)" style="padding:3px 10px;font-size:9px;background:#1a3a2a;color:#00cc66;border:1px solid #00cc6640;border-radius:3px;cursor:pointer;font-family:var(--mono)">RUN</button>
+      </div>
+      <div id="backtest-body" style="font-size:11px;color:var(--text2);padding:4px 0">
+        <div style="color:var(--text3);font-size:10px">No backtest yet. Click RUN to have Claude analyze your trade history with pandas.</div>
+      </div>
+    </div>
     <div class="panel" id="reviews-panel">
       <div class="panel-title">NIGHTLY REVIEW (CLAUDE)</div>
       <div id="review-body" style="font-size:11px;color:var(--text2);padding:4px 0">
@@ -1312,6 +1320,46 @@ async function fetchDeep(){
     el.innerHTML=parts.join(' ')+tail;
   }catch(e){}
 }
+/* ── BACKTEST ── */
+async function fetchBacktest(){
+  try{
+    const r=await fetch(`${BOT}/backtest`);if(!r.ok)return;
+    const d=await r.json();
+    const box=document.getElementById('backtest-body');if(!box)return;
+    const rep=d.report;
+    if(!rep){return;}
+    const findings=rep.key_findings||[];
+    const recs=rep.recommendations||[];
+    const findHtml=findings.length?findings.slice(0,8).map(f=>`<li style="margin:3px 0;font-size:10px">${safeHtml(String(f))}</li>`).join(''):'';
+    const recHtml=recs.length?recs.slice(0,5).map(r=>`<li style="margin:3px 0;font-size:10px;color:var(--text)">${safeHtml(String(r))}</li>`).join(''):'';
+    const ts=rep.created_at?new Date(rep.created_at+'Z').toLocaleString():'—';
+    box.innerHTML=
+      `<div style="color:var(--text3);font-size:10px">${safeHtml(ts)} · ${rep.trades_analyzed||0} trades · ${Number(rep.latency_s||0).toFixed(1)}s · ${safeHtml(rep.model||'')}</div>`+
+      `<div style="margin:6px 0;color:var(--text);font-size:11px">${safeHtml(rep.summary||'')}</div>`+
+      (findHtml?`<div style="font-size:10px;color:var(--text3);margin-top:6px">Findings:</div><ul style="margin:2px 0 0 14px;padding:0">${findHtml}</ul>`:'')+
+      (recHtml?`<div style="font-size:10px;color:var(--text3);margin-top:6px">Recommendations:</div><ul style="margin:2px 0 0 14px;padding:0">${recHtml}</ul>`:'');
+  }catch(e){}
+}
+async function runBacktest(btn){
+  const key=sessionStorage.getItem('sb_key')||prompt('Enter API key to run backtest:','')||'';
+  if(!key)return;
+  sessionStorage.setItem('sb_key',key);
+  if(btn){btn.disabled=true;btn.textContent='RUNNING…';}
+  try{
+    const r=await fetch(`${BOT}/backtest/run`,{method:'POST',headers:{'X-API-Key':key}});
+    const d=await r.json();
+    if(r.ok&&d.ok){
+      if(btn){btn.disabled=false;btn.textContent='RUN';}
+      fetchBacktest();
+    }else{
+      if(btn){btn.disabled=false;btn.textContent='RUN';}
+      alert('Backtest: '+(d.message||d.detail||'failed'));
+    }
+  }catch(e){
+    if(btn){btn.disabled=false;btn.textContent='RUN';}
+    alert('Network error');
+  }
+}
 /* ── REALIZED P&L ── */
 async function fetchRealizedPnl(){
   try{
@@ -1416,7 +1464,7 @@ async function applyReview(reviewId,idx,btn){
   }
 }
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();
 setInterval(fetchBot,15000);
 setInterval(fetchPortfolio,30000);
 setInterval(fetchMarkets,60000);
