@@ -64,12 +64,29 @@ jobs:
     needs: syntax
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
+      - name: Decode base64-encoded SSH key
+        # The key is stored as a single-line base64 blob to dodge all
+        # whitespace/line-ending mishaps that come from pasting multi-line
+        # PEM into the Secrets UI. We decode it to a file, set 0600
+        # permissions, and hand the plain path to the ssh action. No key
+        # material ever lands in the workflow output.
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY_B64 }}" | base64 -d > ~/.ssh/vps_key
+          chmod 600 ~/.ssh/vps_key
+          # Sanity-check: must end with an OpenSSH private key footer
+          if ! tail -1 ~/.ssh/vps_key | grep -q "PRIVATE KEY-----"; then
+            echo "ERROR: decoded key does not end with a PRIVATE KEY footer"
+            echo "Check that VPS_SSH_KEY_B64 is a valid base64 encoding of the private key"
+            exit 1
+          fi
+
       - name: SSH into VPS, pull main, restart sexybot
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: 159.65.201.165
           username: root
-          key: ${{ secrets.VPS_SSH_KEY }}
+          key_path: /home/runner/.ssh/vps_key
           port: 22
           script_stop: true
           script: |
