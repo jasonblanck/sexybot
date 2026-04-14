@@ -4749,6 +4749,14 @@ async def trigger_trade_resolve(limit: int = 100):
     return JSONResponse({"ok": True, "settled": settled})
 
 
+@app.get("/health")
+def health():
+    """Liveness probe for nginx / uptime monitors. Returns 200 iff the
+    FastAPI app is responsive. Does NOT check Claude / Polymarket / DB —
+    use /health/claude for feature-specific readiness."""
+    return {"status": "ok", "ts": datetime.utcnow().isoformat()}
+
+
 @app.get("/health/claude")
 def claude_max_health():
     """Single-pane-of-glass health check for every Claude Max feature.
@@ -5123,12 +5131,27 @@ async def update_settings(body: dict):
     except FileNotFoundError:
         lines = []
 
+    # Accept JSON true/false, 0/1, or the strings "true"/"false"/"1"/"0".
+    # Naive bool("false") == True — so stringified booleans must be parsed
+    # explicitly or an operator toggling DRY_RUN via curl would silently
+    # keep live trading on.
+    def _as_bool(v, field: str) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("true", "1", "yes", "on"):  return True
+            if s in ("false", "0", "no", "off"): return False
+        raise HTTPException(status_code=400, detail=f"{field} must be boolean")
+
     updates: dict = {}
     if "paper_mode" in body:
-        PAPER_MODE = bool(body["paper_mode"])
+        PAPER_MODE = _as_bool(body["paper_mode"], "paper_mode")
         updates["PAPER_MODE"] = "true" if PAPER_MODE else "false"
     if "dry_run" in body:
-        DRY_RUN = bool(body["dry_run"])
+        DRY_RUN = _as_bool(body["dry_run"], "dry_run")
         updates["DRY_RUN"] = "true" if DRY_RUN else "false"
     if "strategy" in body:
         val = str(body["strategy"])

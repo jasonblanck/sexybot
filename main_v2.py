@@ -599,6 +599,32 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # Safety guard: main_v2.py and bot.py both load the same codebase,
+    # same wallet, and same allowance. Running them in parallel (as
+    # happened once when a stray main_v2.py was left running on the
+    # VPS while the sexybot systemd service also ran bot.py) causes
+    # them to race on orders and drain allowance. Refuse to start if
+    # the sexybot service is already active — the operator must either
+    # stop sexybot first or set SEXYBOT_ALLOW_DUAL=1 to override.
+    import subprocess as _sp, sys as _sys
+    if os.getenv("SEXYBOT_ALLOW_DUAL") != "1":
+        try:
+            _r = _sp.run(
+                ["systemctl", "is-active", "--quiet", "sexybot"],
+                timeout=3,
+            )
+            if _r.returncode == 0:
+                print(
+                    "REFUSING TO START: sexybot service is active — "
+                    "bot.py is already running and shares this wallet. "
+                    "Either `systemctl stop sexybot` first, or set "
+                    "SEXYBOT_ALLOW_DUAL=1 to override.",
+                    file=_sys.stderr,
+                )
+                _sys.exit(2)
+        except (FileNotFoundError, _sp.TimeoutExpired):
+            pass  # systemctl unavailable (e.g. local dev on macOS) — allow
+
     logging.basicConfig(
         level  = logging.INFO,
         format = "%(asctime)s %(levelname)-8s %(message)s",
