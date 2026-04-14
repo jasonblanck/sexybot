@@ -115,6 +115,8 @@ class PolymarketBot:
         # Nightly review task handle — guarantees a single live reviewer loop
         self._nightly_review_task: Optional[asyncio.Task] = None
         self._last_review_at: float = 0.0
+        # Brier resolver task handle
+        self._brier_resolver_task: Optional[asyncio.Task] = None
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -1246,20 +1248,115 @@ class PolymarketBot:
             log.debug(f"brier log error: {e}")
 
     def get_brier_stats(self) -> dict:
-        """Return calibration stats from resolved predictions."""
+        """Return calibration stats from resolved predictions.
+        Adds a 30-day slice so a long-running bot doesn't drown in old
+        predictions — the recent slice is what the nightly review should
+        weight most."""
         try:
             cur = self.db.execute(
                 "SELECT COUNT(*), AVG(brier_score) FROM brier_scores WHERE resolved=1 AND brier_score IS NOT NULL")
             row = cur.fetchone()
             total_cur = self.db.execute("SELECT COUNT(*) FROM brier_scores").fetchone()
+            recent = self.db.execute(
+                "SELECT COUNT(*), AVG(brier_score) FROM brier_scores "
+                "WHERE resolved=1 AND brier_score IS NOT NULL "
+                "AND time >= datetime('now','-30 days')"
+            ).fetchone()
+            # Breakdown by side so overconfidence on one side shows up.
+            side_rows = self.db.execute(
+                "SELECT side, COUNT(*), AVG(brier_score) FROM brier_scores "
+                "WHERE resolved=1 AND brier_score IS NOT NULL "
+                "GROUP BY side"
+            ).fetchall()
+            by_side = {
+                str(r[0]).upper(): {"n": int(r[1] or 0),
+                                    "avg_brier": round(float(r[2]), 4) if r[2] is not None else None}
+                for r in side_rows
+            }
             return {
-                "total_predictions": total_cur[0] if total_cur else 0,
-                "resolved": row[0] if row else 0,
-                "avg_brier_score": round(row[1], 4) if row and row[1] else None,
+                "total_predictions": int(total_cur[0]) if total_cur else 0,
+                "resolved":          int(row[0]) if row else 0,
+                "avg_brier_score":   round(float(row[1]), 4) if row and row[1] is not None else None,
+                "resolved_30d":      int(recent[0]) if recent else 0,
+                "avg_brier_30d":     round(float(recent[1]), 4) if recent and recent[1] is not None else None,
+                "by_side":           by_side,
             }
         except Exception as e:
             log.warning(f"get_brier_stats DB error: {e}")
             return {}
+
+    async def resolve_brier_predictions(self, limit: int = 50) -> int:
+        """Scan unresolved Brier predictions and settle the ones whose
+        markets have resolved. Uses the CLOB midpoint of the prediction's
+        token — a resolved market has its winning token at ~$1 and the
+        losing token at ~$0. Stored token_id always matches the predicted
+        side (logged at prediction time), so mid >= 0.99 means our side
+        won and mid <= 0.01 means our side lost. Returns number of rows
+        settled this call."""
+        try:
+            rows = self.db.execute(
+                "SELECT id, token_id, predicted_prob FROM brier_scores "
+                "WHERE resolved=0 AND token_id IS NOT NULL AND token_id != '' "
+                "ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
+            if not rows:
+                return 0
+            settled = 0
+            for row_id, token_id, predicted_prob in rows:
+                try:
+                    mid = await asyncio.to_thread(self.get_midpoint, token_id)
+                except Exception:
+                    continue
+                if mid is None:
+                    continue
+                if mid >= 0.99:
+                    actual_outcome = 1       # our side won
+                elif mid <= 0.01:
+                    actual_outcome = 0       # our side lost
+                else:
+                    continue                 # still trading — not yet resolved
+                try:
+                    p = float(predicted_prob or 0.0)
+                except (TypeError, ValueError):
+                    p = 0.5
+                brier = (p - actual_outcome) ** 2
+                with self.db:
+                    self.db.execute(
+                        "UPDATE brier_scores SET resolved=1, actual_outcome=?, brier_score=? WHERE id=?",
+                        (actual_outcome, round(brier, 6), row_id),
+                    )
+                settled += 1
+            if settled:
+                self._log(f"[BRIER] Resolved {settled} prediction(s) this pass")
+            return settled
+        except Exception as e:
+            log.warning(f"resolve_brier_predictions error: {e}")
+            return 0
+
+    async def _brier_resolver_loop(self):
+        """Background task — every 6h scans up to 50 unresolved predictions
+        and settles the ones whose markets have closed. First pass fires
+        ~10 minutes after startup so we don't hammer the CLOB during boot."""
+        if not ANTHROPIC_API_KEY:
+            # The Brier loop is independent of Claude; keep running regardless.
+            pass
+        # Grace period at boot
+        try:
+            await asyncio.sleep(600)
+        except asyncio.CancelledError:
+            return
+        while self.running:
+            try:
+                await self.resolve_brier_predictions(limit=50)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.debug(f"brier resolver loop error: {e}")
+            try:
+                await asyncio.sleep(6 * 3600)
+            except asyncio.CancelledError:
+                break
 
     def get_courtlistener_data(self, query: str) -> str:
         """Search CourtListener for relevant court dockets/opinions (free API)."""
@@ -2496,14 +2593,32 @@ class PolymarketBot:
                         q_lower = question.lower()
                         is_legal = any(x in q_lower for x in ["indicted","trial","court","lawsuit","ruling","judge","convicted","charged","plea","verdict","sentenced"])
                         is_legislative = any(x in q_lower for x in ["bill","act","legislation","congress","senate","pass","signed","law","vote","amendment"])
-                        research = {
-                            "orderbook": ob_data,
-                            "crypto":    await asyncio.to_thread(self.get_crypto_prices),
-                            "news":      await asyncio.to_thread(self.get_news_headlines, question[:60]),
-                            "tavily":    await asyncio.to_thread(self.get_tavily_research, question[:80]) if TAVILY_API_KEY else "",
-                            "court":     await asyncio.to_thread(self.get_courtlistener_data, question[:60]) if is_legal else "",
-                            "govtrack":  await asyncio.to_thread(self.get_govtrack_data, question[:60]) if is_legislative else "",
+                        # Fan out research fetches in parallel — each was
+                        # previously awaited sequentially, so per-market AI
+                        # prep stacked up 4-5 HTTP round trips worst case.
+                        # Most of them are cached after the first call, but
+                        # the uncached first call dominated the critical path.
+                        _research_tasks: dict = {
+                            "crypto": asyncio.to_thread(self.get_crypto_prices),
+                            "news":   asyncio.to_thread(self.get_news_headlines, question[:60]),
                         }
+                        if TAVILY_API_KEY:
+                            _research_tasks["tavily"] = asyncio.to_thread(self.get_tavily_research, question[:80])
+                        if is_legal:
+                            _research_tasks["court"] = asyncio.to_thread(self.get_courtlistener_data, question[:60])
+                        if is_legislative:
+                            _research_tasks["govtrack"] = asyncio.to_thread(self.get_govtrack_data, question[:60])
+                        _keys = list(_research_tasks.keys())
+                        _vals = await asyncio.gather(*_research_tasks.values(), return_exceptions=True)
+                        research = {"orderbook": ob_data}
+                        for _k, _v in zip(_keys, _vals):
+                            research[_k] = "" if isinstance(_v, Exception) else _v
+                        # Ensure optional keys exist even when not fetched —
+                        # analyze_with_claude reads them with .get() but some
+                        # downstream paths treat missing keys differently.
+                        research.setdefault("tavily",   "")
+                        research.setdefault("court",    "")
+                        research.setdefault("govtrack", "")
                         ai = await self.analyze_with_claude(mkt, yes_p, research)
                         if ai is None:
                             _ai_failures += 1
@@ -2959,6 +3074,11 @@ async def lifespan(app_: FastAPI):
         if REGIME_DETECTOR_ENABLED and ANTHROPIC_API_KEY:
             asyncio.create_task(bot.assess_market_regime(force=True))
             log.info("[REGIME] Bootstrap assessment kicked off at startup")
+        # Brier calibration resolver — periodic background task that settles
+        # unresolved predictions by checking token midpoints. Feeds real
+        # calibration data into the nightly review. Independent of Claude.
+        bot._brier_resolver_task = asyncio.create_task(bot._brier_resolver_loop())
+        log.info("[BRIER] Calibration resolver scheduled (every 6h)")
     else:
         log.warning("Could not connect — check .env credentials")
     yield
@@ -2968,6 +3088,8 @@ async def lifespan(app_: FastAPI):
         bot._paper_oracle_task.cancel()
     if bot._nightly_review_task and not bot._nightly_review_task.done():
         bot._nightly_review_task.cancel()
+    if bot._brier_resolver_task and not bot._brier_resolver_task.done():
+        bot._brier_resolver_task.cancel()
     if _bot_task and not _bot_task.done():
         _bot_task.cancel()
         try:
@@ -3481,6 +3603,15 @@ async def trigger_regime_assessment():
     """Force a regime re-assessment (bypasses the 10-minute cache)."""
     result = await bot.assess_market_regime(force=True)
     return JSONResponse(result)
+
+
+@app.post("/brier/resolve", dependencies=[Depends(require_api_key)])
+async def trigger_brier_resolve(limit: int = 50):
+    """Force an immediate pass of the Brier resolver (bypasses the 6h timer).
+    Returns the number of predictions settled this pass."""
+    limit = max(1, min(limit, 500))
+    settled = await bot.resolve_brier_predictions(limit=limit)
+    return JSONResponse({"ok": True, "settled": settled})
 
 
 @app.get("/pretrade/recent")
