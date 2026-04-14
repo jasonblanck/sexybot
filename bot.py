@@ -1622,7 +1622,14 @@ class PolymarketBot:
                 system=system,
                 messages=[{"role": "user", "content": ctx}],
             )
+            # Handle non-success stop_reasons explicitly — avoids a confusing
+            # json.loads failure downstream and keeps the last good cache.
+            if getattr(msg, "stop_reason", None) in ("refusal", "max_tokens"):
+                log.warning(f"assess_market_regime stop_reason={msg.stop_reason} — keeping previous regime")
+                return self._regime_cache
             text = next((b.text for b in msg.content if getattr(b, "type", "") == "text"), "").strip()
+            if not text:
+                return self._regime_cache
             if "```" in text:
                 text = text.split("```")[1]
                 if text.startswith("json"):
@@ -1789,8 +1796,10 @@ class PolymarketBot:
             client = self._anthropic_client
 
             # Window: last 24h of matched trades
-            since = (datetime.utcnow().replace(microsecond=0)).isoformat()
-            cutoff_iso = (datetime.utcnow()).isoformat()
+            from datetime import timedelta as _td
+            now_utc    = datetime.utcnow()
+            since      = (now_utc - _td(hours=24)).replace(microsecond=0).isoformat()
+            cutoff_iso = now_utc.replace(microsecond=0).isoformat()
             # Pull raw rows
             rows = self.db.execute(
                 "SELECT market, side, amount, price, shares, status, time "
@@ -1862,14 +1871,38 @@ class PolymarketBot:
                 "an empty recommendations array and say so in the summary."
             )
 
-            msg = await asyncio.to_thread(
-                client.messages.create,
-                model=CLAUDE_MODEL,
-                max_tokens=1500,
-                system=system,
-                messages=[{"role": "user", "content": ctx}],
-            )
+            # Nightly review benefits from real reasoning over yesterday's
+            # trades, so enable adaptive thinking on capable models. Bump
+            # max_tokens to leave room for thinking + JSON.
+            review_kwargs = {
+                "model": CLAUDE_MODEL,
+                "max_tokens": 3000,
+                "system": system,
+                "messages": [{"role": "user", "content": ctx}],
+            }
+            if CLAUDE_ADAPTIVE_THINK and ("sonnet" in CLAUDE_MODEL or "opus" in CLAUDE_MODEL):
+                review_kwargs["thinking"] = {"type": "adaptive"}
+            try:
+                msg = await asyncio.to_thread(client.messages.create, **review_kwargs)
+            except Exception as api_err:
+                log.warning(f"nightly review primary call failed ({api_err}); falling back to {CLAUDE_FAST_MODEL}")
+                msg = await asyncio.to_thread(
+                    client.messages.create,
+                    model=CLAUDE_FAST_MODEL,
+                    max_tokens=1500,
+                    system=system,
+                    messages=[{"role": "user", "content": ctx}],
+                )
+            if msg.stop_reason == "refusal":
+                log.warning("[NIGHTLY REVIEW] Claude refused")
+                return None
+            if msg.stop_reason == "max_tokens":
+                log.warning("[NIGHTLY REVIEW] Claude response truncated (max_tokens) — skipping")
+                return None
             text = next((b.text for b in msg.content if getattr(b, "type", "") == "text"), "").strip()
+            if not text:
+                log.warning("[NIGHTLY REVIEW] empty response")
+                return None
             if "```" in text:
                 text = text.split("```")[1]
                 if text.startswith("json"):
@@ -1879,6 +1912,8 @@ class PolymarketBot:
             decision = _j.loads(text)
             summary = str(decision.get("summary", ""))[:2000]
             recs    = decision.get("recommendations", []) or []
+            if not isinstance(recs, list):
+                recs = []
 
             now_iso = datetime.utcnow().isoformat()
             with self.db:
@@ -3401,9 +3436,13 @@ async def apply_review_recommendation(review_id: int, body: dict):
         recs = _j.loads(row[0]) if row[0] else []
     except Exception:
         raise HTTPException(status_code=500, detail="stored recommendations unparseable")
+    if not isinstance(recs, list):
+        raise HTTPException(status_code=500, detail="stored recommendations is not a list")
     if idx >= len(recs):
         raise HTTPException(status_code=400, detail=f"index {idx} out of range (0..{len(recs)-1})")
     rec = recs[idx]
+    if not isinstance(rec, dict):
+        raise HTTPException(status_code=400, detail=f"recommendation at index {idx} is not an object")
     param = str(rec.get("param", "")).upper()
     suggested = rec.get("suggested")
     prev_value = None
