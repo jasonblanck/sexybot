@@ -1816,7 +1816,13 @@ class PolymarketBot:
                 }
 
             def _breakdown(group_col: str, window_sql: str = "AND resolved_at >= datetime('now','-30 days')") -> dict:
-                """Return {group_value: {trades, pnl, profitable_rate}} for the column."""
+                """Return {group_value: {trades, pnl, profitable_rate}} for the column.
+                group_col is whitelisted because it gets interpolated directly into
+                SQL — user input must never reach it. If we ever expose this via
+                an HTTP endpoint, the check below is the last line of defense."""
+                _ALLOWED = {"strategy", "category", "regime_at_entry", "side", "ai_risk"}
+                if group_col not in _ALLOWED:
+                    raise ValueError(f"_breakdown: group_col {group_col!r} not in whitelist {_ALLOWED}")
                 rows = self.db.execute(
                     f"SELECT COALESCE({group_col}, 'unknown') AS g, COUNT(*), "
                     f"SUM(realized_pnl), "
