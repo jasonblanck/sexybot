@@ -93,6 +93,14 @@ DEEP_ANALYZE_ENABLED   = os.getenv("DEEP_ANALYZE", "true").lower() == "true"
 DEEP_ANALYZE_MIN_USD   = float(os.getenv("DEEP_ANALYZE_MIN_USD", "20.0"))
 DEEP_ANALYZE_MODEL     = os.getenv("DEEP_ANALYZE_MODEL", "claude-opus-4-6")
 DEEP_ANALYZE_TIMEOUT_S = float(os.getenv("DEEP_ANALYZE_TIMEOUT_S", "45.0"))
+# Auto-apply: after a nightly review, auto-apply recommendations that are
+# (a) on safelisted params, (b) within a conservative bound of the current
+# value, and (c) high enough confidence. Everything else still requires
+# manual APPLY. Off by default — turn on only after you've seen a few
+# reviews and trust the recommendations.
+AUTO_APPLY_ENABLED     = os.getenv("AUTO_APPLY_REVIEW", "false").lower() == "true"
+AUTO_APPLY_MIN_CONF    = int(os.getenv("AUTO_APPLY_MIN_CONF", "70"))
+AUTO_APPLY_MAX_DELTA   = float(os.getenv("AUTO_APPLY_MAX_DELTA", "0.25"))   # ±25% of current
 
 try:
     from paper import PolymarketPaperHandler, paper_resolution_oracle as _paper_oracle
@@ -2617,9 +2625,94 @@ class PolymarketBot:
     # ── Nightly strategy review (Claude Max) ───────────────────────────────
     # Once per 24h, feed Claude the day's trades, Brier calibration, regime
     # log, and current parameters. Claude writes a review to the DB with
-    # concrete recommendations. Does NOT auto-apply — operator reviews via
-    # dashboard and approves. This is the compounding edge loop: the bot
-    # learns from its own trades over time.
+    # concrete recommendations. The operator reviews via the dashboard and
+    # approves via APPLY buttons. If AUTO_APPLY_REVIEW=true, a tight
+    # safelist of low-risk params can auto-apply — see _auto_apply_review_recs.
+    # This is the compounding edge loop: the bot learns from its own trades.
+    def _auto_apply_review_recs(
+        self,
+        review_id: int,
+        recs: list,
+        confidence: int,
+    ) -> list:
+        """Auto-apply safe recommendations from a nightly review. Returns
+        the list of applied_change dicts so the caller can surface them in
+        Telegram/logs. Never raises — any rec that fails validation is
+        silently skipped (still available for manual APPLY on the dashboard)."""
+        global MAX_ORDER_SIZE, DAILY_LOSS_LIMIT
+        if confidence < AUTO_APPLY_MIN_CONF:
+            self._log(f"[AUTO-APPLY] Review confidence {confidence} < {AUTO_APPLY_MIN_CONF} — manual apply only")
+            return []
+        applied: list = []
+        import json as _j
+        for idx, rec in enumerate(recs or []):
+            if not isinstance(rec, dict):
+                continue
+            param     = str(rec.get("param", "")).upper()
+            suggested = rec.get("suggested")
+            if param == "MAX_ORDER_SIZE":
+                current = MAX_ORDER_SIZE
+                max_v   = 10_000.0
+                min_v   = 0.1
+                setter  = lambda v: globals().update(MAX_ORDER_SIZE=v)   # noqa: E731
+                env_key = "MAX_ORDER_SIZE"
+            elif param == "DAILY_LOSS_LIMIT":
+                current = DAILY_LOSS_LIMIT
+                max_v   = 1_000_000.0
+                min_v   = 0.0
+                setter  = lambda v: globals().update(DAILY_LOSS_LIMIT=v)   # noqa: E731
+                env_key = "DAILY_LOSS_LIMIT"
+            else:
+                # Deliberately NOT in the safelist:
+                #   STRATEGY  — changes the whole trading approach; needs a human
+                #   PAUSE     — halting the bot without an operator in the loop
+                #               is scary; at minimum they should see the alert
+                #   KELLY_FRACTION — not in the env vars we manage
+                continue
+            try:
+                val = float(suggested)
+            except (TypeError, ValueError):
+                continue
+            if not (min_v <= val <= max_v):
+                continue
+            if current <= 0:
+                continue
+            delta = abs(val - current) / current
+            if delta > AUTO_APPLY_MAX_DELTA:
+                self._log(f"[AUTO-APPLY] {param} change too large ({delta:.0%} > {AUTO_APPLY_MAX_DELTA:.0%}) — manual apply only")
+                continue
+            # Apply
+            prev_value = current
+            setter(val)
+            _write_env_update(env_key, str(val))
+            applied.append({"param": param, "previous": prev_value, "new": val, "index": idx})
+            self._log(f"[AUTO-APPLY] {param}: {prev_value} → {val}  (Δ={delta:.0%}, conf={confidence})")
+        # Record applied entries on the review row so the dashboard shows
+        # them as [applied] instead of offering an APPLY button.
+        if applied:
+            try:
+                now_iso = datetime.utcnow().isoformat()
+                existing = self.db.execute(
+                    "SELECT applied FROM strategy_reviews WHERE id=?",
+                    (review_id,),
+                ).fetchone()
+                existing_applied = (existing[0] or "") if existing else ""
+                entries = []
+                for a in applied:
+                    entries.append(_j.dumps({
+                        "index": a["index"], "at": now_iso, "auto": True,
+                        "change": {"param": a["param"], "previous": a["previous"], "new": a["new"]},
+                    }))
+                new_applied = (existing_applied + "\n" + "\n".join(entries)).strip() if existing_applied else "\n".join(entries)
+                with self.db:
+                    self.db.execute(
+                        "UPDATE strategy_reviews SET applied=? WHERE id=?",
+                        (new_applied, review_id),
+                    )
+            except Exception as e:
+                log.warning(f"_auto_apply_review_recs: audit log update failed: {e}")
+        return applied
+
     async def nightly_strategy_review(self) -> Optional[dict]:
         """Generate a one-sentence summary + recommendations from yesterday's
         trades. Writes to strategy_reviews table. Returns the review dict or
@@ -2759,24 +2852,44 @@ class PolymarketBot:
             if not isinstance(recs, list):
                 recs = []
 
+            confidence = int(decision.get("confidence", 50)) if isinstance(decision.get("confidence"), (int, float)) else 50
             now_iso = datetime.utcnow().isoformat()
             with self.db:
-                self.db.execute(
+                cur = self.db.execute(
                     "INSERT INTO strategy_reviews (review_date, period_start, "
                     "period_end, trades_count, pnl, win_rate, regime_summary, "
                     "summary, recommendations, applied, created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,0,?)",
+                    "VALUES (?,?,?,?,?,?,?,?,?,'',?)",
                     (now_iso[:10], since, cutoff_iso, trades_count, gross,
                      win_rate, regime_summary, summary, _j.dumps(recs), now_iso),
                 )
+                review_id = cur.lastrowid
             self._last_review_at = time.time()
-            self._log(f"[NIGHTLY REVIEW] {trades_count} trades, {len(recs)} recommendation(s): {summary[:120]}")
+            self._log(f"[NIGHTLY REVIEW] {trades_count} trades, {len(recs)} recommendation(s), conf={confidence}: {summary[:120]}")
+
+            # Auto-apply low-risk recommendations if enabled. Only applies
+            # recs that (a) target a safelisted param, (b) change the value
+            # by no more than AUTO_APPLY_MAX_DELTA (default 25%), (c) have
+            # review-level confidence ≥ AUTO_APPLY_MIN_CONF (default 70).
+            # Everything else still needs the operator's manual APPLY click.
+            auto_applied = self._auto_apply_review_recs(review_id, recs, confidence) if AUTO_APPLY_ENABLED else []
+
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                msg_tail = ""
+                if auto_applied:
+                    msg_tail = "\n\nAuto-applied:\n" + "\n".join(
+                        f"• {a['param']}: {a['previous']} → {a['new']}" for a in auto_applied
+                    )
                 await asyncio.to_thread(
                     self.send_telegram,
-                    f"📊 Nightly review ({trades_count} trades)\n{summary[:400]}"
+                    f"📊 Nightly review ({trades_count} trades)\n{summary[:400]}{msg_tail}"
                 )
-            return {"summary": summary, "recommendations": recs, "trades_count": trades_count}
+            return {
+                "summary":         summary,
+                "recommendations": recs,
+                "trades_count":    trades_count,
+                "auto_applied":    auto_applied,
+            }
         except Exception as e:
             log.warning(f"nightly_strategy_review error: {e}")
             return None
