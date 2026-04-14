@@ -1934,10 +1934,17 @@ class PolymarketBot:
                             cycle_cash -= amt
                             sig_record["traded"] = True
                         elif signal["strategy"] == "marketMaking":
-                            if signal.get("bid"):
-                                await self._execute_order(signal["token_id"], "BUY", amt, mkt_name, "limit", signal["bid"], amt)
-                            if signal.get("ask"):
-                                await self._execute_order(signal["token_id"], "SELL", amt, mkt_name, "limit", signal["ask"], amt)
+                            # For limit orders, `size` is share count (= amount_usdc / price),
+                            # not USDC. Passing amt as size would send a quote for `amt` shares
+                            # rather than `amt` USDC of shares.
+                            bid = signal.get("bid") or 0
+                            ask = signal.get("ask") or 0
+                            if bid and bid > 0:
+                                bid_size = round(amt / bid, 4)
+                                await self._execute_order(signal["token_id"], "BUY", amt, mkt_name, "limit", bid, bid_size)
+                            if ask and ask > 0:
+                                ask_size = round(amt / ask, 4)
+                                await self._execute_order(signal["token_id"], "SELL", amt, mkt_name, "limit", ask, ask_size)
                             cycle_cash -= amt
                             sig_record["traded"] = True
                         elif "BUY" in signal.get("signal", ""):
