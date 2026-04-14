@@ -92,6 +92,95 @@ except ImportError:
     _PAPER_AVAILABLE = False
 
 
+# ── Structured-output tool schemas (shared by the Claude call sites) ──────────
+# Using tool_use + tool_choice gives us API-enforced JSON output with the
+# exact shape we need — no markdown fences to strip, no truncated JSON to
+# fail-parse. Works with every anthropic SDK ≥ 0.25 so no package bump.
+# Numerical min/max constraints are intentionally omitted — they're not
+# enforced on non-strict schemas and the code clamps the values defensively.
+_TOOL_ANALYZE = {
+    "name": "submit_trade_decision",
+    "description": "Submit your BUY/SKIP decision for the given market.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action":      {"type": "string", "enum": ["BUY", "SKIP"]},
+            "side":        {"type": "string", "enum": ["YES", "NO"]},
+            "probability": {"type": "integer", "description": "0–100 integer percent"},
+            "confidence":  {"type": "integer", "description": "0–100 integer percent"},
+            "reasoning":   {"type": "string",  "description": "One sentence"},
+            "risk":        {"type": "string",  "enum": ["low", "medium", "high"]},
+        },
+        "required": ["action", "side", "probability", "confidence", "reasoning", "risk"],
+    },
+}
+_TOOL_REGIME = {
+    "name": "submit_regime",
+    "description": "Submit the current trading-regime assessment.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "regime":           {"type": "string", "enum": ["normal", "cautious", "hostile"]},
+            "kelly_multiplier": {"type": "number", "description": "0.0–1.0"},
+            "min_edge_add":     {"type": "number", "description": "0.0–0.20"},
+            "reasoning":        {"type": "string", "description": "One sentence"},
+        },
+        "required": ["regime", "kelly_multiplier", "min_edge_add", "reasoning"],
+    },
+}
+_TOOL_PRETRADE = {
+    "name": "submit_pretrade_verdict",
+    "description": "Submit a proceed/downsize/abort decision for the planned trade.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "proceed":         {"type": "boolean"},
+            "size_multiplier": {"type": "number", "description": "0.0–1.0; 0.0 means abort"},
+            "reason":          {"type": "string"},
+        },
+        "required": ["proceed", "size_multiplier", "reason"],
+    },
+}
+_TOOL_REVIEW = {
+    "name": "submit_strategy_review",
+    "description": "Submit the nightly strategy review and recommendations.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary":    {"type": "string"},
+            "confidence": {"type": "integer", "description": "0–100 integer percent"},
+            "recommendations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "param":     {"type": "string"},
+                        "current":   {"type": "string"},
+                        "suggested": {"type": "string"},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["param", "current", "suggested", "rationale"],
+                },
+            },
+        },
+        "required": ["summary", "confidence", "recommendations"],
+    },
+}
+
+
+def _extract_tool_input(msg, tool_name: str) -> Optional[dict]:
+    """Return the input dict from the first tool_use block matching
+    tool_name, or None if no such block is present. Used to pull the
+    structured output from a messages.create response."""
+    try:
+        for block in getattr(msg, "content", []) or []:
+            if getattr(block, "type", "") == "tool_use" and getattr(block, "name", "") == tool_name:
+                return dict(getattr(block, "input", {}) or {})
+    except Exception:
+        pass
+    return None
+
+
 class PolymarketBot:
     def __init__(self):
         self.client: Optional[ClobClient] = None
@@ -1608,6 +1697,8 @@ class PolymarketBot:
                     "cache_control": {"type": "ephemeral"},
                 }],
                 "messages": [{"role": "user", "content": user_prompt}],
+                "tools":       [_TOOL_ANALYZE],
+                "tool_choice": {"type": "tool", "name": _TOOL_ANALYZE["name"]},
             }
             if CLAUDE_ADAPTIVE_THINK and ("sonnet" in CLAUDE_MODEL or "opus" in CLAUDE_MODEL):
                 api_kwargs["thinking"] = {"type": "adaptive"}
@@ -1625,10 +1716,12 @@ class PolymarketBot:
                     max_tokens=500,
                     system=system_prompt,
                     messages=[{"role": "user", "content": user_prompt}],
+                    tools=[_TOOL_ANALYZE],
+                    tool_choice={"type": "tool", "name": _TOOL_ANALYZE["name"]},
                 )
 
             # Explicitly handle non-success stop reasons so they don't fall
-            # through to a confusing JSONDecodeError further down.
+            # through to a confusing parse failure further down.
             if msg.stop_reason == "refusal":
                 log.warning("Claude refused to analyze market: %s", question[:60])
                 return None
@@ -1636,20 +1729,25 @@ class PolymarketBot:
                 log.warning("Claude response truncated (max_tokens) for: %s", question[:60])
                 return None
 
+            # Primary path: the forced tool_use block contains the structured
+            # decision dict directly — no JSON parsing needed.
+            decision = _extract_tool_input(msg, _TOOL_ANALYZE["name"])
+            if decision is not None:
+                return decision
+
+            # Fallback: old text-then-markdown-strip parse, in case the model
+            # somehow emitted text instead of the tool call (shouldn't happen
+            # with tool_choice forced, but defensive).
             import json as _j
-            # Pick the first text block instead of indexing [0] — thinking/other
-            # block types would otherwise crash .text access.
             text = next((b.text for b in msg.content if getattr(b, "type", "") == "text"), "").strip()
             if not text:
                 return None
-            # Defensive strip of markdown fences in case the model ignores the "no fences" rule.
             if "```" in text:
                 text = text.split("```")[1]
                 if text.startswith("json"):
                     text = text[4:]
                 text = text.strip()
-            decision = _j.loads(text)
-            return decision
+            return _j.loads(text)
         except Exception as e:
             log.warning(f"Claude analysis error: {e}")
             return None
@@ -1730,13 +1828,7 @@ class PolymarketBot:
                 "momentum/econFlow trading for the cycle), min_edge_add "
                 "0.10.\n"
                 "\n"
-                "Respond with JSON only (no fences):\n"
-                "{\n"
-                '  "regime": "normal" | "cautious" | "hostile",\n'
-                '  "kelly_multiplier": <float 0.0-1.0>,\n'
-                '  "min_edge_add": <float 0.0-0.20>,\n'
-                '  "reasoning": "<one sentence>"\n'
-                "}"
+                "Submit your verdict via the submit_regime tool."
             )
 
             msg = await asyncio.to_thread(
@@ -1745,22 +1837,27 @@ class PolymarketBot:
                 max_tokens=400,
                 system=system,
                 messages=[{"role": "user", "content": ctx}],
+                tools=[_TOOL_REGIME],
+                tool_choice={"type": "tool", "name": _TOOL_REGIME["name"]},
             )
             # Handle non-success stop_reasons explicitly — avoids a confusing
-            # json.loads failure downstream and keeps the last good cache.
+            # parse failure downstream and keeps the last good cache.
             if getattr(msg, "stop_reason", None) in ("refusal", "max_tokens"):
                 log.warning(f"assess_market_regime stop_reason={msg.stop_reason} — keeping previous regime")
                 return self._regime_cache
-            text = next((b.text for b in msg.content if getattr(b, "type", "") == "text"), "").strip()
-            if not text:
-                return self._regime_cache
-            if "```" in text:
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-                text = text.strip()
-            import json as _j
-            decision = _j.loads(text)
+            decision = _extract_tool_input(msg, _TOOL_REGIME["name"])
+            if decision is None:
+                # Fallback to text parse on the off-chance tool_use isn't emitted
+                text = next((b.text for b in msg.content if getattr(b, "type", "") == "text"), "").strip()
+                if not text:
+                    return self._regime_cache
+                if "```" in text:
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                    text = text.strip()
+                import json as _j
+                decision = _j.loads(text)
             regime = str(decision.get("regime", "normal")).lower()
             if regime not in ("normal", "cautious", "hostile"):
                 regime = "normal"
@@ -1877,16 +1974,10 @@ class PolymarketBot:
                 "materially in the adverse direction. Lean toward proceeding "
                 "— do not second-guess the analysis step on general concerns.\n"
                 "\n"
-                "Respond with JSON only (no fences):\n"
-                "{\n"
-                '  "proceed": true|false,\n'
-                '  "size_multiplier": <float 0.0-1.0>,\n'
-                '  "reason": "<one short sentence>"\n'
-                "}\n"
-                "\n"
-                'If proceed=false, size_multiplier must be 0.0. If adverse '
-                'but not fatal, proceed=true with size_multiplier=0.5. Full '
-                'size_multiplier=1.0 is the default.'
+                "Submit your verdict via the submit_pretrade_verdict tool. "
+                "If proceed=false, size_multiplier must be 0.0. If adverse "
+                "but not fatal, proceed=true with size_multiplier=0.5. Full "
+                "size_multiplier=1.0 is the default."
             )
 
             msg = await asyncio.wait_for(
@@ -1896,17 +1987,22 @@ class PolymarketBot:
                     max_tokens=250,
                     system=system,
                     messages=[{"role": "user", "content": ctx}],
+                    tools=[_TOOL_PRETRADE],
+                    tool_choice={"type": "tool", "name": _TOOL_PRETRADE["name"]},
                 ),
                 timeout=PRETRADE_TIMEOUT_S,
             )
-            text = next((b.text for b in msg.content if getattr(b, "type", "") == "text"), "").strip()
-            if "```" in text:
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-                text = text.strip()
-            import json as _j
-            d = _j.loads(text)
+            d = _extract_tool_input(msg, _TOOL_PRETRADE["name"])
+            if d is None:
+                # Fallback — unlikely with forced tool_choice
+                text = next((b.text for b in msg.content if getattr(b, "type", "") == "text"), "").strip()
+                if "```" in text:
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                    text = text.strip()
+                import json as _j
+                d = _j.loads(text) if text else {}
             proceed = bool(d.get("proceed", True))
             mult = float(d.get("size_multiplier", 1.0))
             mult = max(0.0, min(1.0, mult))
@@ -2014,32 +2110,23 @@ class PolymarketBot:
                 "under ~20 trades, default to 'keep current params, need more "
                 "data'.\n"
                 "\n"
-                "Respond with JSON only:\n"
-                "{\n"
-                '  "summary": "<2-3 sentences: what happened, what worked, what didn\'t>",\n'
-                '  "recommendations": [\n'
-                "    {\n"
-                '      "param": "MAX_ORDER_SIZE" | "DAILY_LOSS_LIMIT" | "KELLY_FRACTION" | "STRATEGY" | "PAUSE",\n'
-                '      "current": "<current value>",\n'
-                '      "suggested": "<new value or N/A>",\n'
-                '      "rationale": "<one sentence>"\n'
-                "    }\n"
-                "  ],\n"
-                '  "confidence": <integer 0-100>\n'
-                "}\n"
-                "\n"
-                "At most 4 recommendations. If nothing should change, return "
-                "an empty recommendations array and say so in the summary."
+                "Submit your review via the submit_strategy_review tool. At "
+                "most 4 recommendations. Valid params for 'param' field: "
+                "MAX_ORDER_SIZE, DAILY_LOSS_LIMIT, KELLY_FRACTION, STRATEGY, "
+                "PAUSE. If nothing should change, return an empty "
+                "recommendations array and say so in the summary."
             )
 
             # Nightly review benefits from real reasoning over yesterday's
             # trades, so enable adaptive thinking on capable models. Bump
-            # max_tokens to leave room for thinking + JSON.
+            # max_tokens to leave room for thinking + structured output.
             review_kwargs = {
                 "model": CLAUDE_MODEL,
                 "max_tokens": 3000,
                 "system": system,
                 "messages": [{"role": "user", "content": ctx}],
+                "tools": [_TOOL_REVIEW],
+                "tool_choice": {"type": "tool", "name": _TOOL_REVIEW["name"]},
             }
             if CLAUDE_ADAPTIVE_THINK and ("sonnet" in CLAUDE_MODEL or "opus" in CLAUDE_MODEL):
                 review_kwargs["thinking"] = {"type": "adaptive"}
@@ -2053,6 +2140,8 @@ class PolymarketBot:
                     max_tokens=1500,
                     system=system,
                     messages=[{"role": "user", "content": ctx}],
+                    tools=[_TOOL_REVIEW],
+                    tool_choice={"type": "tool", "name": _TOOL_REVIEW["name"]},
                 )
             if msg.stop_reason == "refusal":
                 log.warning("[NIGHTLY REVIEW] Claude refused")
@@ -2060,17 +2149,20 @@ class PolymarketBot:
             if msg.stop_reason == "max_tokens":
                 log.warning("[NIGHTLY REVIEW] Claude response truncated (max_tokens) — skipping")
                 return None
-            text = next((b.text for b in msg.content if getattr(b, "type", "") == "text"), "").strip()
-            if not text:
-                log.warning("[NIGHTLY REVIEW] empty response")
-                return None
-            if "```" in text:
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-                text = text.strip()
-            import json as _j
-            decision = _j.loads(text)
+            decision = _extract_tool_input(msg, _TOOL_REVIEW["name"])
+            if decision is None:
+                # Fallback for unexpected non-tool-call responses
+                text = next((b.text for b in msg.content if getattr(b, "type", "") == "text"), "").strip()
+                if not text:
+                    log.warning("[NIGHTLY REVIEW] empty response")
+                    return None
+                if "```" in text:
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                    text = text.strip()
+                import json as _j
+                decision = _j.loads(text)
             summary = str(decision.get("summary", ""))[:2000]
             recs    = decision.get("recommendations", []) or []
             if not isinstance(recs, list):
