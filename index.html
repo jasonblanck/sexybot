@@ -727,7 +727,10 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 </div>
 <div class="kill-bar">
   <div style="font-family:'DM Mono',monospace;font-size:11px;color:#555">SEXYBOT · <span id="kill-status">bot running</span></div>
-  <button onclick="document.getElementById('kill-overlay').style.display='flex'" style="background:#ff335515;border:1px solid #ff335560;color:#ff3355;padding:6px 20px;border-radius:3px;font-family:'DM Mono',monospace;font-size:11px;font-weight:700;letter-spacing:2px;cursor:pointer;">☠ KILL</button>
+  <div style="display:flex;gap:8px;">
+    <button id="start-btn" onclick="startBot()" style="background:#00cc8815;border:1px solid #00cc8860;color:#00cc88;padding:6px 20px;border-radius:3px;font-family:'DM Mono',monospace;font-size:11px;font-weight:700;letter-spacing:2px;cursor:pointer;">▶ START</button>
+    <button onclick="document.getElementById('kill-overlay').style.display='flex'" style="background:#ff335515;border:1px solid #ff335560;color:#ff3355;padding:6px 20px;border-radius:3px;font-family:'DM Mono',monospace;font-size:11px;font-weight:700;letter-spacing:2px;cursor:pointer;">☠ KILL</button>
+  </div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
@@ -1247,6 +1250,39 @@ async function confirmKill(){
   document.getElementById('kill-status').textContent='bot stopped';
   document.getElementById('sdot').className='dot off';
   document.getElementById('stext').textContent='stopped';
+}
+
+/* ══════════════════════════════════════════════════════
+   START (paired with KILL — recovers from "stopped" state
+   without requiring SSH. /start retries bot.connect() if
+   the startup connect failed, so this also rescues the
+   bot from a failed lifespan initialization.)
+══════════════════════════════════════════════════════ */
+async function startBot(){
+  const key=sessionStorage.getItem('sb_key')||prompt('Enter API key to start the bot:','')||'';
+  if(!key){
+    document.getElementById('kill-status').textContent='start cancelled — API key required';
+    return;
+  }
+  sessionStorage.setItem('sb_key',key);
+  document.getElementById('kill-status').textContent='starting…';
+  try{
+    const r=await fetch(`${BOT}/start`,{method:'POST',headers:{'X-API-Key':key}});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){
+      document.getElementById('kill-status').textContent=`start failed (HTTP ${r.status})${d.detail?': '+d.detail:''}`;
+      return;
+    }
+    if(d.ok===false && d.message){
+      document.getElementById('kill-status').textContent=d.message.toLowerCase();
+      return;
+    }
+    document.getElementById('kill-status').textContent='bot started';
+    document.getElementById('sdot').className='dot on';
+    document.getElementById('stext').textContent='live';
+  }catch(e){
+    document.getElementById('kill-status').textContent='start failed — bot unreachable';
+  }
 }
 
 /* ══════════════════════════════════════════════════════
