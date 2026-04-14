@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>SEXYBOT // ACCESS TERMINAL</title>
+<style>
+/* ─────────────────────────────────────────────────────────────
+   Retro Bloomberg terminal × The Matrix
+   Amber on black, monospace, scanlines, digital rain
+   ───────────────────────────────────────────────────────────── */
+:root{
+  --amber:#ffb000;       /* Bloomberg amber */
+  --amber-dim:#b37a00;
+  --green:#00ff41;       /* Matrix green */
+  --green-dim:#00a82b;
+  --bg:#000;
+  --red:#ff3355;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;background:var(--bg);color:var(--amber);font-family:'Courier New','Consolas',monospace;overflow:hidden;}
+
+/* Matrix digital rain canvas — full screen behind everything */
+#rain{position:fixed;inset:0;z-index:0;opacity:0.35;}
+
+/* Scanline overlay */
+body::before{
+  content:"";
+  position:fixed;inset:0;
+  background:repeating-linear-gradient(0deg,rgba(0,0,0,0) 0px,rgba(0,0,0,0) 2px,rgba(255,176,0,0.04) 2px,rgba(255,176,0,0.04) 3px);
+  pointer-events:none;z-index:10;
+}
+/* Slight CRT vignette */
+body::after{
+  content:"";
+  position:fixed;inset:0;
+  background:radial-gradient(ellipse at center,rgba(0,0,0,0) 0%,rgba(0,0,0,0.55) 100%);
+  pointer-events:none;z-index:11;
+}
+
+.wrap{
+  position:relative;z-index:20;
+  height:100%;display:flex;flex-direction:column;
+}
+
+/* Top status bar — Bloomberg-style */
+.topbar{
+  border-bottom:1px solid var(--amber-dim);
+  padding:6px 14px;
+  display:flex;justify-content:space-between;align-items:center;
+  font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--amber-dim);
+  background:rgba(0,0,0,0.7);
+}
+.topbar .brand{color:var(--amber);font-weight:700;letter-spacing:3px;}
+.topbar .blip{display:inline-block;width:8px;height:8px;background:var(--green);border-radius:50%;margin-right:6px;vertical-align:middle;animation:blip 1.5s infinite;box-shadow:0 0 6px var(--green);}
+@keyframes blip{0%,100%{opacity:1}50%{opacity:0.3}}
+
+/* Bottom status ribbon */
+.botbar{
+  border-top:1px solid var(--amber-dim);
+  padding:6px 14px;
+  display:flex;justify-content:space-between;align-items:center;
+  font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--amber-dim);
+  background:rgba(0,0,0,0.7);
+}
+
+/* Center panel */
+main{
+  flex:1;display:flex;align-items:center;justify-content:center;padding:24px;
+}
+.panel{
+  width:460px;max-width:100%;
+  background:rgba(0,0,0,0.82);
+  border:1px solid var(--amber);
+  box-shadow:0 0 0 1px rgba(255,176,0,0.15),0 0 40px rgba(255,176,0,0.18) inset,0 0 60px rgba(0,0,0,0.6);
+  padding:0;
+  position:relative;
+}
+/* Panel title bar */
+.panel .title{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:8px 14px;
+  border-bottom:1px solid var(--amber-dim);
+  font-size:11px;letter-spacing:2.5px;text-transform:uppercase;
+}
+.panel .title .tag{color:var(--amber);font-weight:700;}
+.panel .title .dots{color:var(--amber-dim);letter-spacing:3px;}
+.panel .body{padding:28px 24px 24px;}
+
+.header-art{
+  text-align:center;
+  color:var(--amber);
+  font-size:10px;line-height:1.1;letter-spacing:1px;
+  margin-bottom:16px;
+  white-space:pre;
+}
+.header-art .green{color:var(--green);text-shadow:0 0 4px var(--green);}
+
+h1{
+  font-size:15px;font-weight:700;letter-spacing:4px;text-align:center;
+  color:var(--amber);margin-bottom:6px;
+}
+.sub{
+  font-size:10px;letter-spacing:2px;text-align:center;
+  color:var(--amber-dim);margin-bottom:22px;text-transform:uppercase;
+}
+
+/* Prompt block — mimics a terminal command line */
+.prompt{
+  display:flex;align-items:center;gap:8px;
+  border:1px solid var(--amber-dim);
+  padding:10px 12px;
+  background:rgba(255,176,0,0.03);
+  margin-bottom:14px;
+}
+.prompt .ps{color:var(--green);font-weight:700;text-shadow:0 0 4px var(--green);}
+.prompt input{
+  flex:1;background:transparent;border:none;outline:none;
+  color:var(--amber);font-family:inherit;font-size:14px;letter-spacing:2px;
+  caret-color:var(--amber);
+}
+.prompt .caret{
+  display:inline-block;width:8px;height:14px;background:var(--amber);
+  animation:caret 1s step-end infinite;
+}
+@keyframes caret{50%{opacity:0}}
+
+button{
+  width:100%;
+  padding:11px 16px;
+  background:transparent;
+  color:var(--amber);
+  border:1px solid var(--amber);
+  font-family:inherit;font-size:12px;letter-spacing:3px;font-weight:700;text-transform:uppercase;
+  cursor:pointer;
+  transition:all 0.15s ease;
+}
+button:hover:not(:disabled){
+  background:var(--amber);color:#000;
+  box-shadow:0 0 16px rgba(255,176,0,0.5);
+}
+button:disabled{opacity:0.4;cursor:not-allowed;}
+
+.status{
+  margin-top:16px;
+  font-size:11px;letter-spacing:1.5px;
+  min-height:16px;
+  text-align:center;
+}
+.status.ok  {color:var(--green);text-shadow:0 0 4px var(--green);}
+.status.err {color:var(--red);text-shadow:0 0 4px var(--red);}
+.status.info{color:var(--amber-dim);}
+
+/* Flicker on submit */
+@keyframes flicker{0%,100%{opacity:1}2%{opacity:0.3}4%{opacity:1}6%{opacity:0.5}8%{opacity:1}}
+.flicker{animation:flicker 0.8s ease;}
+
+/* Ticker at the bottom, fake market data for atmosphere */
+.ticker{
+  overflow:hidden;white-space:nowrap;
+  border-top:1px dashed var(--amber-dim);
+  padding:4px 0;
+  font-size:10px;color:var(--amber-dim);letter-spacing:1px;
+}
+.ticker-track{display:inline-block;animation:tick 40s linear infinite;}
+@keyframes tick{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+
+@media (max-width:500px){
+  .panel{width:100%;}
+  .topbar,.botbar{font-size:9px;padding:5px 8px;}
+  h1{font-size:13px;}
+  .header-art{font-size:8px;}
+}
+</style>
+</head>
+<body>
+<canvas id="rain"></canvas>
+
+<div class="wrap">
+  <div class="topbar">
+    <div><span class="blip"></span><span class="brand">SEXYBOT</span> · TERMINAL v4.6</div>
+    <div id="topclock">—</div>
+  </div>
+
+  <main>
+    <div class="panel" id="panel">
+      <div class="title">
+        <span class="tag">&gt; AUTH // ACCESS CONTROL</span>
+        <span class="dots">· · ·</span>
+      </div>
+      <div class="body">
+<div class="header-art">  ____ _______  ___   __ ___   ___ _____
+ / __// __/\ \/ \ \ / // _ ) / _ /_  _/
+_\ \ / _/  \  / \ V // _ \ / (_)/  /
+/___//___/  /_/   |_|/____/ \___/__/</div>
+        <h1>ACCESS TERMINAL</h1>
+        <div class="sub">authorization required · no trace logged</div>
+
+        <form id="loginForm" autocomplete="off">
+          <div class="prompt">
+            <span class="ps">$</span>
+            <input type="password" id="pw" name="password" placeholder="enter access code" autofocus spellcheck="false">
+            <span class="caret"></span>
+          </div>
+          <button type="submit" id="submitBtn">[ AUTHENTICATE ]</button>
+        </form>
+
+        <div id="status" class="status info">awaiting input…</div>
+      </div>
+    </div>
+  </main>
+
+  <div class="botbar">
+    <div><span id="conn">◉</span> LINK 159.65.201.165 · POLYGON MAINNET · CLOB 200 OK</div>
+    <div>RND: <span id="rnd">—</span></div>
+  </div>
+  <div class="ticker">
+    <div class="ticker-track" id="tickerTrack">
+      SEXYBOT · ESTD 2026 · POLYMARKET CLOB · BTC 114,382 +1.24% · ETH 3,891 −0.61% · SPY 582.41 +0.08% · NASDAQ 18,291 +0.42% · DXY 103.7 −0.12% · UST10Y 4.28% · VIX 14.1 · GOLD 2,738 · WTI 73.19 · FED 4.75% · NO UNAUTHORIZED ACCESS · SEXYBOT · ESTD 2026 · POLYMARKET CLOB · BTC 114,382 +1.24% · ETH 3,891 −0.61% · SPY 582.41 +0.08% · NASDAQ 18,291 +0.42% · DXY 103.7 −0.12% · UST10Y 4.28% · VIX 14.1 · GOLD 2,738 · WTI 73.19 · FED 4.75% · NO UNAUTHORIZED ACCESS ·
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── Matrix digital rain ─────────────────────────────────────────
+(function(){
+  const canvas = document.getElementById('rain');
+  const ctx = canvas.getContext('2d');
+  let cols, drops;
+  const chars = 'ｦｱｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜ0123456789';
+  function sizeCanvas(){
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    cols  = Math.floor(canvas.width / 14);
+    drops = new Array(cols).fill(0).map(()=>Math.random() * canvas.height);
+  }
+  window.addEventListener('resize', sizeCanvas);
+  sizeCanvas();
+  function frame(){
+    ctx.fillStyle = 'rgba(0,0,0,0.06)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.font = '14px monospace';
+    for (let i=0; i<cols; i++){
+      const ch = chars[Math.floor(Math.random() * chars.length)];
+      const x = i * 14;
+      const y = drops[i];
+      // head glow
+      ctx.fillStyle = '#9cff9c';
+      ctx.fillText(ch, x, y);
+      // trail colour
+      ctx.fillStyle = '#00ff41';
+      ctx.fillText(ch, x, y - 14);
+      drops[i] = (y > canvas.height + Math.random() * 200) ? 0 : y + 14;
+    }
+    requestAnimationFrame(frame);
+  }
+  frame();
+})();
+
+// ─── Top-right clock (UTC) ───────────────────────────────────────
+function pad(n){return String(n).padStart(2,'0');}
+function updateClock(){
+  const d = new Date();
+  document.getElementById('topclock').textContent =
+    pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+':'+pad(d.getUTCSeconds())+' UTC · '+
+    d.toISOString().slice(0,10);
+}
+setInterval(updateClock, 1000); updateClock();
+
+// ─── Fake session ID for atmosphere ──────────────────────────────
+document.getElementById('rnd').textContent =
+  Array.from({length:8},()=>'0123456789ABCDEF'[Math.floor(Math.random()*16)]).join('');
+
+// ─── Login flow ──────────────────────────────────────────────────
+const form   = document.getElementById('loginForm');
+const btn    = document.getElementById('submitBtn');
+const pwIn   = document.getElementById('pw');
+const status = document.getElementById('status');
+const panel  = document.getElementById('panel');
+
+function setStatus(msg, cls){
+  status.textContent = msg;
+  status.className = 'status ' + (cls || 'info');
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const pw = pwIn.value;
+  if (!pw){
+    setStatus('[ error ] access code required', 'err');
+    return;
+  }
+  btn.disabled = true;
+  panel.classList.add('flicker');
+  setStatus('> authenticating…', 'info');
+  try {
+    const r = await fetch('/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({password: pw}),
+      credentials: 'same-origin'
+    });
+    if (r.ok) {
+      setStatus('[ ok ] access granted · routing to terminal…', 'ok');
+      setTimeout(() => { window.location.href = '/'; }, 650);
+    } else if (r.status === 401) {
+      setStatus('[ denied ] invalid access code', 'err');
+      pwIn.value = ''; pwIn.focus();
+      btn.disabled = false;
+    } else {
+      setStatus('[ error ] auth service HTTP ' + r.status, 'err');
+      btn.disabled = false;
+    }
+  } catch (err) {
+    setStatus('[ error ] auth service unreachable', 'err');
+    btn.disabled = false;
+  } finally {
+    setTimeout(()=>panel.classList.remove('flicker'), 800);
+  }
+});
+
+// If user already has a valid session, redirect straight to /
+(async () => {
+  try {
+    const r = await fetch('/auth/check', {credentials:'same-origin'});
+    if (r.ok) window.location.href = '/';
+  } catch (e) { /* ignore — stay on login */ }
+})();
+</script>
+</body>
+</html>
