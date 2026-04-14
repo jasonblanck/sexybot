@@ -76,6 +76,14 @@ CLAUDE_FAST_MODEL      = os.getenv("CLAUDE_FAST_MODEL", "claude-haiku-4-5")
 CLAUDE_ADAPTIVE_THINK  = os.getenv("CLAUDE_ADAPTIVE_THINK", "true").lower() == "true"
 REGIME_DETECTOR_ENABLED = os.getenv("REGIME_DETECTOR", "true").lower() == "true"
 NIGHTLY_REVIEW_ENABLED  = os.getenv("NIGHTLY_REVIEW",  "true").lower() == "true"
+# Pre-trade Claude sanity check: right before a real order places, ask Haiku
+# if conditions still support the trade. Catches signals firing into
+# breaking-news reversals. Skipped below PRETRADE_MIN_USD to keep cost and
+# latency off of tiny trades. Fails open (proceeds at full size) on any
+# error or timeout — never blocks a legitimate trade on infra issues.
+PRETRADE_CHECK_ENABLED = os.getenv("PRETRADE_CHECK", "true").lower() == "true"
+PRETRADE_MIN_USD       = float(os.getenv("PRETRADE_MIN_USD", "3.0"))
+PRETRADE_TIMEOUT_S     = float(os.getenv("PRETRADE_TIMEOUT_S", "4.0"))
 
 try:
     from paper import PolymarketPaperHandler, paper_resolution_oracle as _paper_oracle
@@ -1662,6 +1670,106 @@ class PolymarketBot:
             log.warning(f"assess_market_regime error: {e}")
             return self._regime_cache   # return last good value; never block trading on Claude outage
 
+    # ── Pre-trade sanity check (Claude Max) ────────────────────────────────
+    # Fast Haiku call right before a real order. Reads the current OBI + spread
+    # + any news hint and decides: proceed / scale-down / abort. Catches the
+    # "momentum signal fires into reversal" failure. Fails open (proceeds at
+    # full size) on any error/timeout — infra problems never block trading.
+    async def pretrade_check(
+        self,
+        *,
+        market_question: str,
+        our_side: str,        # "YES" or "NO" — the side we're about to buy
+        amount_usdc: float,
+        entry_price: float,
+        orderbook: Optional[dict] = None,
+        ai_reasoning: str = "",
+    ) -> dict:
+        """Returns {"proceed": bool, "size_multiplier": float (0.0-1.0),
+        "reason": str}. Default when disabled or below threshold: proceed at
+        full size."""
+        default_ok = {"proceed": True, "size_multiplier": 1.0, "reason": "check skipped"}
+        if not PRETRADE_CHECK_ENABLED or not ANTHROPIC_API_KEY:
+            return default_ok
+        if amount_usdc < PRETRADE_MIN_USD:
+            return {"proceed": True, "size_multiplier": 1.0,
+                    "reason": f"below ${PRETRADE_MIN_USD:.2f} threshold"}
+        try:
+            import anthropic
+            if self._anthropic_client is None:
+                self._anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            client = self._anthropic_client
+
+            ob = orderbook or {}
+            best_bid = ob.get("best_bid")
+            best_ask = ob.get("best_ask")
+            spread   = ob.get("spread")
+            liquid   = ob.get("liquid")
+            obi      = ob.get("obi", 0)
+
+            ctx = (
+                f"MARKET: {market_question[:180]}\n"
+                f"PLANNED TRADE: BUY {our_side}  ${amount_usdc:.2f}  @ {entry_price:.3f}\n"
+                f"ORDER BOOK NOW: bid={best_bid} ask={best_ask} spread={spread} "
+                f"liquid={liquid} obi={obi} (>0 = YES-side pressure)\n"
+                + (f"PRIOR AI REASONING: {ai_reasoning[:400]}\n" if ai_reasoning else "")
+            )
+
+            system = (
+                "You are the last-mile risk gate for a Polymarket trading bot. "
+                "An analysis step already approved this trade; your job is a "
+                "2-second sanity read on the *current* book. Only ABORT or "
+                "DOWNSIZE if you see concrete evidence of adverse conditions: "
+                "the order book has flipped strongly against the side since "
+                "the signal fired (|OBI| > 0.4 against us), the spread has "
+                "widened to an unusable level, or the entry price has moved "
+                "materially in the adverse direction. Lean toward proceeding "
+                "— do not second-guess the analysis step on general concerns.\n"
+                "\n"
+                "Respond with JSON only (no fences):\n"
+                "{\n"
+                '  "proceed": true|false,\n'
+                '  "size_multiplier": <float 0.0-1.0>,\n'
+                '  "reason": "<one short sentence>"\n'
+                "}\n"
+                "\n"
+                'If proceed=false, size_multiplier must be 0.0. If adverse '
+                'but not fatal, proceed=true with size_multiplier=0.5. Full '
+                'size_multiplier=1.0 is the default.'
+            )
+
+            msg = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.messages.create,
+                    model=CLAUDE_FAST_MODEL,
+                    max_tokens=250,
+                    system=system,
+                    messages=[{"role": "user", "content": ctx}],
+                ),
+                timeout=PRETRADE_TIMEOUT_S,
+            )
+            text = next((b.text for b in msg.content if getattr(b, "type", "") == "text"), "").strip()
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+            import json as _j
+            d = _j.loads(text)
+            proceed = bool(d.get("proceed", True))
+            mult = float(d.get("size_multiplier", 1.0))
+            mult = max(0.0, min(1.0, mult))
+            if not proceed:
+                mult = 0.0
+            reason = str(d.get("reason", ""))[:200]
+            return {"proceed": proceed, "size_multiplier": mult, "reason": reason}
+        except asyncio.TimeoutError:
+            log.debug("pretrade_check timeout — proceeding at full size")
+            return {"proceed": True, "size_multiplier": 1.0, "reason": "check timeout (fail-open)"}
+        except Exception as e:
+            log.debug(f"pretrade_check error ({e}) — proceeding at full size")
+            return {"proceed": True, "size_multiplier": 1.0, "reason": "check failed (fail-open)"}
+
     # ── Nightly strategy review (Claude Max) ───────────────────────────────
     # Once per 24h, feed Claude the day's trades, Brier calibration, regime
     # log, and current parameters. Claude writes a review to the DB with
@@ -2423,6 +2531,38 @@ class PolymarketBot:
                             cycle_cash -= amt
                             sig_record["traded"] = True
                         elif "BUY" in signal.get("signal", ""):
+                            # Pre-trade sanity check — fast Haiku read of the
+                            # current book + news. Scales or aborts if
+                            # conditions have shifted against the signal since
+                            # it fired. Fails open, so infra issues never
+                            # block a legitimate trade.
+                            our_side = "YES" if "YES" in signal.get("signal", "") else "NO"
+                            pre = await self.pretrade_check(
+                                market_question = mkt_name,
+                                our_side        = our_side,
+                                amount_usdc     = amt,
+                                entry_price     = entry_price,
+                                orderbook       = ob_data,
+                                ai_reasoning    = signal.get("ai_reasoning", ""),
+                            )
+                            if not pre["proceed"]:
+                                self._log(
+                                    f"🛑 PRE-TRADE ABORT | {mkt_name[:40]} — {pre['reason']}",
+                                    "warning",
+                                )
+                                sig_record["skip_reason"] = f"pretrade: {pre['reason']}"
+                                continue
+                            size_mult = pre.get("size_multiplier", 1.0)
+                            if size_mult < 1.0:
+                                adj_amt = round(amt * size_mult, 2)
+                                self._log(
+                                    f"🟠 PRE-TRADE DOWNSIZE | {mkt_name[:40]}  "
+                                    f"${amt:.2f} → ${adj_amt:.2f}  —  {pre['reason']}"
+                                )
+                                amt = adj_amt
+                                if amt < 1.0:
+                                    sig_record["skip_reason"] = f"pretrade downsized below $1: {pre['reason']}"
+                                    continue
                             result = await self._execute_order(signal["token_id"], "BUY", amt, mkt_name)
                             cycle_cash -= amt
                             if result and result.get("status") not in ("error", None):
@@ -3235,6 +3375,132 @@ async def trigger_regime_assessment():
     """Force a regime re-assessment (bypasses the 10-minute cache)."""
     result = await bot.assess_market_regime(force=True)
     return JSONResponse(result)
+
+
+@app.post("/reviews/{review_id}/apply", dependencies=[Depends(require_api_key)])
+async def apply_review_recommendation(review_id: int, body: dict):
+    """Apply a single recommendation from a nightly review.
+    Body: {"index": <int>} — 0-based index into the review's recommendations.
+    Supported params: MAX_ORDER_SIZE, DAILY_LOSS_LIMIT, STRATEGY, PAUSE.
+    Records the change on the review row (applied=timestamp:index) and
+    mirrors the existing /settings .env-rewrite logic, so rolling back
+    means editing .env or applying a compensating review."""
+    global MAX_ORDER_SIZE, DAILY_LOSS_LIMIT, STRATEGY
+    idx = int(body.get("index", -1))
+    if idx < 0:
+        raise HTTPException(status_code=400, detail="body.index (0-based) required")
+
+    import json as _j
+    row = bot.db.execute(
+        "SELECT recommendations, applied FROM strategy_reviews WHERE id=?",
+        (review_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"review {review_id} not found")
+    try:
+        recs = _j.loads(row[0]) if row[0] else []
+    except Exception:
+        raise HTTPException(status_code=500, detail="stored recommendations unparseable")
+    if idx >= len(recs):
+        raise HTTPException(status_code=400, detail=f"index {idx} out of range (0..{len(recs)-1})")
+    rec = recs[idx]
+    param = str(rec.get("param", "")).upper()
+    suggested = rec.get("suggested")
+    prev_value = None
+    applied_change = None
+
+    if param == "MAX_ORDER_SIZE":
+        try:
+            val = float(suggested)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"non-numeric suggested value: {suggested!r}")
+        if not (0.1 <= val <= 10_000):
+            raise HTTPException(status_code=400, detail="MAX_ORDER_SIZE must be 0.1–10000")
+        prev_value = MAX_ORDER_SIZE
+        MAX_ORDER_SIZE = val
+        applied_change = {"param": "MAX_ORDER_SIZE", "previous": prev_value, "new": val}
+        _write_env_update("MAX_ORDER_SIZE", str(val))
+    elif param == "DAILY_LOSS_LIMIT":
+        try:
+            val = float(suggested)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"non-numeric suggested value: {suggested!r}")
+        if not (0 <= val <= 1_000_000):
+            raise HTTPException(status_code=400, detail="DAILY_LOSS_LIMIT must be 0–1000000")
+        prev_value = DAILY_LOSS_LIMIT
+        DAILY_LOSS_LIMIT = val
+        applied_change = {"param": "DAILY_LOSS_LIMIT", "previous": prev_value, "new": val}
+        _write_env_update("DAILY_LOSS_LIMIT", str(val))
+    elif param == "STRATEGY":
+        val = str(suggested)
+        _valid = ("momentum", "value", "both", "volumeSpike", "newsEdge", "econFlow", "meanReversion", "arbitrage", "marketMaking")
+        if val not in _valid:
+            raise HTTPException(status_code=400, detail=f"strategy must be one of: {', '.join(_valid)}")
+        prev_value = STRATEGY
+        STRATEGY = val
+        applied_change = {"param": "STRATEGY", "previous": prev_value, "new": val}
+        _write_env_update("STRATEGY", val)
+    elif param == "PAUSE":
+        # PAUSE = stop trading without touching other config. Operator
+        # restarts manually via /start once they've investigated.
+        was_running = bot.running
+        bot.stop()
+        applied_change = {"param": "PAUSE", "previous": was_running, "new": False}
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"param {param!r} not applyable (supported: MAX_ORDER_SIZE, DAILY_LOSS_LIMIT, STRATEGY, PAUSE)",
+        )
+
+    # Mark this recommendation as applied on the review row. Record the
+    # specific index + timestamp + previous value so apply-history is auditable.
+    try:
+        import json as _j2
+        now_iso = datetime.utcnow().isoformat()
+        existing_applied = row[1] or ""
+        entry = _j2.dumps({
+            "index": idx, "at": now_iso,
+            "change": applied_change,
+        })
+        new_applied = (existing_applied + "\n" + entry).strip() if existing_applied else entry
+        with bot.db:
+            bot.db.execute(
+                "UPDATE strategy_reviews SET applied=? WHERE id=?",
+                (new_applied, review_id),
+            )
+    except Exception as e:
+        log.warning(f"apply_review_recommendation: applied-log update failed: {e}")
+
+    log.info(f"[REVIEW APPLY] review={review_id} idx={idx} {applied_change}")
+    return JSONResponse({"ok": True, "applied": applied_change})
+
+
+def _write_env_update(key: str, value: str) -> None:
+    """Rewrite a single key in .env, adding it if missing. Mirrors the
+    logic in /settings POST so applied review changes persist across
+    restarts the same way."""
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    try:
+        with open(env_path, "r") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+    new_lines = []
+    written = False
+    for line in lines:
+        k = line.split("=", 1)[0].strip()
+        if k == key:
+            new_lines.append(f"{key}={value}\n")
+            written = True
+        else:
+            new_lines.append(line)
+    if not written:
+        new_lines.append(f"{key}={value}\n")
+    try:
+        with open(env_path, "w") as f:
+            f.writelines(new_lines)
+    except Exception as e:
+        log.warning(f".env write failed for {key}: {e}")
 
 
 @app.post("/settings", dependencies=[Depends(require_api_key)])

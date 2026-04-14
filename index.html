@@ -1289,24 +1289,71 @@ async function fetchRegime(){
   }catch(e){}
 }
 /* ── NIGHTLY REVIEWS ── */
+let _latestReview=null;
 async function fetchReviews(){
   try{
     const r=await fetch(`${BOT}/reviews?limit=1`);if(!r.ok)return;
     const d=await r.json();
     const box=document.getElementById('review-body');if(!box)return;
     const rev=(d.reviews||[])[0];
+    _latestReview=rev;
     if(!rev){
       if(!d.enabled){box.innerHTML='<div style="color:var(--text3);font-size:10px">Nightly review disabled (set NIGHTLY_REVIEW=true and ANTHROPIC_API_KEY in .env)</div>';}
       return;
     }
+    // Parse the applied log to know which recommendations were already
+    // applied (so we can disable the button).
+    const appliedSet=new Set();
+    if(rev.applied){
+      const applied=String(rev.applied||'');
+      applied.split('\n').forEach(line=>{
+        try{const obj=JSON.parse(line);if(typeof obj.index==='number')appliedSet.add(obj.index);}catch(e){}
+      });
+    }
     const recs=rev.recommendations||[];
     const pnlCls=(rev.pnl||0)>=0?'g':'r';
-    const recHtml=recs.length?recs.map(x=>`<li style="margin:3px 0"><b>${safeHtml(x.param||'')}</b>: ${safeHtml(String(x.current||''))} → <span class="y">${safeHtml(String(x.suggested||''))}</span><br><span style="font-size:10px;color:var(--text3)">${safeHtml(x.rationale||'')}</span></li>`).join(''):'<li style="color:var(--text3);font-size:10px">No changes recommended.</li>';
+    const applyable=new Set(['MAX_ORDER_SIZE','DAILY_LOSS_LIMIT','STRATEGY','PAUSE']);
+    const recHtml=recs.length?recs.map((x,i)=>{
+      const param=String(x.param||'').toUpperCase();
+      const isApplied=appliedSet.has(i);
+      const canApply=applyable.has(param) && !isApplied;
+      const btn=canApply
+        ? `<button onclick="applyReview(${rev.id},${i},this)" style="margin-left:6px;padding:2px 8px;font-size:9px;background:#1a3a2a;color:#00cc66;border:1px solid #00cc6640;border-radius:3px;cursor:pointer;font-family:var(--mono)">APPLY</button>`
+        : isApplied
+          ? `<span style="margin-left:6px;font-size:9px;color:var(--text3)">[applied]</span>`
+          : `<span style="margin-left:6px;font-size:9px;color:var(--text3)">[read-only]</span>`;
+      return `<li style="margin:6px 0"><b>${safeHtml(param)}</b>: ${safeHtml(String(x.current||''))} → <span class="y">${safeHtml(String(x.suggested||''))}</span>${btn}<br><span style="font-size:10px;color:var(--text3)">${safeHtml(x.rationale||'')}</span></li>`;
+    }).join(''):'<li style="color:var(--text3);font-size:10px">No changes recommended.</li>';
     box.innerHTML=
       `<div style="color:var(--text3);font-size:10px">${safeHtml(rev.review_date||'')} · ${rev.trades_count||0} trades · gross $<span class="${pnlCls}">${Number(rev.pnl||0).toFixed(2)}</span> · match ${Number(rev.win_rate||0).toFixed(0)}%</div>`+
       `<div style="margin:6px 0;color:var(--text);font-size:11px">${safeHtml(rev.summary||'')}</div>`+
       `<ul style="margin:4px 0 0 14px;padding:0">${recHtml}</ul>`;
   }catch(e){}
+}
+async function applyReview(reviewId,idx,btn){
+  const key=sessionStorage.getItem('sb_key')||prompt('Enter API key to apply this change:','')||'';
+  if(!key)return;
+  sessionStorage.setItem('sb_key',key);
+  if(btn){btn.disabled=true;btn.textContent='APPLYING…';}
+  try{
+    const r=await fetch(`${BOT}/reviews/${reviewId}/apply`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-API-Key':key},
+      body:JSON.stringify({index:idx})
+    });
+    const d=await r.json();
+    if(r.ok){
+      if(btn){btn.textContent='✓ APPLIED';btn.style.background='#1a2a3a';btn.style.color='#66aaff';}
+      // refresh review panel so the applied flag updates from the server
+      fetchReviews();
+    }else{
+      if(btn){btn.disabled=false;btn.textContent='APPLY';}
+      alert('Apply failed: '+(d.detail||d.error||r.status));
+    }
+  }catch(e){
+    if(btn){btn.disabled=false;btn.textContent='APPLY';}
+    alert('Apply failed: network error');
+  }
 }
 initChart();psCalc();
 fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();
