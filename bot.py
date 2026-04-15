@@ -3510,25 +3510,72 @@ class PolymarketBot:
         if not tid:
             return None
 
-        # Hard cap: never bet more than $100 on an EconFlow trade
-        amount = min(MAX_ORDER_SIZE, 100.0, max(1.0, flow["confidence"] / 10.0))
+        # ── Macro weighting ─────────────────────────────────────────────────
+        # Trade-flow is only meaningful when the broader tape is moving.
+        # VIX is the cheapest proxy: <13 = complacent market (flow likely
+        # noise from a single trader), >25 = stressed (flow more likely to
+        # carry real information). On known Fed-policy-sensitive markets,
+        # an obvious rate-cycle mismatch (e.g. flow buying YES on "Fed
+        # hikes" during an easing cycle) damps confidence further.
+        macro = self.get_macro_context() or {}
+        vix = macro.get("vix")
+        fed_rate = macro.get("fed_rate")
+        conf_mult = 1.0
+        notes = []
+        if isinstance(vix, (int, float)):
+            if vix < 13:
+                conf_mult *= 0.7
+                notes.append(f"calm tape (VIX {vix:.1f})")
+            elif vix > 25:
+                conf_mult *= 1.1
+                notes.append(f"stressed tape (VIX {vix:.1f})")
+        q_low = question.lower()
+        # Direction mismatch check on Fed-path markets. Rough heuristic:
+        # rate > 4% → tight cycle → "cut"/"lower" YES more plausible than "hike".
+        if isinstance(fed_rate, (int, float)) and ("fed" in q_low or "fomc" in q_low or "rate" in q_low):
+            hawkish_bet = side_label == "YES" and any(x in q_low for x in ["hike","raise","increase","higher"])
+            dovish_bet  = side_label == "YES" and any(x in q_low for x in ["cut","lower","decrease","reduce"])
+            if fed_rate > 4.0 and hawkish_bet:
+                conf_mult *= 0.75
+                notes.append(f"contra-cycle (rate {fed_rate:.2f}% + hawkish bet)")
+            elif fed_rate < 2.0 and dovish_bet:
+                conf_mult *= 0.75
+                notes.append(f"contra-cycle (rate {fed_rate:.2f}% + dovish bet)")
 
-        reason = (
+        weighted_conf = max(0.0, min(100.0, flow["confidence"] * conf_mult))
+
+        # Below 15% weighted confidence the signal is effectively noise;
+        # skip rather than burn a bet on it.
+        if weighted_conf < 15.0:
+            self._log(
+                f"[ECON FLOW] SKIP {question[:40]} — weighted conf {weighted_conf:.0f}% "
+                f"({'; '.join(notes) if notes else 'no macro edge'})"
+            )
+            return None
+
+        # Hard cap: never bet more than $100 on an EconFlow trade
+        amount = min(MAX_ORDER_SIZE, 100.0, max(1.0, weighted_conf / 10.0))
+
+        reason_parts = [
             f"Trade flow spike {flow['spike_ratio']:.1f}× avg "
             f"({flow['recent_trades']} trades in 5min, "
             f"{flow['yes_vol']:.0f} YES / {flow['no_vol']:.0f} NO USDC)"
-        )
+        ]
+        if notes:
+            reason_parts.append("macro: " + "; ".join(notes))
+        reason = " | ".join(reason_parts)
 
         self._log(
             f"[ECON FLOW] {side_label} pressure on {question[:45]} "
-            f"— {flow['spike_ratio']:.1f}× spike, conf={flow['confidence']}%"
+            f"— {flow['spike_ratio']:.1f}× spike, base_conf={flow['confidence']}% "
+            f"× macro={conf_mult:.2f} → {weighted_conf:.0f}%"
         )
         return {
             "strategy":    "econFlow",
             "signal":      f"BUY {side_label}",
             "token_id":    tid,
             "price":       round(entry_p, 4),
-            "confidence":  flow["confidence"],
+            "confidence":  round(weighted_conf, 1),
             "market":      question,
             "amount":      round(amount, 2),
             "spike_ratio": flow["spike_ratio"],
