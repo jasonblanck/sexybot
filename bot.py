@@ -295,6 +295,8 @@ class PolymarketBot:
         self._brier_resolver_task: Optional[asyncio.Task] = None
         # Weekly scheduled backtest task handle
         self._weekly_backtest_task: Optional[asyncio.Task] = None
+        # Daily SQLite VACUUM + prune task
+        self._db_maintenance_task:  Optional[asyncio.Task] = None
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -456,6 +458,21 @@ class PolymarketBot:
                 latency_s           REAL,
                 created_at          TEXT NOT NULL
             )""")
+            # Anthropic API spend tracker — one row per Claude call so the
+            # operator can see per-day / per-model spend on the dashboard
+            # before the credit balance runs out (yesterday's $60-in-36-h
+            # incident motivated this — there was no in-process visibility,
+            # only the post-hoc Anthropic console invoice).
+            self.db.execute("""CREATE TABLE IF NOT EXISTS claude_usage (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                model             TEXT NOT NULL,
+                input_tokens      INTEGER DEFAULT 0,
+                output_tokens     INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                est_cost_usd      REAL    DEFAULT 0,
+                created_at        TEXT NOT NULL
+            )""")
             # Indexes on frequent WHERE-clause columns. Without these,
             # get_daily_loss and brier-stats queries scan the whole table
             # as trades/brier_scores grow — latency creeps up over weeks.
@@ -467,6 +484,7 @@ class PolymarketBot:
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_pretrade_time ON pretrade_log(created_at)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_trades_category ON trades(category)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_claude_usage_time ON claude_usage(created_at)")
             # Purge idempotency keys older than 24h on startup
             self.db.execute(
                 "DELETE FROM idempotency_keys WHERE datetime(created) < datetime('now', '-24 hours')"
@@ -1722,6 +1740,95 @@ class PolymarketBot:
         except Exception as e:
             log.debug(f"brier log error: {e}")
 
+    # ── Claude API spend tracking ─────────────────────────────────────────
+    # Per-1M-token pricing for the models we actually call. Updated for
+    # Claude 4.6 family. cache_read is 0.1× input; cache_write (5-min)
+    # is 1.25× input. If a model name doesn't match, falls back to
+    # Sonnet pricing (conservative for spend estimation).
+    _CLAUDE_PRICING_PER_MTOK = {
+        "sonnet": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
+        "opus":   {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write": 18.75},
+        "haiku":  {"input": 0.80,  "output": 4.00,  "cache_read": 0.08, "cache_write": 1.00},
+    }
+
+    def _record_claude_usage(self, msg) -> None:
+        """Persist Anthropic API usage for one Claude call. Reads the
+        usage block from the response and writes a row to claude_usage
+        with model, tokens, and estimated cost. Failures are swallowed
+        — spend tracking must never break a trade."""
+        try:
+            usage = getattr(msg, "usage", None)
+            if usage is None:
+                return
+            model = (getattr(msg, "model", "") or "").lower()
+            family = "sonnet" if "sonnet" in model else (
+                "opus" if "opus" in model else (
+                "haiku" if "haiku" in model else "sonnet"))
+            p = self._CLAUDE_PRICING_PER_MTOK[family]
+            inp   = int(getattr(usage, "input_tokens", 0) or 0)
+            out   = int(getattr(usage, "output_tokens", 0) or 0)
+            cread = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+            cwrt  = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+            est = (
+                inp   * p["input"]       / 1_000_000 +
+                out   * p["output"]      / 1_000_000 +
+                cread * p["cache_read"]  / 1_000_000 +
+                cwrt  * p["cache_write"] / 1_000_000
+            )
+            with self.db:
+                self.db.execute(
+                    "INSERT INTO claude_usage "
+                    "(model, input_tokens, output_tokens, cache_read_tokens, "
+                    " cache_write_tokens, est_cost_usd, created_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (model or "unknown", inp, out, cread, cwrt,
+                     round(est, 6), datetime.utcnow().isoformat()),
+                )
+        except Exception as e:
+            log.debug(f"_record_claude_usage failed: {e}")
+
+    def get_claude_spend(self, days: int = 1) -> dict:
+        """Aggregate Claude API spend over the last N days.
+        Returns totals, by-model breakdown, and call count. Used by
+        the dashboard /spend/claude panel and (optionally) by a
+        Telegram alert when daily spend exceeds CLAUDE_DAILY_BUDGET_USD."""
+        try:
+            days = max(1, min(int(days), 365))
+            row = self.db.execute(
+                "SELECT COUNT(*), "
+                "       COALESCE(SUM(input_tokens), 0), "
+                "       COALESCE(SUM(output_tokens), 0), "
+                "       COALESCE(SUM(cache_read_tokens), 0), "
+                "       COALESCE(SUM(cache_write_tokens), 0), "
+                "       COALESCE(SUM(est_cost_usd), 0) "
+                "FROM claude_usage WHERE created_at >= datetime('now', ?)",
+                (f"-{days} days",),
+            ).fetchone()
+            calls, inp, out, cread, cwrt, cost = row or (0, 0, 0, 0, 0, 0)
+            by_model_rows = self.db.execute(
+                "SELECT model, COUNT(*), COALESCE(SUM(est_cost_usd), 0) "
+                "FROM claude_usage WHERE created_at >= datetime('now', ?) "
+                "GROUP BY model ORDER BY 3 DESC",
+                (f"-{days} days",),
+            ).fetchall()
+            return {
+                "window_days":      days,
+                "calls":            int(calls or 0),
+                "input_tokens":     int(inp or 0),
+                "output_tokens":    int(out or 0),
+                "cache_read_tokens":  int(cread or 0),
+                "cache_write_tokens": int(cwrt or 0),
+                "est_cost_usd":     round(float(cost or 0), 4),
+                "by_model": [
+                    {"model": r[0], "calls": int(r[1] or 0),
+                     "est_cost_usd": round(float(r[2] or 0), 4)}
+                    for r in by_model_rows
+                ],
+            }
+        except Exception as e:
+            log.warning(f"get_claude_spend error: {e}")
+            return {"window_days": days, "calls": 0, "est_cost_usd": 0.0, "by_model": []}
+
     def get_brier_stats(self) -> dict:
         """Return calibration stats from resolved predictions.
         Adds a 30-day slice so a long-running bot doesn't drown in old
@@ -1926,6 +2033,49 @@ class PolymarketBot:
                 log.debug(f"brier resolver loop error: {e}")
             try:
                 await asyncio.sleep(6 * 3600)
+            except asyncio.CancelledError:
+                break
+
+    async def _db_maintenance_loop(self):
+        """Daily SQLite housekeeping. Runs once per 24h:
+          - VACUUM       — reclaims space, keeps query latency flat as
+                           trades.db grows past 100k rows.
+          - ANALYZE      — refreshes stats so the planner picks indexes.
+          - Prune old    — pretrade_log / regime_log entries older than
+                           90 days are dropped (high churn, low long-
+                           term value). claude_usage older than 90 days
+                           is dropped too. trades / brier_scores /
+                           strategy_reviews are kept forever.
+        First pass fires ~30 minutes after startup so it doesn't compete
+        with the boot-time AI prewarm."""
+        try:
+            await asyncio.sleep(1800)
+        except asyncio.CancelledError:
+            return
+        while self.running:
+            try:
+                pruned = 0
+                with self.db:
+                    for table, days in (("pretrade_log", 90),
+                                         ("regime_log",   90),
+                                         ("claude_usage", 90)):
+                        col = "created_at" if table != "regime_log" else "created_at"
+                        cur = self.db.execute(
+                            f"DELETE FROM {table} WHERE {col} < datetime('now', ?)",
+                            (f"-{days} days",),
+                        )
+                        pruned += cur.rowcount
+                # VACUUM cannot run inside a transaction
+                self.db.execute("VACUUM")
+                self.db.execute("ANALYZE")
+                if pruned > 0:
+                    log.info(f"[DB MAINT] pruned {pruned} rows; vacuum + analyze done")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning(f"[DB MAINT] failed: {e}")
+            try:
+                await asyncio.sleep(24 * 3600)
             except asyncio.CancelledError:
                 break
 
@@ -2392,6 +2542,7 @@ class PolymarketBot:
                     tools=[_TOOL_ANALYZE],
                     tool_choice={"type": "tool", "name": _TOOL_ANALYZE["name"]},
                 )
+            self._record_claude_usage(msg)
 
             # Explicitly handle non-success stop reasons so they don't fall
             # through to a confusing parse failure further down.
@@ -2513,6 +2664,7 @@ class PolymarketBot:
                 tools=[_TOOL_REGIME],
                 tool_choice={"type": "tool", "name": _TOOL_REGIME["name"]},
             )
+            self._record_claude_usage(msg)
             # Handle non-success stop_reasons explicitly — avoids a confusing
             # parse failure downstream and keeps the last good cache.
             if getattr(msg, "stop_reason", None) in ("refusal", "max_tokens"):
@@ -2665,6 +2817,7 @@ class PolymarketBot:
                 ),
                 timeout=PRETRADE_TIMEOUT_S,
             )
+            self._record_claude_usage(msg)
             d = _extract_tool_input(msg, _TOOL_PRETRADE["name"])
             if d is None:
                 # Fallback — unlikely with forced tool_choice
@@ -2829,6 +2982,7 @@ class PolymarketBot:
                     asyncio.to_thread(client.messages.create, **deep_kwargs),
                     timeout=DEEP_ANALYZE_TIMEOUT_S,
                 )
+            self._record_claude_usage(msg)
             latency = round(time.time() - t0, 2)
 
             if msg.stop_reason == "refusal":
@@ -3021,6 +3175,7 @@ class PolymarketBot:
                     tools=[_TOOL_BACKTEST],
                     tool_choice={"type": "tool", "name": _TOOL_BACKTEST["name"]},
                 )
+            self._record_claude_usage(msg)
             latency = round(time.time() - t0, 2)
 
             if getattr(msg, "stop_reason", None) == "refusal":
@@ -3286,6 +3441,7 @@ class PolymarketBot:
                     tools=[_TOOL_REVIEW],
                     tool_choice={"type": "tool", "name": _TOOL_REVIEW["name"]},
                 )
+            self._record_claude_usage(msg)
             if msg.stop_reason == "refusal":
                 log.warning("[NIGHTLY REVIEW] Claude refused")
                 return None
@@ -4539,6 +4695,9 @@ async def lifespan(app_: FastAPI):
         if BACKTEST_WEEKLY_ENABLED and ANTHROPIC_API_KEY:
             bot._weekly_backtest_task = asyncio.create_task(bot._weekly_backtest_loop())
             log.info("[BACKTEST] Weekly analysis scheduled (Sunday ~01:00 UTC)")
+        # Daily DB hygiene — VACUUM + prune of high-churn audit tables.
+        bot._db_maintenance_task = asyncio.create_task(bot._db_maintenance_loop())
+        log.info("[DB MAINT] Daily VACUUM + prune scheduled (every 24h)")
     else:
         log.warning("Could not connect — check .env credentials")
     yield
@@ -4552,6 +4711,8 @@ async def lifespan(app_: FastAPI):
         bot._brier_resolver_task.cancel()
     if bot._weekly_backtest_task and not bot._weekly_backtest_task.done():
         bot._weekly_backtest_task.cancel()
+    if bot._db_maintenance_task and not bot._db_maintenance_task.done():
+        bot._db_maintenance_task.cancel()
     if _bot_task and not _bot_task.done():
         _bot_task.cancel()
         try:
@@ -5195,6 +5356,47 @@ async def trigger_brier_resolve(limit: int = 50):
     limit = max(1, min(limit, 500))
     settled = await bot.resolve_brier_predictions(limit=limit)
     return JSONResponse({"ok": True, "settled": settled})
+
+
+@app.get("/admin/backup", dependencies=[Depends(require_api_key)])
+def admin_backup():
+    """Stream a tarball of trades.db + .env so the operator can pull a
+    fresh backup from anywhere with the API key. Requires X-API-Key
+    (this endpoint exposes the wallet private key in .env — never
+    surface it without auth)."""
+    import io
+    import tarfile
+    from fastapi.responses import StreamingResponse
+    here = os.path.dirname(os.path.abspath(__file__))
+    targets = [
+        ("trades.db", os.path.join(here, "trades.db")),
+        (".env",      os.path.join(here, ".env")),
+    ]
+    buf = io.BytesIO()
+    try:
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for arcname, fp in targets:
+                if os.path.isfile(fp):
+                    tar.add(fp, arcname=arcname)
+    except Exception as e:
+        log.warning(f"backup tar failed: {e}")
+        raise HTTPException(status_code=500, detail="backup creation failed")
+    buf.seek(0)
+    fname = f"sexybot-backup-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.tgz"
+    return StreamingResponse(
+        buf, media_type="application/gzip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.get("/spend/claude")
+def get_spend_claude(days: int = 1):
+    """Anthropic API spend over the last N days. Read by the dashboard
+    SPEND TODAY panel and (optionally) tripped against
+    CLAUDE_DAILY_BUDGET_USD for a Telegram alert. Defaults to 1 day
+    (today) — pass days=7 or days=30 for longer windows."""
+    days = max(1, min(int(days), 365))
+    return JSONResponse(bot.get_claude_spend(days=days))
 
 
 @app.get("/brier/calibration")

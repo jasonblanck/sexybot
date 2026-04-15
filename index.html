@@ -297,6 +297,24 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
         <div style="color:var(--text3)">No reviews yet. First review runs at 00:05 UTC after the bot has real trades in the last 24h.</div>
       </div>
     </div>
+    <div class="panel" id="spend-panel">
+      <div class="panel-title">CLAUDE SPEND</div>
+      <div style="display:flex;gap:16px;margin:6px 0 10px 0;">
+        <div>
+          <div style="color:var(--text3);font-size:9px;letter-spacing:1px">TODAY</div>
+          <div id="spend-today" style="font-size:22px;font-weight:700;font-family:var(--mono);color:var(--orange)">$—</div>
+        </div>
+        <div>
+          <div style="color:var(--text3);font-size:9px;letter-spacing:1px">7 DAYS</div>
+          <div id="spend-7d" style="font-size:14px;font-weight:600;font-family:var(--mono);color:var(--text2)">$—</div>
+        </div>
+        <div>
+          <div style="color:var(--text3);font-size:9px;letter-spacing:1px">CALLS TODAY</div>
+          <div id="spend-calls" style="font-size:14px;font-weight:600;font-family:var(--mono);color:var(--text2)">—</div>
+        </div>
+      </div>
+      <div id="spend-by-model" style="font-size:10px;color:var(--text2);padding:4px 0"></div>
+    </div>
     <div class="panel" id="calibration-panel">
       <div class="panel-title">CALIBRATION BY CATEGORY (30D)</div>
       <div id="calibration-body" style="font-size:10px;padding:4px 0">
@@ -1555,6 +1573,54 @@ async function fetchPretrade(){
    Per-category scorecard. Shows which categories AI is well-calibrated
    on and which it's overconfident in — the evidence base for deciding
    whether to lean into weather / dial back politics / etc. */
+/* ── CLAUDE SPEND TRACKER ──
+   Reads /spend/claude (today + 7d) and renders the dashboard panel.
+   Lets the operator see real-time burn-rate before the Anthropic
+   credit balance runs out (yesterday's $60-in-36-h surprise was
+   only visible after the fact on the Anthropic console). */
+async function fetchSpend(){
+  try{
+    const [r1, r7] = await Promise.all([
+      fetch(`${BOT}/spend/claude?days=1`),
+      fetch(`${BOT}/spend/claude?days=7`),
+    ]);
+    if(!r1.ok || !r7.ok) return;
+    const today = await r1.json();
+    const week  = await r7.json();
+    const $today = Number(today.est_cost_usd || 0);
+    const $week  = Number(week.est_cost_usd || 0);
+    const calls  = Number(today.calls || 0);
+    const todayEl = document.getElementById('spend-today');
+    const weekEl  = document.getElementById('spend-7d');
+    const callsEl = document.getElementById('spend-calls');
+    if(todayEl){
+      todayEl.textContent = '$' + $today.toFixed(2);
+      // colour-code by daily burn — green <$10, orange <$30, red >=$30
+      todayEl.style.color = $today < 10 ? 'var(--green)'
+                          : $today < 30 ? 'var(--orange)'
+                          : 'var(--red)';
+    }
+    if(weekEl)  weekEl.textContent  = '$' + $week.toFixed(2);
+    if(callsEl) callsEl.textContent = calls.toLocaleString();
+    const byModel = (today.by_model || []).slice(0, 4);
+    const mEl = document.getElementById('spend-by-model');
+    if(mEl){
+      if(byModel.length === 0){
+        mEl.innerHTML = '<div style="color:var(--text3);font-size:10px">No Claude calls yet today.</div>';
+      } else {
+        mEl.innerHTML = byModel.map(m => {
+          const short = (m.model || '').replace(/^claude-/,'').slice(0, 22);
+          return `<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;padding:2px 0;border-bottom:1px dashed var(--border2)">
+            <span style="color:var(--text2)">${safeHtml(short)}</span>
+            <span style="color:var(--text3)">${m.calls} calls</span>
+            <span style="color:var(--text)">$${Number(m.est_cost_usd||0).toFixed(3)}</span>
+          </div>`;
+        }).join('');
+      }
+    }
+  }catch(e){}
+}
+
 async function fetchCalibration(){
   try{
     const r=await fetch(`${BOT}/brier/calibration?days=30`);if(!r.ok)return;
@@ -1671,7 +1737,7 @@ async function applyReview(reviewId,idx,btn){
   }
 }
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();fetchClaudeMax();fetchCalibration();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();fetchClaudeMax();fetchCalibration();fetchSpend();
 setInterval(fetchBot,15000);
 setInterval(fetchPortfolio,30000);
 setInterval(fetchMarkets,60000);
@@ -1686,6 +1752,7 @@ setInterval(fetchRegime,60000);
 setInterval(fetchReviews,600000);
 setInterval(fetchPretrade,90000);
 setInterval(fetchCalibration,600000);  // 10 min — data only changes when Brier resolver fires (every 6h)
+setInterval(fetchSpend,60000);          // 1 min — Claude spend can move fast during heavy scanning
 setInterval(fetchRealizedPnl,180000);
 setInterval(fetchDeep,120000);
 setInterval(fetchClaudeMax,60000);
