@@ -2020,7 +2020,12 @@ class PolymarketBot:
             ]
             macro = self._macro_cache
             if macro:
-                ctx_parts.append(f"MACRO: Fed Rate={macro.get('fed_rate')}%  CPI YoY={macro.get('cpi')}%")
+                _vix = macro.get("vix")
+                _vix_str = f"  VIX={_vix}" if _vix is not None else ""
+                ctx_parts.append(
+                    f"MACRO: Fed Rate={macro.get('fed_rate')}%  "
+                    f"CPI YoY={macro.get('cpi')}%{_vix_str}"
+                )
             fmp = self._fmp_cache.get("_sentiment", {})
             if fmp:
                 ctx_parts.append(f"MARKET SENTIMENT: SPY {fmp.get('spy_change_pct',0):+.2f}%  {fmp.get('up_count',0)}/{fmp.get('total',0)} stocks up")
@@ -3765,6 +3770,17 @@ class PolymarketBot:
                             _tasks: dict = {
                                 "crypto": asyncio.to_thread(self.get_crypto_prices),
                                 "news":   asyncio.to_thread(self.get_news_headlines, c["question"][:60]),
+                                # Keep macro + FMP caches fresh on every AI call.
+                                # Both methods are cache-aware (TTL 1hr / 5min) so
+                                # calling them each cycle is cheap when warm and
+                                # re-fetches when stale. Previously these only
+                                # refreshed inside the momentum strategy path
+                                # (bot.py:3302,3398), so AI-path markets were
+                                # reading whatever values happened to be in the
+                                # cache from hours ago — same "data fetched but
+                                # never freshly routed" bug as the weather gap.
+                                "_macro": asyncio.to_thread(self.get_macro_context),
+                                "_fmp":   asyncio.to_thread(self.get_fmp_market),
                             }
                             if TAVILY_API_KEY:
                                 _tasks["tavily"] = asyncio.to_thread(self.get_tavily_research, c["question"][:80])
