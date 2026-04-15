@@ -566,7 +566,10 @@ class PolymarketBot:
                      "convicted","charged","plea","verdict","sentenced","supreme court",
                      "appellate","docket","hearing","prosecutor","defendant"],
         "weather":  ["hurricane","tornado","earthquake","storm","snowfall","rainfall",
-                     "temperature","heat wave","flood","wildfire","drought","meteorologic"],
+                     "temperature","heat wave","flood","wildfire","drought","meteorologic",
+                     "degrees","°f","°c","inches of rain","inches of snow","high temp",
+                     "low temp","precipitation","hail","blizzard","heatwave","climate",
+                     "noaa","nws","weather service"],
     }
 
     @classmethod
@@ -1335,6 +1338,87 @@ class PolymarketBot:
         self._weather_cache_time = time.time()
         return self._weather_cache
 
+    # ── Per-market weather forecast (for weather-tagged markets) ─────────────
+    # Common-city lookup table. Falls back to Open-Meteo's free geocoder if
+    # no match. Kept small on purpose — most Polymarket weather contracts
+    # center on a handful of reference cities / stations.
+    _COMMON_CITIES = {
+        "nyc":"New York","new york":"New York","manhattan":"New York","central park":"New York",
+        "la":"Los Angeles","los angeles":"Los Angeles",
+        "chicago":"Chicago","chi":"Chicago",
+        "miami":"Miami","houston":"Houston","dallas":"Dallas",
+        "atlanta":"Atlanta","boston":"Boston","philadelphia":"Philadelphia","philly":"Philadelphia",
+        "seattle":"Seattle","denver":"Denver","phoenix":"Phoenix",
+        "san francisco":"San Francisco","sf":"San Francisco",
+        "washington dc":"Washington","washington":"Washington","dc":"Washington",
+        "las vegas":"Las Vegas","minneapolis":"Minneapolis","detroit":"Detroit",
+        "san diego":"San Diego","portland":"Portland","austin":"Austin",
+        "london":"London","tokyo":"Tokyo","paris":"Paris","toronto":"Toronto",
+    }
+    _weather_forecast_cache: dict = {}  # city_key → (expiry_ts, payload)
+
+    @classmethod
+    def _extract_city(cls, question: str) -> Optional[str]:
+        import re as _re
+        q = (question or "").lower()
+        # Longest-first so "new york" wins over "york", "san francisco" over "san"
+        for key in sorted(cls._COMMON_CITIES.keys(), key=len, reverse=True):
+            if _re.search(rf"(?<![a-z]){_re.escape(key)}(?![a-z])", q):
+                return cls._COMMON_CITIES[key]
+        return None
+
+    def get_weather_for_location(self, city: str, days: int = 14) -> Optional[dict]:
+        """Fetch a multi-day daily forecast for a named city. Uses Open-Meteo's
+        free geocoder for lat/lng lookup; 30-minute cache keyed on city. Returns
+        None on failure — callers should treat None as "no weather signal"."""
+        if not city:
+            return None
+        key = city.lower()
+        cached = self._weather_forecast_cache.get(key)
+        if cached and cached[0] > time.time():
+            return cached[1]
+        try:
+            import json as _j, urllib.parse as _up
+            geo_url = (
+                "https://geocoding-api.open-meteo.com/v1/search?"
+                f"name={_up.quote(city)}&count=1&language=en&format=json"
+            )
+            with _ureq.urlopen(geo_url, timeout=5) as r:
+                geo = _j.loads(r.read())
+            hits = geo.get("results") or []
+            if not hits:
+                return None
+            lat = hits[0]["latitude"]
+            lon = hits[0]["longitude"]
+            resolved = hits[0].get("name", city)
+
+            base = "https://customer-api.open-meteo.com" if OPEN_METEO_API_KEY else "https://api.open-meteo.com"
+            key_param = f"&apikey={OPEN_METEO_API_KEY}" if OPEN_METEO_API_KEY else ""
+            url = (
+                f"{base}/v1/forecast?latitude={lat}&longitude={lon}"
+                f"&daily=temperature_2m_max,temperature_2m_min,"
+                f"precipitation_sum,precipitation_probability_max,"
+                f"snowfall_sum,windspeed_10m_max,weathercode"
+                f"&temperature_unit=fahrenheit&windspeed_unit=mph"
+                f"&forecast_days={min(max(days,1),16)}"
+                f"{key_param}"
+            )
+            with _ureq.urlopen(url, timeout=8) as r:
+                data = _j.loads(r.read())
+            payload = {
+                "city":  resolved,
+                "lat":   lat,
+                "lon":   lon,
+                "daily": data.get("daily", {}),
+            }
+            # 30-minute cache — forecasts rarely change meaningfully faster,
+            # and we re-fetch each scan cycle for many candidate markets.
+            self._weather_forecast_cache[key] = (time.time() + 1800, payload)
+            return payload
+        except Exception as e:
+            log.debug(f"weather forecast fetch failed for {city}: {e}")
+            return None
+
     # ── Volatility & Gas ─────────────────────────────────────────────────────
 
     _gas_cache: dict = {}
@@ -1960,6 +2044,36 @@ class PolymarketBot:
             govtrack = research.get("govtrack", "")
             if govtrack:
                 ctx_parts.append(f"LEGISLATION: {govtrack}")
+            # Weather forecast (only present for weather-tagged markets with
+            # a resolvable location). Daily granularity, 14-day window, with
+            # precip probability — lets Claude compare the market's implied
+            # probability against the forecast directly.
+            wf = research.get("weather_forecast") or {}
+            if wf and wf.get("daily"):
+                daily   = wf["daily"]
+                times   = daily.get("time") or []
+                tmax    = daily.get("temperature_2m_max") or []
+                tmin    = daily.get("temperature_2m_min") or []
+                precip  = daily.get("precipitation_sum") or []
+                pop     = daily.get("precipitation_probability_max") or []
+                snow    = daily.get("snowfall_sum") or []
+                wind    = daily.get("windspeed_10m_max") or []
+                lines = [f"WEATHER FORECAST for {wf.get('city','?')} (fahrenheit, mph, inches):"]
+                for i in range(min(len(times), 14)):
+                    def _g(arr, default="—"):
+                        return arr[i] if i < len(arr) and arr[i] is not None else default
+                    lines.append(
+                        f"  {times[i]}: hi={_g(tmax)}°  lo={_g(tmin)}°  "
+                        f"rain={_g(precip,0)}in  pop={_g(pop,0)}%  "
+                        f"snow={_g(snow,0)}in  wind={_g(wind,0)}"
+                    )
+                ctx_parts.append("\n".join(lines))
+                ctx_parts.append(
+                    "WEATHER USAGE: compare the forecast above to the market "
+                    "question's threshold / date window. For weather contracts "
+                    "the forecast + its implied variance is usually a better "
+                    "prior than the order-book mid."
+                )
 
             # Current trading regime — lets Claude weight calibration against
             # system-level risk posture. In cautious/hostile regimes it should
@@ -3171,8 +3285,15 @@ class PolymarketBot:
         # just burns Anthropic API credits on already-decided outcomes
         if yes_p <= 0.02 or yes_p >= 0.98:
             return None
-        # Skip dead or illiquid markets — can't execute meaningfully
-        if liq < 5_000 or vol < 200:
+        # Skip dead or illiquid markets — can't execute meaningfully.
+        # Weather markets get a lower bar because they typically launch with
+        # $1-3k liquidity and small daily volume but carry real forecast edge.
+        _cat = type(self).classify_market(question)
+        if _cat == "weather":
+            _min_liq, _min_vol = 1_500, 50
+        else:
+            _min_liq, _min_vol = 5_000, 200
+        if liq < _min_liq or vol < _min_vol:
             return None
 
         if STRATEGY == "momentum":
@@ -3640,6 +3761,7 @@ class PolymarketBot:
                             _q_lower = c["question"].lower()
                             _is_legal = any(x in _q_lower for x in ["indicted","trial","court","lawsuit","ruling","judge","convicted","charged","plea","verdict","sentenced"])
                             _is_legislative = any(x in _q_lower for x in ["bill","act","legislation","congress","senate","pass","signed","law","vote","amendment"])
+                            _cat = type(self).classify_market(c["question"])
                             _tasks: dict = {
                                 "crypto": asyncio.to_thread(self.get_crypto_prices),
                                 "news":   asyncio.to_thread(self.get_news_headlines, c["question"][:60]),
@@ -3650,6 +3772,15 @@ class PolymarketBot:
                                 _tasks["court"] = asyncio.to_thread(self.get_courtlistener_data, c["question"][:60])
                             if _is_legislative:
                                 _tasks["govtrack"] = asyncio.to_thread(self.get_govtrack_data, c["question"][:60])
+                            # Weather markets: fetch a location-specific 14-day
+                            # forecast so Claude can compare its own pricing
+                            # with the forecast probability directly.
+                            if _cat == "weather":
+                                _city = type(self)._extract_city(c["question"])
+                                if _city:
+                                    _tasks["weather_forecast"] = asyncio.to_thread(
+                                        self.get_weather_for_location, _city
+                                    )
                             _k = list(_tasks.keys())
                             _v = await asyncio.gather(*_tasks.values(), return_exceptions=True)
                             _research = {"orderbook": ob}
