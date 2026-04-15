@@ -106,6 +106,12 @@ AI_MIN_CONFIDENCE      = float(os.getenv("AI_MIN_CONFIDENCE", "35.0"))
 # default `true` is the safe choice; set false only if you intend to hand
 # off open orders across restarts (rare).
 STARTUP_CANCEL_OPEN    = os.getenv("STARTUP_CANCEL_OPEN", "true").lower() == "true"
+# Daily Telegram summary — end-of-UTC-day digest of trades, realized P&L,
+# Claude spend, and top/worst category. Lets the operator see what the bot
+# did without opening the dashboard. One push per day at ~23:55 UTC.
+DAILY_SUMMARY_ENABLED  = os.getenv("DAILY_SUMMARY", "true").lower() == "true"
+DAILY_SUMMARY_UTC_HOUR = int(os.getenv("DAILY_SUMMARY_UTC_HOUR", "23"))    # 0-23
+DAILY_SUMMARY_UTC_MIN  = int(os.getenv("DAILY_SUMMARY_UTC_MIN",  "55"))
 # Deep analysis: for trades above DEEP_ANALYZE_MIN_USD, fire a second pass
 # with a stronger model + server-side web_search to catch signals that the
 # fast pass missed. Expensive (~10-30s latency, $0.10-0.50/call) so only
@@ -304,6 +310,8 @@ class PolymarketBot:
         self._weekly_backtest_task: Optional[asyncio.Task] = None
         # Daily SQLite VACUUM + prune task
         self._db_maintenance_task:  Optional[asyncio.Task] = None
+        # Daily Telegram digest task
+        self._daily_summary_task:   Optional[asyncio.Task] = None
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -3516,6 +3524,137 @@ class PolymarketBot:
             log.warning(f"nightly_strategy_review error: {e}")
             return None
 
+    def _build_daily_summary(self) -> str:
+        """Assemble the end-of-day digest. Pure read — no mutations. Returns
+        a Telegram-ready string. Safe to call at any hour; "today" is the
+        current UTC date."""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        lines: list = [f"📊 SEXYBOT · {today} UTC"]
+
+        # Trades today
+        try:
+            row = self.db.execute(
+                "SELECT COUNT(*), "
+                "       SUM(CASE WHEN status IN ('matched','filled') AND dry_run=0 THEN 1 ELSE 0 END), "
+                "       SUM(CASE WHEN dry_run=0 THEN amount ELSE 0 END) "
+                "FROM trades WHERE time LIKE ?",
+                (f"{today}%",),
+            ).fetchone()
+            total_attempts = int(row[0] or 0) if row else 0
+            filled         = int(row[1] or 0) if row else 0
+            deployed_usd   = float(row[2] or 0) if row else 0.0
+            lines.append(
+                f"· Trades: {filled} filled / {total_attempts} attempted · "
+                f"${deployed_usd:.2f} deployed"
+            )
+        except Exception as e:
+            log.debug(f"daily summary trades query failed: {e}")
+            lines.append("· Trades: (query failed)")
+
+        # Realized P&L today
+        try:
+            pnl_row = self.db.execute(
+                "SELECT COALESCE(SUM(realized_pnl), 0), "
+                "       SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), "
+                "       COUNT(*) "
+                "FROM trades WHERE resolved=1 AND dry_run=0 "
+                "AND resolved_at >= datetime('now', 'start of day')"
+            ).fetchone()
+            realized = float(pnl_row[0] or 0) if pnl_row else 0.0
+            wins     = int(pnl_row[1] or 0)   if pnl_row else 0
+            resolved = int(pnl_row[2] or 0)   if pnl_row else 0
+            wr_str = f" · WR {round(100*wins/resolved)}%" if resolved else ""
+            emoji = "🟢" if realized > 0 else ("🔴" if realized < 0 else "⚪")
+            lines.append(f"· Realized P&L: {emoji} ${realized:+.2f} ({resolved} resolved{wr_str})")
+        except Exception as e:
+            log.debug(f"daily summary pnl query failed: {e}")
+
+        # Unresolved count
+        try:
+            unres = self.db.execute(
+                "SELECT COUNT(*) FROM trades WHERE resolved=0 AND dry_run=0 "
+                "AND status IN ('matched','filled') AND order_type='market'"
+            ).fetchone()[0]
+            if unres:
+                lines.append(f"· Unresolved positions: {int(unres)}")
+        except Exception:
+            pass
+
+        # Claude spend today
+        try:
+            spend = self.get_claude_spend(days=1)
+            lines.append(
+                f"· Claude spend: ${spend.get('est_cost_usd', 0):.2f} "
+                f"({spend.get('calls', 0)} calls)"
+            )
+        except Exception as e:
+            log.debug(f"daily summary spend query failed: {e}")
+
+        # Top / worst category over last 30d — long enough to have signal,
+        # short enough to reflect the current strategy era.
+        try:
+            by_cat = self.db.execute(
+                "SELECT category, "
+                "       COALESCE(SUM(realized_pnl), 0) as pnl, "
+                "       COUNT(*) "
+                "FROM trades WHERE resolved=1 AND dry_run=0 "
+                "AND category IS NOT NULL AND category != '' "
+                "AND resolved_at >= datetime('now', '-30 days') "
+                "GROUP BY category ORDER BY pnl DESC"
+            ).fetchall() or []
+            cats = [(r[0], float(r[1] or 0), int(r[2] or 0)) for r in by_cat if r[2]]
+            if cats:
+                best = cats[0]
+                worst = cats[-1]
+                if len(cats) > 1 and best[1] != worst[1]:
+                    lines.append(
+                        f"· 30d best: {best[0]} ${best[1]:+.2f} (n={best[2]}) · "
+                        f"worst: {worst[0]} ${worst[1]:+.2f} (n={worst[2]})"
+                    )
+                else:
+                    lines.append(f"· 30d: {best[0]} ${best[1]:+.2f} (n={best[2]})")
+        except Exception as e:
+            log.debug(f"daily summary category query failed: {e}")
+
+        # Portfolio snapshot
+        try:
+            pos_val = self.get_positions_value()
+            lines.append(f"· Portfolio: ${pos_val:.2f} open positions")
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+
+    async def _daily_summary_loop(self):
+        """Background task — fires one Telegram digest per UTC day at the
+        configured hour:min. No-op if Telegram creds aren't set or
+        DAILY_SUMMARY is disabled."""
+        if not DAILY_SUMMARY_ENABLED or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        from datetime import timedelta
+        while self.running:
+            try:
+                now = datetime.utcnow()
+                target = now.replace(
+                    hour   = DAILY_SUMMARY_UTC_HOUR,
+                    minute = DAILY_SUMMARY_UTC_MIN,
+                    second = 0, microsecond = 0,
+                )
+                if target <= now:
+                    target += timedelta(days=1)
+                wait_s = max(60.0, (target - now).total_seconds())
+                await asyncio.sleep(wait_s)
+                if not self.running:
+                    break
+                msg = self._build_daily_summary()
+                await asyncio.to_thread(self.send_telegram, msg)
+                log.info(f"[DAILY SUMMARY] sent ({len(msg)} chars)")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning(f"daily summary loop error: {e}")
+                await asyncio.sleep(3600)
+
     async def _nightly_review_loop(self):
         """Background task — waits until ~00:05 UTC each day, runs the review."""
         if not NIGHTLY_REVIEW_ENABLED:
@@ -4717,6 +4856,13 @@ async def lifespan(app_: FastAPI):
         # Daily DB hygiene — VACUUM + prune of high-churn audit tables.
         bot._db_maintenance_task = asyncio.create_task(bot._db_maintenance_loop())
         log.info("[DB MAINT] Daily VACUUM + prune scheduled (every 24h)")
+        # Daily Telegram digest — silent if Telegram creds aren't set.
+        if DAILY_SUMMARY_ENABLED and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            bot._daily_summary_task = asyncio.create_task(bot._daily_summary_loop())
+            log.info(
+                f"[DAILY SUMMARY] Telegram digest scheduled "
+                f"(~{DAILY_SUMMARY_UTC_HOUR:02d}:{DAILY_SUMMARY_UTC_MIN:02d} UTC)"
+            )
     else:
         log.warning("Could not connect — check .env credentials")
     yield
@@ -4732,6 +4878,8 @@ async def lifespan(app_: FastAPI):
         bot._weekly_backtest_task.cancel()
     if bot._db_maintenance_task and not bot._db_maintenance_task.done():
         bot._db_maintenance_task.cancel()
+    if bot._daily_summary_task and not bot._daily_summary_task.done():
+        bot._daily_summary_task.cancel()
     if _bot_task and not _bot_task.done():
         _bot_task.cancel()
         try:
@@ -5406,6 +5554,16 @@ def admin_backup():
         buf, media_type="application/gzip",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
+
+
+@app.post("/admin/daily-summary", dependencies=[Depends(require_api_key)])
+async def trigger_daily_summary():
+    """Send the daily summary Telegram digest on demand. Useful for
+    testing the message format or sending an ad-hoc report during the
+    day. Fires synchronously and returns the message that was sent."""
+    msg = bot._build_daily_summary()
+    await asyncio.to_thread(bot.send_telegram, msg)
+    return JSONResponse({"ok": True, "sent": msg})
 
 
 @app.get("/spend/claude")
