@@ -566,7 +566,10 @@ class PolymarketBot:
                      "convicted","charged","plea","verdict","sentenced","supreme court",
                      "appellate","docket","hearing","prosecutor","defendant"],
         "weather":  ["hurricane","tornado","earthquake","storm","snowfall","rainfall",
-                     "temperature","heat wave","flood","wildfire","drought","meteorologic"],
+                     "temperature","heat wave","flood","wildfire","drought","meteorologic",
+                     "degrees","°f","°c","inches of rain","inches of snow","high temp",
+                     "low temp","precipitation","hail","blizzard","heatwave","climate",
+                     "noaa","nws","weather service"],
     }
 
     @classmethod
@@ -587,6 +590,27 @@ class PolymarketBot:
             if any(k in q for k in kws):
                 return cat
         return "other"
+
+    @classmethod
+    def _is_temp_threshold_market(cls, question: str) -> bool:
+        """Detect the specific 'highest/lowest temperature in <city> be <N>°'
+        template that dominates the highest-EV weather niche on Polymarket.
+        Requires (a) a temperature keyword, (b) either a 'highest' / 'lowest' /
+        'high' / 'low' modifier, AND (c) a numeric threshold. Deliberately
+        narrow — generic 'weather' markets go through the regular weather
+        path with its $1500 liquidity floor."""
+        if not question:
+            return False
+        import re as _re
+        q = question.lower()
+        if "temperature" not in q and "°" not in q and " temp " not in q and q.endswith(" temp") is False:
+            return False
+        has_extreme = any(w in q for w in ["highest", "lowest", "high temp", "low temp",
+                                            "max temp", "min temp", "peak temp"])
+        # Match "72°", "85 degrees", "40F", "95°F" etc. The `°` symbol needs
+        # no word boundary (it isn't a word char); the bare letters F / C do.
+        has_threshold = bool(_re.search(r"\d{1,3}\s*(?:°[fc]?|degrees?|[fc]\b)", q))
+        return has_extreme and has_threshold
 
     def get_daily_loss(self) -> float:
         try:
@@ -1335,6 +1359,87 @@ class PolymarketBot:
         self._weather_cache_time = time.time()
         return self._weather_cache
 
+    # ── Per-market weather forecast (for weather-tagged markets) ─────────────
+    # Common-city lookup table. Falls back to Open-Meteo's free geocoder if
+    # no match. Kept small on purpose — most Polymarket weather contracts
+    # center on a handful of reference cities / stations.
+    _COMMON_CITIES = {
+        "nyc":"New York","new york":"New York","manhattan":"New York","central park":"New York",
+        "la":"Los Angeles","los angeles":"Los Angeles",
+        "chicago":"Chicago","chi":"Chicago",
+        "miami":"Miami","houston":"Houston","dallas":"Dallas",
+        "atlanta":"Atlanta","boston":"Boston","philadelphia":"Philadelphia","philly":"Philadelphia",
+        "seattle":"Seattle","denver":"Denver","phoenix":"Phoenix",
+        "san francisco":"San Francisco","sf":"San Francisco",
+        "washington dc":"Washington","washington":"Washington","dc":"Washington",
+        "las vegas":"Las Vegas","minneapolis":"Minneapolis","detroit":"Detroit",
+        "san diego":"San Diego","portland":"Portland","austin":"Austin",
+        "london":"London","tokyo":"Tokyo","paris":"Paris","toronto":"Toronto",
+    }
+    _weather_forecast_cache: dict = {}  # city_key → (expiry_ts, payload)
+
+    @classmethod
+    def _extract_city(cls, question: str) -> Optional[str]:
+        import re as _re
+        q = (question or "").lower()
+        # Longest-first so "new york" wins over "york", "san francisco" over "san"
+        for key in sorted(cls._COMMON_CITIES.keys(), key=len, reverse=True):
+            if _re.search(rf"(?<![a-z]){_re.escape(key)}(?![a-z])", q):
+                return cls._COMMON_CITIES[key]
+        return None
+
+    def get_weather_for_location(self, city: str, days: int = 14) -> Optional[dict]:
+        """Fetch a multi-day daily forecast for a named city. Uses Open-Meteo's
+        free geocoder for lat/lng lookup; 30-minute cache keyed on city. Returns
+        None on failure — callers should treat None as "no weather signal"."""
+        if not city:
+            return None
+        key = city.lower()
+        cached = self._weather_forecast_cache.get(key)
+        if cached and cached[0] > time.time():
+            return cached[1]
+        try:
+            import json as _j, urllib.parse as _up
+            geo_url = (
+                "https://geocoding-api.open-meteo.com/v1/search?"
+                f"name={_up.quote(city)}&count=1&language=en&format=json"
+            )
+            with _ureq.urlopen(geo_url, timeout=5) as r:
+                geo = _j.loads(r.read())
+            hits = geo.get("results") or []
+            if not hits:
+                return None
+            lat = hits[0]["latitude"]
+            lon = hits[0]["longitude"]
+            resolved = hits[0].get("name", city)
+
+            base = "https://customer-api.open-meteo.com" if OPEN_METEO_API_KEY else "https://api.open-meteo.com"
+            key_param = f"&apikey={OPEN_METEO_API_KEY}" if OPEN_METEO_API_KEY else ""
+            url = (
+                f"{base}/v1/forecast?latitude={lat}&longitude={lon}"
+                f"&daily=temperature_2m_max,temperature_2m_min,"
+                f"precipitation_sum,precipitation_probability_max,"
+                f"snowfall_sum,windspeed_10m_max,weathercode"
+                f"&temperature_unit=fahrenheit&windspeed_unit=mph"
+                f"&forecast_days={min(max(days,1),16)}"
+                f"{key_param}"
+            )
+            with _ureq.urlopen(url, timeout=8) as r:
+                data = _j.loads(r.read())
+            payload = {
+                "city":  resolved,
+                "lat":   lat,
+                "lon":   lon,
+                "daily": data.get("daily", {}),
+            }
+            # 30-minute cache — forecasts rarely change meaningfully faster,
+            # and we re-fetch each scan cycle for many candidate markets.
+            self._weather_forecast_cache[key] = (time.time() + 1800, payload)
+            return payload
+        except Exception as e:
+            log.debug(f"weather forecast fetch failed for {city}: {e}")
+            return None
+
     # ── Volatility & Gas ─────────────────────────────────────────────────────
 
     _gas_cache: dict = {}
@@ -1645,6 +1750,99 @@ class PolymarketBot:
             log.warning(f"get_brier_stats DB error: {e}")
             return {}
 
+    def get_brier_by_category(self, window_days: int = 30) -> list:
+        """Per-category calibration scorecard. For each category:
+          n                  # resolved predictions in window
+          claimed_win_pct    # AI's average probability it'd win
+          actual_win_pct     # how often AI was actually right
+          calibration_gap    # claimed − actual (positive = overconfident)
+          avg_brier          # lower is better (0 = perfect, 0.25 = coin flip)
+        Categories with n < 5 are still shown so the operator can see
+        sample-size warnings rather than wondering why a category is
+        missing.
+        """
+        try:
+            rows = self.db.execute(
+                "SELECT market, predicted_prob, actual_outcome, brier_score "
+                "FROM brier_scores "
+                "WHERE resolved=1 AND brier_score IS NOT NULL "
+                "AND time >= datetime('now', ?)",
+                (f"-{int(max(1,min(window_days,365)))} days",),
+            ).fetchall()
+        except Exception as e:
+            log.warning(f"get_brier_by_category query error: {e}")
+            return []
+        buckets: dict = {}
+        for market, predicted, actual, brier in rows:
+            cat = type(self).classify_market(market or "")
+            b = buckets.setdefault(cat, {"n": 0, "p_sum": 0.0, "w_sum": 0.0, "brier_sum": 0.0})
+            b["n"]         += 1
+            b["p_sum"]     += float(predicted or 0)
+            b["w_sum"]     += 1 if int(actual or 0) == 1 else 0
+            b["brier_sum"] += float(brier or 0)
+        out = []
+        for cat, b in buckets.items():
+            n = b["n"] or 1
+            claimed = b["p_sum"] / n
+            actual  = b["w_sum"] / n
+            out.append({
+                "category":         cat,
+                "n":                b["n"],
+                "claimed_win_pct":  round(100 * claimed, 1),
+                "actual_win_pct":   round(100 * actual, 1),
+                "calibration_gap":  round(100 * (claimed - actual), 1),
+                "avg_brier":        round(b["brier_sum"] / n, 4),
+            })
+        # Largest n first — stability-weighted display
+        out.sort(key=lambda r: r["n"], reverse=True)
+        return out
+
+    def get_brier_by_city(self, window_days: int = 30) -> list:
+        """Per-city calibration for weather-tagged markets only.
+        Motivated by the brother-benchmark finding that geographic
+        edge in weather forecasting is real (Seattle / NYC / Atlanta
+        were disproportionately profitable in his stats). Lets the
+        operator see which cities *our* signal nails vs misses, once
+        enough resolved weather trades accumulate."""
+        try:
+            rows = self.db.execute(
+                "SELECT market, predicted_prob, actual_outcome, brier_score "
+                "FROM brier_scores "
+                "WHERE resolved=1 AND brier_score IS NOT NULL "
+                "AND time >= datetime('now', ?)",
+                (f"-{int(max(1,min(window_days,365)))} days",),
+            ).fetchall()
+        except Exception as e:
+            log.warning(f"get_brier_by_city query error: {e}")
+            return []
+        buckets: dict = {}
+        for market, predicted, actual, brier in rows:
+            if type(self).classify_market(market or "") != "weather":
+                continue
+            city = type(self)._extract_city(market or "")
+            if not city:
+                continue
+            b = buckets.setdefault(city, {"n": 0, "p_sum": 0.0, "w_sum": 0.0, "brier_sum": 0.0})
+            b["n"]         += 1
+            b["p_sum"]     += float(predicted or 0)
+            b["w_sum"]     += 1 if int(actual or 0) == 1 else 0
+            b["brier_sum"] += float(brier or 0)
+        out = []
+        for city, b in buckets.items():
+            n = b["n"] or 1
+            claimed = b["p_sum"] / n
+            actual  = b["w_sum"] / n
+            out.append({
+                "city":             city,
+                "n":                b["n"],
+                "claimed_win_pct":  round(100 * claimed, 1),
+                "actual_win_pct":   round(100 * actual, 1),
+                "calibration_gap":  round(100 * (claimed - actual), 1),
+                "avg_brier":        round(b["brier_sum"] / n, 4),
+            })
+        out.sort(key=lambda r: r["n"], reverse=True)
+        return out
+
     async def resolve_brier_predictions(self, limit: int = 50) -> int:
         """Scan unresolved Brier predictions and settle the ones whose
         markets have resolved. Uses the CLOB midpoint of the prediction's
@@ -1929,14 +2127,31 @@ class PolymarketBot:
             no_p = round(1 - yes_p, 4)
 
             # Build context block
+            # Make payoff asymmetry explicit: "buy YES at 0.20" implies a
+            # 5x payoff if right, 1x loss if wrong. Surfacing the win-multiple
+            # next to each price helps Claude weight cheap-side asymmetric
+            # bets (the dominant pattern in winning Polymarket strategies)
+            # rather than treating every market as a 50/50 coin flip.
+            _yes_payoff = (1.0 / yes_p) if yes_p > 0 else 0.0
+            _no_payoff  = (1.0 / no_p)  if no_p  > 0 else 0.0
             ctx_parts = [
                 f"MARKET: {question}",
-                f"CURRENT PRICES: YES={yes_p:.3f} ({yes_p*100:.1f}¢)  NO={no_p:.3f} ({no_p*100:.1f}¢)",
+                (
+                    f"CURRENT PRICES: YES={yes_p:.3f} ({yes_p*100:.1f}¢, "
+                    f"{_yes_payoff:.2f}× if wins)  "
+                    f"NO={no_p:.3f} ({no_p*100:.1f}¢, "
+                    f"{_no_payoff:.2f}× if wins)"
+                ),
                 f"VOLUME 24H: ${float(market.get('volume24hr',0)):,.0f}",
             ]
             macro = self._macro_cache
             if macro:
-                ctx_parts.append(f"MACRO: Fed Rate={macro.get('fed_rate')}%  CPI YoY={macro.get('cpi')}%")
+                _vix = macro.get("vix")
+                _vix_str = f"  VIX={_vix}" if _vix is not None else ""
+                ctx_parts.append(
+                    f"MACRO: Fed Rate={macro.get('fed_rate')}%  "
+                    f"CPI YoY={macro.get('cpi')}%{_vix_str}"
+                )
             fmp = self._fmp_cache.get("_sentiment", {})
             if fmp:
                 ctx_parts.append(f"MARKET SENTIMENT: SPY {fmp.get('spy_change_pct',0):+.2f}%  {fmp.get('up_count',0)}/{fmp.get('total',0)} stocks up")
@@ -1960,6 +2175,36 @@ class PolymarketBot:
             govtrack = research.get("govtrack", "")
             if govtrack:
                 ctx_parts.append(f"LEGISLATION: {govtrack}")
+            # Weather forecast (only present for weather-tagged markets with
+            # a resolvable location). Daily granularity, 14-day window, with
+            # precip probability — lets Claude compare the market's implied
+            # probability against the forecast directly.
+            wf = research.get("weather_forecast") or {}
+            if wf and wf.get("daily"):
+                daily   = wf["daily"]
+                times   = daily.get("time") or []
+                tmax    = daily.get("temperature_2m_max") or []
+                tmin    = daily.get("temperature_2m_min") or []
+                precip  = daily.get("precipitation_sum") or []
+                pop     = daily.get("precipitation_probability_max") or []
+                snow    = daily.get("snowfall_sum") or []
+                wind    = daily.get("windspeed_10m_max") or []
+                lines = [f"WEATHER FORECAST for {wf.get('city','?')} (fahrenheit, mph, inches):"]
+                for i in range(min(len(times), 14)):
+                    def _g(arr, default="—"):
+                        return arr[i] if i < len(arr) and arr[i] is not None else default
+                    lines.append(
+                        f"  {times[i]}: hi={_g(tmax)}°  lo={_g(tmin)}°  "
+                        f"rain={_g(precip,0)}in  pop={_g(pop,0)}%  "
+                        f"snow={_g(snow,0)}in  wind={_g(wind,0)}"
+                    )
+                ctx_parts.append("\n".join(lines))
+                ctx_parts.append(
+                    "WEATHER USAGE: compare the forecast above to the market "
+                    "question's threshold / date window. For weather contracts "
+                    "the forecast + its implied variance is usually a better "
+                    "prior than the order-book mid."
+                )
 
             # Current trading regime — lets Claude weight calibration against
             # system-level risk posture. In cautious/hostile regimes it should
@@ -3171,8 +3416,23 @@ class PolymarketBot:
         # just burns Anthropic API credits on already-decided outcomes
         if yes_p <= 0.02 or yes_p >= 0.98:
             return None
-        # Skip dead or illiquid markets — can't execute meaningfully
-        if liq < 5_000 or vol < 200:
+        # Skip dead or illiquid markets — can't execute meaningfully.
+        # Weather markets get a lower bar because they typically launch with
+        # $1-3k liquidity and small daily volume but carry real forecast edge.
+        # Daily-high/low temperature markets (the "Will highest temperature
+        # in <city> be ≥N°" template that's become the highest-EV niche on
+        # Polymarket) get the lowest bar — these routinely launch with
+        # $500-1k liquidity and <$100 daily volume but have a 24-48h
+        # resolution window so our forecast edge materialises fast.
+        _cat = type(self).classify_market(question)
+        _is_temp_threshold = type(self)._is_temp_threshold_market(question)
+        if _is_temp_threshold:
+            _min_liq, _min_vol = 500, 25
+        elif _cat == "weather":
+            _min_liq, _min_vol = 1_500, 50
+        else:
+            _min_liq, _min_vol = 5_000, 200
+        if liq < _min_liq or vol < _min_vol:
             return None
 
         if STRATEGY == "momentum":
@@ -3337,25 +3597,72 @@ class PolymarketBot:
         if not tid:
             return None
 
-        # Hard cap: never bet more than $100 on an EconFlow trade
-        amount = min(MAX_ORDER_SIZE, 100.0, max(1.0, flow["confidence"] / 10.0))
+        # ── Macro weighting ─────────────────────────────────────────────────
+        # Trade-flow is only meaningful when the broader tape is moving.
+        # VIX is the cheapest proxy: <13 = complacent market (flow likely
+        # noise from a single trader), >25 = stressed (flow more likely to
+        # carry real information). On known Fed-policy-sensitive markets,
+        # an obvious rate-cycle mismatch (e.g. flow buying YES on "Fed
+        # hikes" during an easing cycle) damps confidence further.
+        macro = self.get_macro_context() or {}
+        vix = macro.get("vix")
+        fed_rate = macro.get("fed_rate")
+        conf_mult = 1.0
+        notes = []
+        if isinstance(vix, (int, float)):
+            if vix < 13:
+                conf_mult *= 0.7
+                notes.append(f"calm tape (VIX {vix:.1f})")
+            elif vix > 25:
+                conf_mult *= 1.1
+                notes.append(f"stressed tape (VIX {vix:.1f})")
+        q_low = question.lower()
+        # Direction mismatch check on Fed-path markets. Rough heuristic:
+        # rate > 4% → tight cycle → "cut"/"lower" YES more plausible than "hike".
+        if isinstance(fed_rate, (int, float)) and ("fed" in q_low or "fomc" in q_low or "rate" in q_low):
+            hawkish_bet = side_label == "YES" and any(x in q_low for x in ["hike","raise","increase","higher"])
+            dovish_bet  = side_label == "YES" and any(x in q_low for x in ["cut","lower","decrease","reduce"])
+            if fed_rate > 4.0 and hawkish_bet:
+                conf_mult *= 0.75
+                notes.append(f"contra-cycle (rate {fed_rate:.2f}% + hawkish bet)")
+            elif fed_rate < 2.0 and dovish_bet:
+                conf_mult *= 0.75
+                notes.append(f"contra-cycle (rate {fed_rate:.2f}% + dovish bet)")
 
-        reason = (
+        weighted_conf = max(0.0, min(100.0, flow["confidence"] * conf_mult))
+
+        # Below 15% weighted confidence the signal is effectively noise;
+        # skip rather than burn a bet on it.
+        if weighted_conf < 15.0:
+            self._log(
+                f"[ECON FLOW] SKIP {question[:40]} — weighted conf {weighted_conf:.0f}% "
+                f"({'; '.join(notes) if notes else 'no macro edge'})"
+            )
+            return None
+
+        # Hard cap: never bet more than $100 on an EconFlow trade
+        amount = min(MAX_ORDER_SIZE, 100.0, max(1.0, weighted_conf / 10.0))
+
+        reason_parts = [
             f"Trade flow spike {flow['spike_ratio']:.1f}× avg "
             f"({flow['recent_trades']} trades in 5min, "
             f"{flow['yes_vol']:.0f} YES / {flow['no_vol']:.0f} NO USDC)"
-        )
+        ]
+        if notes:
+            reason_parts.append("macro: " + "; ".join(notes))
+        reason = " | ".join(reason_parts)
 
         self._log(
             f"[ECON FLOW] {side_label} pressure on {question[:45]} "
-            f"— {flow['spike_ratio']:.1f}× spike, conf={flow['confidence']}%"
+            f"— {flow['spike_ratio']:.1f}× spike, base_conf={flow['confidence']}% "
+            f"× macro={conf_mult:.2f} → {weighted_conf:.0f}%"
         )
         return {
             "strategy":    "econFlow",
             "signal":      f"BUY {side_label}",
             "token_id":    tid,
             "price":       round(entry_p, 4),
-            "confidence":  flow["confidence"],
+            "confidence":  round(weighted_conf, 1),
             "market":      question,
             "amount":      round(amount, 2),
             "spike_ratio": flow["spike_ratio"],
@@ -3640,9 +3947,21 @@ class PolymarketBot:
                             _q_lower = c["question"].lower()
                             _is_legal = any(x in _q_lower for x in ["indicted","trial","court","lawsuit","ruling","judge","convicted","charged","plea","verdict","sentenced"])
                             _is_legislative = any(x in _q_lower for x in ["bill","act","legislation","congress","senate","pass","signed","law","vote","amendment"])
+                            _cat = type(self).classify_market(c["question"])
                             _tasks: dict = {
                                 "crypto": asyncio.to_thread(self.get_crypto_prices),
                                 "news":   asyncio.to_thread(self.get_news_headlines, c["question"][:60]),
+                                # Keep macro + FMP caches fresh on every AI call.
+                                # Both methods are cache-aware (TTL 1hr / 5min) so
+                                # calling them each cycle is cheap when warm and
+                                # re-fetches when stale. Previously these only
+                                # refreshed inside the momentum strategy path
+                                # (bot.py:3302,3398), so AI-path markets were
+                                # reading whatever values happened to be in the
+                                # cache from hours ago — same "data fetched but
+                                # never freshly routed" bug as the weather gap.
+                                "_macro": asyncio.to_thread(self.get_macro_context),
+                                "_fmp":   asyncio.to_thread(self.get_fmp_market),
                             }
                             if TAVILY_API_KEY:
                                 _tasks["tavily"] = asyncio.to_thread(self.get_tavily_research, c["question"][:80])
@@ -3650,6 +3969,15 @@ class PolymarketBot:
                                 _tasks["court"] = asyncio.to_thread(self.get_courtlistener_data, c["question"][:60])
                             if _is_legislative:
                                 _tasks["govtrack"] = asyncio.to_thread(self.get_govtrack_data, c["question"][:60])
+                            # Weather markets: fetch a location-specific 14-day
+                            # forecast so Claude can compare its own pricing
+                            # with the forecast probability directly.
+                            if _cat == "weather":
+                                _city = type(self)._extract_city(c["question"])
+                                if _city:
+                                    _tasks["weather_forecast"] = asyncio.to_thread(
+                                        self.get_weather_for_location, _city
+                                    )
                             _k = list(_tasks.keys())
                             _v = await asyncio.gather(*_tasks.values(), return_exceptions=True)
                             _research = {"orderbook": ob}
@@ -4853,6 +5181,22 @@ async def trigger_brier_resolve(limit: int = 50):
     limit = max(1, min(limit, 500))
     settled = await bot.resolve_brier_predictions(limit=limit)
     return JSONResponse({"ok": True, "settled": settled})
+
+
+@app.get("/brier/calibration")
+def get_brier_calibration(days: int = 30):
+    """Per-category + per-city calibration scorecard.
+    Answers 'which categories is the AI well-calibrated on, and which
+    is it overconfident in?' by splitting resolved Brier predictions
+    by market category and computing claimed vs actual win rate. Also
+    returns a per-city breakdown restricted to weather markets so the
+    operator can see geographic edge (Seattle vs Miami etc.)."""
+    days = max(1, min(int(days), 365))
+    return JSONResponse({
+        "window_days": days,
+        "by_category": bot.get_brier_by_category(window_days=days),
+        "by_city":     bot.get_brier_by_city(window_days=days),
+    })
 
 
 @app.get("/pnl/realized")

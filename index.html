@@ -297,6 +297,31 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
         <div style="color:var(--text3)">No reviews yet. First review runs at 00:05 UTC after the bot has real trades in the last 24h.</div>
       </div>
     </div>
+    <div class="panel" id="calibration-panel">
+      <div class="panel-title">CALIBRATION BY CATEGORY (30D)</div>
+      <div id="calibration-body" style="font-size:10px;padding:4px 0">
+        <div style="color:var(--text3);font-size:10px">No resolved predictions yet.</div>
+      </div>
+      <div id="calibration-city-wrap" style="display:none;margin-top:12px;border-top:1px solid var(--border2);padding-top:10px">
+        <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px">Weather · By city</div>
+        <div id="calibration-city-body" style="font-size:10px;padding:4px 0"></div>
+      </div>
+      <div style="color:var(--text3);font-size:9px;line-height:1.4;margin-top:6px">
+        CLAIMED = AI's avg predicted win % · ACTUAL = how often it was right · GAP &gt; 0 = overconfident · BRIER lower is better (0 = perfect, 0.25 = coin flip)
+      </div>
+    </div>
+    <div class="panel" id="pretrade-panel">
+      <div class="panel-title">PRETRADE CHECKS (24H)</div>
+      <div style="display:flex;gap:16px;margin-bottom:8px;font-size:11px">
+        <div><span style="color:var(--text3);font-size:10px">ABORTED</span><br><span id="pretrade-aborts" style="color:var(--red);font-weight:700;font-size:18px;font-family:var(--mono)">—</span></div>
+        <div><span style="color:var(--text3);font-size:10px">DOWNSIZED</span><br><span id="pretrade-downsizes" style="color:var(--orange);font-weight:700;font-size:18px;font-family:var(--mono)">—</span></div>
+        <div style="flex:1"></div>
+        <div style="align-self:flex-end"><span id="pretrade-enabled" style="color:var(--text3);font-size:9px">—</span></div>
+      </div>
+      <div id="pretrade-body" style="font-size:10px;color:var(--text2);padding:4px 0;max-height:180px;overflow-y:auto">
+        <div style="color:var(--text3);font-size:10px">No recent catches.</div>
+      </div>
+    </div>
     <div class="panel">
       <div class="panel-title">FED / MACRO</div>
       <div class="fred-grid" id="fred-data">
@@ -1472,19 +1497,110 @@ async function fetchRealizedPnl(){
 /* ── PRE-TRADE catches (Claude gate) ── */
 async function fetchPretrade(){
   try{
-    const r=await fetch(`${BOT}/pretrade/recent?limit=1`);if(!r.ok)return;
+    const r=await fetch(`${BOT}/pretrade/recent?limit=15`);if(!r.ok)return;
     const d=await r.json();
     const row=document.getElementById('pretrade-row');
     const el=document.getElementById('pretrade-state');
-    if(!d||!d.enabled||!el||!row)return;
-    const a=Number(d.last_24h_aborts||0);
-    const ds=Number(d.last_24h_downsizes||0);
-    if(a===0 && ds===0){row.style.display='none';return;}
-    row.style.display='';
-    const parts=[];
-    if(a>0)parts.push(`<span class="r">${a} abort${a===1?'':'s'}</span>`);
-    if(ds>0)parts.push(`<span class="y">${ds} downsize${ds===1?'':'s'}</span>`);
-    el.innerHTML=parts.join(' · ');
+    const a=Number(d&&d.last_24h_aborts||0);
+    const ds=Number(d&&d.last_24h_downsizes||0);
+    // mini status-row update (legacy header pill)
+    if(d&&d.enabled&&el&&row){
+      if(a===0 && ds===0){row.style.display='none';}
+      else {
+        row.style.display='';
+        const parts=[];
+        if(a>0)parts.push(`<span class="r">${a} abort${a===1?'':'s'}</span>`);
+        if(ds>0)parts.push(`<span class="y">${ds} downsize${ds===1?'':'s'}</span>`);
+        el.innerHTML=parts.join(' · ');
+      }
+    }
+    // full panel update (CALIBRATION sidebar)
+    const abortEl=document.getElementById('pretrade-aborts');
+    const dsEl=document.getElementById('pretrade-downsizes');
+    const enEl=document.getElementById('pretrade-enabled');
+    const body=document.getElementById('pretrade-body');
+    if(abortEl)abortEl.textContent=a;
+    if(dsEl)dsEl.textContent=ds;
+    if(enEl)enEl.textContent=d&&d.enabled?'● LIVE':'○ DISABLED';
+    if(body){
+      const entries=(d&&d.entries)||[];
+      if(entries.length===0){
+        body.innerHTML='<div style="color:var(--text3);font-size:10px">No recent catches.</div>';
+      } else {
+        body.innerHTML=entries.slice(0,15).map(e=>{
+          const mkt=safeHtml((e.market||'').slice(0,60));
+          const sd=safeHtml(e.our_side||'');
+          const tag=e.proceed
+            ? `<span style="color:var(--orange)">↓ ×${(Number(e.size_multiplier)||0).toFixed(2)}</span>`
+            : `<span style="color:var(--red)">ABORT</span>`;
+          const reason=safeHtml((e.reason||'').slice(0,110));
+          const when=safeHtml((e.at||'').replace('T',' ').slice(0,16));
+          return `<div style="padding:4px 0;border-bottom:1px dashed var(--border2)">
+            <div style="display:flex;justify-content:space-between;gap:8px">
+              <span style="color:var(--text2)">${mkt}</span>
+              <span style="font-family:var(--mono);color:var(--text3);font-size:9px">${when}</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;gap:8px;margin-top:2px">
+              <span style="color:var(--text3);font-size:9px">${sd} · $${(Number(e.amount_usdc)||0).toFixed(2)} · ${tag}</span>
+            </div>
+            <div style="color:var(--text3);font-size:9px;margin-top:2px;line-height:1.3">${reason}</div>
+          </div>`;
+        }).join('');
+      }
+    }
+  }catch(e){}
+}
+
+/* ── CALIBRATION BY CATEGORY ──
+   Per-category scorecard. Shows which categories AI is well-calibrated
+   on and which it's overconfident in — the evidence base for deciding
+   whether to lean into weather / dial back politics / etc. */
+async function fetchCalibration(){
+  try{
+    const r=await fetch(`${BOT}/brier/calibration?days=30`);if(!r.ok)return;
+    const d=await r.json();
+    const body=document.getElementById('calibration-body');
+    if(!body)return;
+    const rows=(d&&d.by_category)||[];
+    const renderRow=(label, r)=>{
+      const nWarn=r.n<5?'<span style="color:var(--orange);font-size:9px"> ⚠</span>':'';
+      const gap=r.calibration_gap;
+      const gapColor=Math.abs(gap)<5?'var(--green)':(gap>0?'var(--red)':'var(--orange)');
+      const brier=r.avg_brier;
+      const brierColor=brier<0.15?'var(--green)':(brier<0.22?'var(--orange)':'var(--red)');
+      return `<div style="display:grid;grid-template-columns:1.3fr .5fr .6fr .6fr .6fr .6fr;gap:6px;padding:4px 0;font-family:var(--mono);font-size:10px;border-bottom:1px dashed var(--border2)">
+        <span style="color:var(--text)">${safeHtml(label)}${nWarn}</span>
+        <span style="text-align:right;color:var(--text2)">${r.n}</span>
+        <span style="text-align:right;color:var(--text2)">${r.claimed_win_pct.toFixed(0)}%</span>
+        <span style="text-align:right;color:var(--text2)">${r.actual_win_pct.toFixed(0)}%</span>
+        <span style="text-align:right;color:${gapColor}">${gap>0?'+':''}${gap.toFixed(1)}</span>
+        <span style="text-align:right;color:${brierColor}">${brier.toFixed(3)}</span>
+      </div>`;
+    };
+    const hdr=(firstLbl)=>`<div style="display:grid;grid-template-columns:1.3fr .5fr .6fr .6fr .6fr .6fr;gap:6px;color:var(--text3);font-size:9px;padding:4px 0;border-bottom:1px solid var(--border2)">
+      <span>${firstLbl}</span><span style="text-align:right">N</span><span style="text-align:right">CLAIMED</span><span style="text-align:right">ACTUAL</span><span style="text-align:right">GAP</span><span style="text-align:right">BRIER</span>
+    </div>`;
+
+    // CATEGORY BREAKDOWN
+    if(rows.length===0){
+      body.innerHTML='<div style="color:var(--text3);font-size:10px">No resolved predictions in the last 30 days yet.</div>';
+    } else {
+      body.innerHTML = hdr('CATEGORY') + rows.map(r=>renderRow(r.category.toUpperCase(), r)).join('');
+    }
+
+    // BY-CITY BREAKDOWN (weather only) — hidden if empty so the panel
+    // stays clean until we have resolved weather trades.
+    const cityRows=(d&&d.by_city)||[];
+    const cityWrap=document.getElementById('calibration-city-wrap');
+    const cityBody=document.getElementById('calibration-city-body');
+    if(cityWrap && cityBody){
+      if(cityRows.length===0){
+        cityWrap.style.display='none';
+      } else {
+        cityWrap.style.display='';
+        cityBody.innerHTML = hdr('CITY') + cityRows.map(r=>renderRow(r.city, r)).join('');
+      }
+    }
   }catch(e){}
 }
 /* ── NIGHTLY REVIEWS ── */
@@ -1555,7 +1671,7 @@ async function applyReview(reviewId,idx,btn){
   }
 }
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();fetchClaudeMax();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();fetchClaudeMax();fetchCalibration();
 setInterval(fetchBot,15000);
 setInterval(fetchPortfolio,30000);
 setInterval(fetchMarkets,60000);
@@ -1569,6 +1685,7 @@ setInterval(fetchPaperPortfolio,30000);
 setInterval(fetchRegime,60000);
 setInterval(fetchReviews,600000);
 setInterval(fetchPretrade,90000);
+setInterval(fetchCalibration,600000);  // 10 min — data only changes when Brier resolver fires (every 6h)
 setInterval(fetchRealizedPnl,180000);
 setInterval(fetchDeep,120000);
 setInterval(fetchClaudeMax,60000);
