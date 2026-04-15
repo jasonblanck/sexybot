@@ -89,6 +89,16 @@ NIGHTLY_REVIEW_ENABLED  = os.getenv("NIGHTLY_REVIEW",  "true").lower() == "true"
 PRETRADE_CHECK_ENABLED = os.getenv("PRETRADE_CHECK", "true").lower() == "true"
 PRETRADE_MIN_USD       = float(os.getenv("PRETRADE_MIN_USD", "3.0"))
 PRETRADE_TIMEOUT_S     = float(os.getenv("PRETRADE_TIMEOUT_S", "4.0"))
+# Anthropic spend throttles. The bot fires one analyze_with_claude call per
+# qualifying market per scan cycle — at the default 30s scan + 20-confidence
+# gate, worst-case spend is ~$30-60/day. Two knobs let the operator trade
+# signal cadence for cost:
+#   SCAN_INTERVAL_S:   seconds between trading-loop cycles (default 60)
+#   AI_MIN_CONFIDENCE: signals below this don't trigger analyze_with_claude
+#                      (default 35 — skips weak signals that rarely turn
+#                      into trades anyway and saves ~50% of AI calls)
+SCAN_INTERVAL_S        = float(os.getenv("SCAN_INTERVAL_S",   "60.0"))
+AI_MIN_CONFIDENCE      = float(os.getenv("AI_MIN_CONFIDENCE", "35.0"))
 # Deep analysis: for trades above DEEP_ANALYZE_MIN_USD, fire a second pass
 # with a stronger model + server-side web_search to catch signals that the
 # fast pass missed. Expensive (~10-30s latency, $0.10-0.50/call) so only
@@ -3942,7 +3952,7 @@ class PolymarketBot:
                     except Exception:
                         ob = {}
                     ai_res = None
-                    if ai_enabled and float(c["signal"].get("confidence", 0)) >= 20:
+                    if ai_enabled and float(c["signal"].get("confidence", 0)) >= AI_MIN_CONFIDENCE:
                         try:
                             _q_lower = c["question"].lower()
                             _is_legal = any(x in _q_lower for x in ["indicted","trial","court","lawsuit","ruling","judge","convicted","charged","plea","verdict","sentenced"])
@@ -4018,7 +4028,7 @@ class PolymarketBot:
                         ob_data, ai = _er
                     predicted_prob = None
 
-                    if ai is None and ai_enabled and float(signal.get("confidence", 0)) >= 20:
+                    if ai is None and ai_enabled and float(signal.get("confidence", 0)) >= AI_MIN_CONFIDENCE:
                         _ai_failures += 1
                         if _ai_failures >= 3:
                             self._log("AI circuit breaker: 3+ failures this cycle", "warning")
@@ -4500,7 +4510,7 @@ async def lifespan(app_: FastAPI):
     global _bot_task
     if bot.connect():
         bot.running = True  # set before create_task to prevent double-start race at startup
-        _bot_task = asyncio.create_task(bot.run_loop(interval=30.0))
+        _bot_task = asyncio.create_task(bot.run_loop(interval=SCAN_INTERVAL_S))
         log.info("Bot auto-started on startup")
         if PAPER_MODE and _PAPER_AVAILABLE and bot.paper:
             bot.start_paper_oracle()
@@ -4727,7 +4737,11 @@ def portfolio():
 
 
 @app.post("/start", dependencies=[Depends(require_api_key)])
-async def start_bot(interval: float = 30.0):
+async def start_bot(interval: Optional[float] = None):
+    # Default to the env-configured SCAN_INTERVAL_S so /start respects the
+    # operator's throttle. Explicit query-param still wins for debugging.
+    if interval is None:
+        interval = SCAN_INTERVAL_S
     global _bot_task
     if bot.running:
         return {"ok": False, "message": "Already running"}
