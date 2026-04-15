@@ -2127,9 +2127,21 @@ class PolymarketBot:
             no_p = round(1 - yes_p, 4)
 
             # Build context block
+            # Make payoff asymmetry explicit: "buy YES at 0.20" implies a
+            # 5x payoff if right, 1x loss if wrong. Surfacing the win-multiple
+            # next to each price helps Claude weight cheap-side asymmetric
+            # bets (the dominant pattern in winning Polymarket strategies)
+            # rather than treating every market as a 50/50 coin flip.
+            _yes_payoff = (1.0 / yes_p) if yes_p > 0 else 0.0
+            _no_payoff  = (1.0 / no_p)  if no_p  > 0 else 0.0
             ctx_parts = [
                 f"MARKET: {question}",
-                f"CURRENT PRICES: YES={yes_p:.3f} ({yes_p*100:.1f}¢)  NO={no_p:.3f} ({no_p*100:.1f}¢)",
+                (
+                    f"CURRENT PRICES: YES={yes_p:.3f} ({yes_p*100:.1f}¢, "
+                    f"{_yes_payoff:.2f}× if wins)  "
+                    f"NO={no_p:.3f} ({no_p*100:.1f}¢, "
+                    f"{_no_payoff:.2f}× if wins)"
+                ),
                 f"VOLUME 24H: ${float(market.get('volume24hr',0)):,.0f}",
             ]
             macro = self._macro_cache
