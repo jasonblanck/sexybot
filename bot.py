@@ -1729,6 +1729,53 @@ class PolymarketBot:
             log.warning(f"get_brier_stats DB error: {e}")
             return {}
 
+    def get_brier_by_category(self, window_days: int = 30) -> list:
+        """Per-category calibration scorecard. For each category:
+          n                  # resolved predictions in window
+          claimed_win_pct    # AI's average probability it'd win
+          actual_win_pct     # how often AI was actually right
+          calibration_gap    # claimed − actual (positive = overconfident)
+          avg_brier          # lower is better (0 = perfect, 0.25 = coin flip)
+        Categories with n < 5 are still shown so the operator can see
+        sample-size warnings rather than wondering why a category is
+        missing.
+        """
+        try:
+            rows = self.db.execute(
+                "SELECT market, predicted_prob, actual_outcome, brier_score "
+                "FROM brier_scores "
+                "WHERE resolved=1 AND brier_score IS NOT NULL "
+                "AND time >= datetime('now', ?)",
+                (f"-{int(max(1,min(window_days,365)))} days",),
+            ).fetchall()
+        except Exception as e:
+            log.warning(f"get_brier_by_category query error: {e}")
+            return []
+        buckets: dict = {}
+        for market, predicted, actual, brier in rows:
+            cat = type(self).classify_market(market or "")
+            b = buckets.setdefault(cat, {"n": 0, "p_sum": 0.0, "w_sum": 0.0, "brier_sum": 0.0})
+            b["n"]         += 1
+            b["p_sum"]     += float(predicted or 0)
+            b["w_sum"]     += 1 if int(actual or 0) == 1 else 0
+            b["brier_sum"] += float(brier or 0)
+        out = []
+        for cat, b in buckets.items():
+            n = b["n"] or 1
+            claimed = b["p_sum"] / n
+            actual  = b["w_sum"] / n
+            out.append({
+                "category":         cat,
+                "n":                b["n"],
+                "claimed_win_pct":  round(100 * claimed, 1),
+                "actual_win_pct":   round(100 * actual, 1),
+                "calibration_gap":  round(100 * (claimed - actual), 1),
+                "avg_brier":        round(b["brier_sum"] / n, 4),
+            })
+        # Largest n first — stability-weighted display
+        out.sort(key=lambda r: r["n"], reverse=True)
+        return out
+
     async def resolve_brier_predictions(self, limit: int = 50) -> int:
         """Scan unresolved Brier predictions and settle the ones whose
         markets have resolved. Uses the CLOB midpoint of the prediction's
@@ -5000,6 +5047,19 @@ async def trigger_brier_resolve(limit: int = 50):
     limit = max(1, min(limit, 500))
     settled = await bot.resolve_brier_predictions(limit=limit)
     return JSONResponse({"ok": True, "settled": settled})
+
+
+@app.get("/brier/calibration")
+def get_brier_calibration(days: int = 30):
+    """Per-category calibration scorecard.
+    Answers 'which categories is the AI well-calibrated on, and which
+    is it overconfident in?' by splitting resolved Brier predictions
+    by market category and computing claimed vs actual win rate."""
+    days = max(1, min(int(days), 365))
+    return JSONResponse({
+        "window_days": days,
+        "by_category": bot.get_brier_by_category(window_days=days),
+    })
 
 
 @app.get("/pnl/realized")
