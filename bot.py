@@ -591,6 +591,27 @@ class PolymarketBot:
                 return cat
         return "other"
 
+    @classmethod
+    def _is_temp_threshold_market(cls, question: str) -> bool:
+        """Detect the specific 'highest/lowest temperature in <city> be <N>°'
+        template that dominates the highest-EV weather niche on Polymarket.
+        Requires (a) a temperature keyword, (b) either a 'highest' / 'lowest' /
+        'high' / 'low' modifier, AND (c) a numeric threshold. Deliberately
+        narrow — generic 'weather' markets go through the regular weather
+        path with its $1500 liquidity floor."""
+        if not question:
+            return False
+        import re as _re
+        q = question.lower()
+        if "temperature" not in q and "°" not in q and " temp " not in q and q.endswith(" temp") is False:
+            return False
+        has_extreme = any(w in q for w in ["highest", "lowest", "high temp", "low temp",
+                                            "max temp", "min temp", "peak temp"])
+        # Match "72°", "85 degrees", "40F", "95°F" etc. The `°` symbol needs
+        # no word boundary (it isn't a word char); the bare letters F / C do.
+        has_threshold = bool(_re.search(r"\d{1,3}\s*(?:°[fc]?|degrees?|[fc]\b)", q))
+        return has_extreme and has_threshold
+
     def get_daily_loss(self) -> float:
         try:
             today = datetime.utcnow().strftime("%Y-%m-%d")  # match UTC stored in time column
@@ -1773,6 +1794,52 @@ class PolymarketBot:
                 "avg_brier":        round(b["brier_sum"] / n, 4),
             })
         # Largest n first — stability-weighted display
+        out.sort(key=lambda r: r["n"], reverse=True)
+        return out
+
+    def get_brier_by_city(self, window_days: int = 30) -> list:
+        """Per-city calibration for weather-tagged markets only.
+        Motivated by the brother-benchmark finding that geographic
+        edge in weather forecasting is real (Seattle / NYC / Atlanta
+        were disproportionately profitable in his stats). Lets the
+        operator see which cities *our* signal nails vs misses, once
+        enough resolved weather trades accumulate."""
+        try:
+            rows = self.db.execute(
+                "SELECT market, predicted_prob, actual_outcome, brier_score "
+                "FROM brier_scores "
+                "WHERE resolved=1 AND brier_score IS NOT NULL "
+                "AND time >= datetime('now', ?)",
+                (f"-{int(max(1,min(window_days,365)))} days",),
+            ).fetchall()
+        except Exception as e:
+            log.warning(f"get_brier_by_city query error: {e}")
+            return []
+        buckets: dict = {}
+        for market, predicted, actual, brier in rows:
+            if type(self).classify_market(market or "") != "weather":
+                continue
+            city = type(self)._extract_city(market or "")
+            if not city:
+                continue
+            b = buckets.setdefault(city, {"n": 0, "p_sum": 0.0, "w_sum": 0.0, "brier_sum": 0.0})
+            b["n"]         += 1
+            b["p_sum"]     += float(predicted or 0)
+            b["w_sum"]     += 1 if int(actual or 0) == 1 else 0
+            b["brier_sum"] += float(brier or 0)
+        out = []
+        for city, b in buckets.items():
+            n = b["n"] or 1
+            claimed = b["p_sum"] / n
+            actual  = b["w_sum"] / n
+            out.append({
+                "city":             city,
+                "n":                b["n"],
+                "claimed_win_pct":  round(100 * claimed, 1),
+                "actual_win_pct":   round(100 * actual, 1),
+                "calibration_gap":  round(100 * (claimed - actual), 1),
+                "avg_brier":        round(b["brier_sum"] / n, 4),
+            })
         out.sort(key=lambda r: r["n"], reverse=True)
         return out
 
@@ -3340,8 +3407,16 @@ class PolymarketBot:
         # Skip dead or illiquid markets — can't execute meaningfully.
         # Weather markets get a lower bar because they typically launch with
         # $1-3k liquidity and small daily volume but carry real forecast edge.
+        # Daily-high/low temperature markets (the "Will highest temperature
+        # in <city> be ≥N°" template that's become the highest-EV niche on
+        # Polymarket) get the lowest bar — these routinely launch with
+        # $500-1k liquidity and <$100 daily volume but have a 24-48h
+        # resolution window so our forecast edge materialises fast.
         _cat = type(self).classify_market(question)
-        if _cat == "weather":
+        _is_temp_threshold = type(self)._is_temp_threshold_market(question)
+        if _is_temp_threshold:
+            _min_liq, _min_vol = 500, 25
+        elif _cat == "weather":
             _min_liq, _min_vol = 1_500, 50
         else:
             _min_liq, _min_vol = 5_000, 200
@@ -5098,14 +5173,17 @@ async def trigger_brier_resolve(limit: int = 50):
 
 @app.get("/brier/calibration")
 def get_brier_calibration(days: int = 30):
-    """Per-category calibration scorecard.
+    """Per-category + per-city calibration scorecard.
     Answers 'which categories is the AI well-calibrated on, and which
     is it overconfident in?' by splitting resolved Brier predictions
-    by market category and computing claimed vs actual win rate."""
+    by market category and computing claimed vs actual win rate. Also
+    returns a per-city breakdown restricted to weather markets so the
+    operator can see geographic edge (Seattle vs Miami etc.)."""
     days = max(1, min(int(days), 365))
     return JSONResponse({
         "window_days": days,
         "by_category": bot.get_brier_by_category(window_days=days),
+        "by_city":     bot.get_brier_by_city(window_days=days),
     })
 
 
