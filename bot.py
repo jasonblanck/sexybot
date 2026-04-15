@@ -99,6 +99,13 @@ PRETRADE_TIMEOUT_S     = float(os.getenv("PRETRADE_TIMEOUT_S", "4.0"))
 #                      into trades anyway and saves ~50% of AI calls)
 SCAN_INTERVAL_S        = float(os.getenv("SCAN_INTERVAL_S",   "60.0"))
 AI_MIN_CONFIDENCE      = float(os.getenv("AI_MIN_CONFIDENCE", "35.0"))
+# Startup safety: cancel any orders left open on Polymarket from a previous
+# bot incarnation. Without this, a crash/restart leaves orphan orders that
+# can fill silently while the bot has no memory of placing them — exactly
+# the failure mode that bit us when the stray main_v2.py was running. The
+# default `true` is the safe choice; set false only if you intend to hand
+# off open orders across restarts (rare).
+STARTUP_CANCEL_OPEN    = os.getenv("STARTUP_CANCEL_OPEN", "true").lower() == "true"
 # Deep analysis: for trades above DEEP_ANALYZE_MIN_USD, fire a second pass
 # with a stronger model + server-side web_search to catch signals that the
 # fast pass missed. Expensive (~10-30s latency, $0.10-0.50/call) so only
@@ -4665,6 +4672,18 @@ _bot_task: Optional[asyncio.Task] = None
 async def lifespan(app_: FastAPI):
     global _bot_task
     if bot.connect():
+        # Startup order reconciliation: clear any orphan orders left
+        # open on Polymarket from a previous bot incarnation. Done
+        # *before* setting running=True so the cancel can't race a
+        # new order placement from the just-started loop. Cancel-all
+        # is idempotent and a no-op if there are no open orders.
+        if STARTUP_CANCEL_OPEN and not DRY_RUN:
+            try:
+                await asyncio.to_thread(bot.cancel_all_orders)
+                log.info("[STARTUP RECONCILE] cancel_all_orders issued — orphan orders cleared")
+            except Exception as e:
+                # Don't block startup on a reconcile failure; log loudly.
+                log.warning(f"[STARTUP RECONCILE] cancel_all failed: {e}")
         bot.running = True  # set before create_task to prevent double-start race at startup
         _bot_task = asyncio.create_task(bot.run_loop(interval=SCAN_INTERVAL_S))
         log.info("Bot auto-started on startup")
