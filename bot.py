@@ -1685,8 +1685,13 @@ class PolymarketBot:
         try:
             from tavily import TavilyClient
             client = TavilyClient(api_key=TAVILY_API_KEY)
-            result = client.search(query=query, search_depth="basic", max_results=3)
-            snippets = [r.get("content","")[:300] for r in result.get("results", [])]
+            # search_depth="advanced" returns longer extracts (Tavily bills
+            # 2 credits/call instead of 1, but the extra context materially
+            # improves reasoning on legal/political/macro markets). 600
+            # chars/snippet × 3 results = ~1800 chars, which still fits
+            # comfortably inside Sonnet's context window.
+            result = client.search(query=query, search_depth="advanced", max_results=3)
+            snippets = [r.get("content","")[:600] for r in result.get("results", [])]
             return " | ".join(snippets)
         except Exception as e:
             log.debug(f"Tavily error: {e}")
@@ -2343,7 +2348,10 @@ class PolymarketBot:
                     ctx_parts.append(f"  - [{n.get('published','')}] {n.get('title','')}")
             tavily = research.get("tavily", "")
             if tavily:
-                ctx_parts.append(f"WEB RESEARCH: {tavily[:500]}")
+                # Match the fetcher's 600-char-per-snippet × 3 snippets upper
+                # bound (~1800 chars + separators). Previously double-
+                # truncated to 500 here, cutting research mid-sentence.
+                ctx_parts.append(f"WEB RESEARCH: {tavily[:1800]}")
             court = research.get("court", "")
             if court:
                 ctx_parts.append(f"COURT DOCKETS: {court}")
