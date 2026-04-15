@@ -142,6 +142,12 @@ BACKTEST_WEEKLY_ENABLED = os.getenv("BACKTEST_WEEKLY", "true").lower() == "true"
 # strategies alone. Use this if Anthropic is having an outage, if you spot
 # a bad pattern, or if you just want to run the legacy path for a day.
 CLAUDE_MAX_DISABLED    = os.getenv("CLAUDE_MAX_DISABLE", "false").lower() == "true"
+# Position redeemer — auto-claims resolved winning positions and merges
+# matched YES+NO pairs back to USDC via the Gnosis Safe proxy wallet.
+# Only active when POLYMARKET_FUNDER is set (proxy wallet mode); EOA mode
+# claims are a different flow not implemented here.
+REDEEMER_ENABLED       = os.getenv("REDEEMER", "true").lower() == "true"
+REDEEMER_CHECK_SEC     = int(os.getenv("REDEEMER_CHECK_SEC", "300"))    # 5 min default
 if CLAUDE_MAX_DISABLED:
     # Force every AI feature off — keeps downstream code paths safe
     # without having to check CLAUDE_MAX_DISABLED everywhere.
@@ -312,6 +318,9 @@ class PolymarketBot:
         self._db_maintenance_task:  Optional[asyncio.Task] = None
         # Daily Telegram digest task
         self._daily_summary_task:   Optional[asyncio.Task] = None
+        # Position redeemer handle + task
+        self._redeemer:             Optional[object] = None
+        self._redeemer_task:        Optional[asyncio.Task] = None
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -742,6 +751,21 @@ class PolymarketBot:
             ok = self.client.get_ok()
             self._log(f"Connected to Polymarket CLOB — {ok}")
             self.init_db()
+            # Initialise the position redeemer (proxy-wallet mode only).
+            # Import lazily so the bot starts even without web3 installed.
+            if REDEEMER_ENABLED and funder and not DRY_RUN:
+                try:
+                    from redeemer import PositionRedeemer
+                    self._redeemer = PositionRedeemer(
+                        private_key    = PRIVATE_KEY,
+                        safe_address   = funder,
+                        signer_address = self.client.get_address(),
+                        dry_run        = False,
+                    )
+                    self._log(f"[REDEEMER] ready — will auto-claim wins every {REDEEMER_CHECK_SEC}s")
+                except Exception as e:
+                    self._log(f"[REDEEMER] init failed ({e}) — manual claim only", "warning")
+                    self._redeemer = None
             self.send_telegram("Bot connected and starting up")
             return True
         except Exception as e:
@@ -3633,6 +3657,40 @@ class PolymarketBot:
 
         return "\n".join(lines)
 
+    async def _redeemer_loop(self):
+        """Background task — every REDEEMER_CHECK_SEC (default 5 min) the
+        PositionRedeemer checks on-chain for redeemable positions (resolved
+        markets our proxy wallet holds winning tokens on) and mergeable
+        positions (back-to-back YES+NO on the same market from MM or
+        arbitrage). Claims them via the Gnosis Safe, converting locked
+        outcome tokens back to USDC that the CLOB can then spend.
+
+        Safe to no-op: if self._redeemer wasn't initialised (EOA mode,
+        web3 missing, or REDEEMER=false), the task exits cleanly without
+        firing."""
+        if self._redeemer is None:
+            return
+        # Small boot delay so the CLOB has time to settle on fresh starts
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            return
+        while self.running:
+            try:
+                claimed = await asyncio.to_thread(self._redeemer.run_once)
+                if claimed:
+                    self._log(f"[REDEEMER] claimed/merged {claimed} position(s)")
+                    # Nudge positions cache so dashboard shows the payout soon
+                    self._positions_cache_time = 0
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning(f"redeemer loop error: {e}")
+            try:
+                await asyncio.sleep(max(60, REDEEMER_CHECK_SEC))
+            except asyncio.CancelledError:
+                break
+
     async def _daily_summary_loop(self):
         """Background task — fires one Telegram digest per UTC day at the
         configured hour:min. No-op if Telegram creds aren't set or
@@ -4871,6 +4929,10 @@ async def lifespan(app_: FastAPI):
                 f"[DAILY SUMMARY] Telegram digest scheduled "
                 f"(~{DAILY_SUMMARY_UTC_HOUR:02d}:{DAILY_SUMMARY_UTC_MIN:02d} UTC)"
             )
+        # Auto-claim winning positions — no-op if redeemer didn't init.
+        if bot._redeemer is not None:
+            bot._redeemer_task = asyncio.create_task(bot._redeemer_loop())
+            log.info(f"[REDEEMER] claim loop scheduled (every {REDEEMER_CHECK_SEC}s)")
     else:
         log.warning("Could not connect — check .env credentials")
     yield
@@ -4888,6 +4950,8 @@ async def lifespan(app_: FastAPI):
         bot._db_maintenance_task.cancel()
     if bot._daily_summary_task and not bot._daily_summary_task.done():
         bot._daily_summary_task.cancel()
+    if bot._redeemer_task and not bot._redeemer_task.done():
+        bot._redeemer_task.cancel()
     if _bot_task and not _bot_task.done():
         _bot_task.cancel()
         try:
@@ -5562,6 +5626,19 @@ def admin_backup():
         buf, media_type="application/gzip",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
+
+
+@app.post("/admin/redeem", dependencies=[Depends(require_api_key)])
+async def trigger_redeem():
+    """Fire the position redeemer on demand. Claims any resolved-winner
+    tokens and merges back-to-back YES+NO pairs to USDC. Useful right
+    after a market resolves in our favour — don't wait for the 5-min
+    loop tick. 202 if the redeemer isn't available (EOA mode / missing
+    web3 / REDEEMER=false)."""
+    if bot._redeemer is None:
+        return JSONResponse({"ok": False, "reason": "redeemer not initialised"}, status_code=202)
+    claimed = await asyncio.to_thread(bot._redeemer.run_once)
+    return JSONResponse({"ok": True, "claimed": int(claimed or 0)})
 
 
 @app.post("/admin/daily-summary", dependencies=[Depends(require_api_key)])
