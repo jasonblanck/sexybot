@@ -148,6 +148,9 @@ CLAUDE_MAX_DISABLED    = os.getenv("CLAUDE_MAX_DISABLE", "false").lower() == "tr
 # claims are a different flow not implemented here.
 REDEEMER_ENABLED       = os.getenv("REDEEMER", "true").lower() == "true"
 REDEEMER_CHECK_SEC     = int(os.getenv("REDEEMER_CHECK_SEC", "300"))    # 5 min default
+# Anthropic daily spend alert. If the rolling 24h Claude-API spend exceeds
+# this, a single Telegram ping is sent per UTC day. Set 0 to disable.
+CLAUDE_DAILY_BUDGET_USD = float(os.getenv("CLAUDE_DAILY_BUDGET_USD", "25.0"))
 if CLAUDE_MAX_DISABLED:
     # Force every AI feature off — keeps downstream code paths safe
     # without having to check CLAUDE_MAX_DISABLED everywhere.
@@ -318,9 +321,14 @@ class PolymarketBot:
         self._db_maintenance_task:  Optional[asyncio.Task] = None
         # Daily Telegram digest task
         self._daily_summary_task:   Optional[asyncio.Task] = None
-        # Position redeemer handle + task
+        # Position redeemer handle + task + today's claim counter
         self._redeemer:             Optional[object] = None
         self._redeemer_task:        Optional[asyncio.Task] = None
+        self._claims_today:         int = 0
+        self._claims_today_ymd:     str = ""   # UTC date str; reset counter on rollover
+        # Spend-alert task + latch (one ping per UTC day when exceeded)
+        self._spend_monitor_task:   Optional[asyncio.Task] = None
+        self._spend_alert_sent_ymd: str = ""
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -3648,6 +3656,11 @@ class PolymarketBot:
         except Exception as e:
             log.debug(f"daily summary category query failed: {e}")
 
+        # Redeemer activity — only surface if we claimed anything today.
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        if self._claims_today_ymd == today_str and self._claims_today > 0:
+            lines.append(f"· Redeemer: claimed/merged {self._claims_today} position(s) today")
+
         # Portfolio snapshot
         try:
             pos_val = self.get_positions_value()
@@ -3679,6 +3692,13 @@ class PolymarketBot:
             try:
                 claimed = await asyncio.to_thread(self._redeemer.run_once)
                 if claimed:
+                    # Track today's claims so the daily digest can report them.
+                    # Reset at UTC rollover.
+                    today = datetime.utcnow().strftime("%Y-%m-%d")
+                    if self._claims_today_ymd != today:
+                        self._claims_today = 0
+                        self._claims_today_ymd = today
+                    self._claims_today += int(claimed or 0)
                     self._log(f"[REDEEMER] claimed/merged {claimed} position(s)")
                     # Nudge positions cache so dashboard shows the payout soon
                     self._positions_cache_time = 0
@@ -3688,6 +3708,48 @@ class PolymarketBot:
                 log.warning(f"redeemer loop error: {e}")
             try:
                 await asyncio.sleep(max(60, REDEEMER_CHECK_SEC))
+            except asyncio.CancelledError:
+                break
+
+    async def _spend_monitor_loop(self):
+        """Background task — every 30 minutes, check today's Claude-API spend.
+        If it exceeds CLAUDE_DAILY_BUDGET_USD, send a single Telegram ping per
+        UTC day. No-op if budget is 0 or Telegram creds aren't set."""
+        if (CLAUDE_DAILY_BUDGET_USD <= 0
+            or not TELEGRAM_TOKEN
+            or not TELEGRAM_CHAT_ID):
+            return
+        # Boot delay — avoid pinging instantly if we restarted mid-day with
+        # spend already over budget from before the restart; let one interval
+        # pass so cumulative number means "since restart" conceptually too.
+        try:
+            await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            return
+        while self.running:
+            try:
+                today_str = datetime.utcnow().strftime("%Y-%m-%d")
+                # Reset the latch at UTC rollover
+                if self._spend_alert_sent_ymd != today_str:
+                    self._spend_alert_sent_ymd = ""
+                spend = self.get_claude_spend(days=1) or {}
+                cost = float(spend.get("est_cost_usd", 0) or 0)
+                if cost >= CLAUDE_DAILY_BUDGET_USD and self._spend_alert_sent_ymd != today_str:
+                    msg = (
+                        f"⚠️ Claude spend alert\n"
+                        f"Today's spend: ${cost:.2f} ≥ budget ${CLAUDE_DAILY_BUDGET_USD:.2f}\n"
+                        f"Calls today: {int(spend.get('calls', 0))}\n"
+                        f"Consider raising SCAN_INTERVAL_S or AI_MIN_CONFIDENCE."
+                    )
+                    await asyncio.to_thread(self.send_telegram, msg)
+                    self._spend_alert_sent_ymd = today_str
+                    log.warning(f"[SPEND ALERT] sent — today's spend ${cost:.2f}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning(f"spend monitor loop error: {e}")
+            try:
+                await asyncio.sleep(1800)   # 30 min
             except asyncio.CancelledError:
                 break
 
@@ -4933,6 +4995,10 @@ async def lifespan(app_: FastAPI):
         if bot._redeemer is not None:
             bot._redeemer_task = asyncio.create_task(bot._redeemer_loop())
             log.info(f"[REDEEMER] claim loop scheduled (every {REDEEMER_CHECK_SEC}s)")
+        # Daily Claude-spend budget alert — silent if budget is 0 or no Telegram.
+        if CLAUDE_DAILY_BUDGET_USD > 0 and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            bot._spend_monitor_task = asyncio.create_task(bot._spend_monitor_loop())
+            log.info(f"[SPEND ALERT] scheduled (budget ${CLAUDE_DAILY_BUDGET_USD:.2f}/day)")
     else:
         log.warning("Could not connect — check .env credentials")
     yield
@@ -4952,6 +5018,8 @@ async def lifespan(app_: FastAPI):
         bot._daily_summary_task.cancel()
     if bot._redeemer_task and not bot._redeemer_task.done():
         bot._redeemer_task.cancel()
+    if bot._spend_monitor_task and not bot._spend_monitor_task.done():
+        bot._spend_monitor_task.cancel()
     if _bot_task and not _bot_task.done():
         _bot_task.cancel()
         try:
@@ -5595,6 +5663,42 @@ async def trigger_brier_resolve(limit: int = 50):
     limit = max(1, min(limit, 500))
     settled = await bot.resolve_brier_predictions(limit=limit)
     return JSONResponse({"ok": True, "settled": settled})
+
+
+@app.get("/admin/trades.csv", dependencies=[Depends(require_api_key)])
+def admin_trades_csv():
+    """Stream the trades table as CSV for offline analysis. Requires
+    X-API-Key because it includes attribution columns (strategy /
+    category / AI probability / regime) that aren't exposed elsewhere.
+    No size limit — at current volume (100s of rows / day) this
+    comfortably fits in a single response."""
+    import io
+    import csv
+    from fastapi.responses import StreamingResponse
+    try:
+        cur = bot.db.execute(
+            "SELECT id, time, market, side, amount, price, shares, order_type, "
+            "       status, order_id, dry_run, token_id, resolved, won, "
+            "       realized_pnl, resolved_at, strategy, category, "
+            "       ai_probability, ai_confidence, ai_risk, regime_at_entry "
+            "FROM trades ORDER BY id DESC"
+        )
+        cols = [d[0] for d in cur.description]
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(cols)
+        for row in cur.fetchall():
+            w.writerow(row)
+        buf.seek(0)
+    except Exception as e:
+        log.warning(f"trades.csv export failed: {e}")
+        raise HTTPException(status_code=500, detail="csv export failed")
+    fname = f"sexybot-trades-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 @app.get("/admin/backup", dependencies=[Depends(require_api_key)])
