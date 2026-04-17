@@ -68,6 +68,15 @@ TAVILY_API_KEY     = os.getenv("TAVILY_API_KEY", "")
 NEWS_API_KEY       = os.getenv("NEWS_API_KEY", "")
 ALCHEMY_API_KEY    = os.getenv("ALCHEMY_API_KEY", "")
 COINGECKO_API_KEY  = os.getenv("COINGECKO_API_KEY", "")
+# Finnhub — real-time stock quotes, earnings, forex, crypto. Used to enrich
+# AI context on markets that mention US stock tickers (e.g. "Will NVDA hit
+# $X by ...?"). Free-tier limit is 60 req/min — plenty at 60s scan.
+FINNHUB_API_KEY    = os.getenv("FINNHUB_API_KEY", "")
+# OpenRouter — unified gateway to many LLM providers. Stored for future use
+# as an Anthropic fallback (when direct Anthropic API is rate-limited or
+# down). No consumer code yet; adding the env var so it's available once we
+# decide how to wire it.
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 PAPER_MODE    = os.getenv("PAPER_MODE", "false").lower() == "true"
 PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "1000.0"))
 
@@ -1639,6 +1648,90 @@ class PolymarketBot:
     _crypto_cache: dict = {}
     _crypto_cache_time: float = 0
 
+    # Finnhub stock quote cache. Keyed by ticker, 60s TTL per symbol.
+    _finnhub_cache:      dict  = {}    # symbol → {price, change_pct, ts}
+    # Common US stock tickers Polymarket frequently asks about. Narrow
+    # whitelist so we don't mistake common English words ("IT", "AI", "WE",
+    # "OR", "BE") for tickers. Extend as new markets come up.
+    _COMMON_TICKERS = {
+        "NVDA","AAPL","MSFT","GOOGL","GOOG","AMZN","META","TSLA","NFLX",
+        "AMD","INTC","AVGO","ORCL","CRM","ADBE","PLTR","SHOP","UBER","COIN",
+        "MSTR","HOOD","GME","AMC","SPY","QQQ","DIA","IWM","VIX","SOXL",
+        "JPM","BAC","GS","MS","WMT","HD","COST","DIS","NKE","BA","F","GM",
+        "XOM","CVX","LMT","RTX","JNJ","PFE","MRNA","LLY",
+    }
+
+    @classmethod
+    def _extract_tickers(cls, question: str) -> list:
+        """Find US stock tickers mentioned in a market question. Returns
+        a de-duplicated list (order preserved). Uses a curated whitelist so
+        short English words don't false-positive as tickers."""
+        if not question:
+            return []
+        import re as _re
+        # Match uppercase word-boundary tokens 2-5 chars long (stock ticker
+        # shape). Intersect with the curated whitelist.
+        candidates = _re.findall(r"\b[A-Z]{2,5}\b", question)
+        seen: list = []
+        for t in candidates:
+            if t in cls._COMMON_TICKERS and t not in seen:
+                seen.append(t)
+        return seen
+
+    def get_finnhub_quote(self, symbol: str) -> Optional[dict]:
+        """Real-time US stock quote from Finnhub. Returns
+        {price, change_pct, prev_close, high, low, ts} or None on failure.
+        60-second per-symbol cache so parallel candidates mentioning the
+        same ticker share one fetch. Silent no-op when API key is unset."""
+        if not FINNHUB_API_KEY or not symbol:
+            return None
+        symbol = symbol.upper().strip()
+        cached = self._finnhub_cache.get(symbol)
+        if cached and time.time() - cached.get("ts", 0) < 60:
+            return cached
+        try:
+            import json as _j
+            url = (
+                f"https://finnhub.io/api/v1/quote?"
+                f"symbol={symbol}&token={FINNHUB_API_KEY}"
+            )
+            with _ureq.urlopen(url, timeout=5) as r:
+                d = _j.loads(r.read())
+            # Finnhub returns: c=current, pc=previous close, h=high, l=low,
+            # d=change (abs), dp=change (%), t=unix ts. If symbol is invalid
+            # or market closed-with-no-data, c=0 — treat as no data.
+            cur = float(d.get("c") or 0)
+            if cur <= 0:
+                return None
+            payload = {
+                "symbol":      symbol,
+                "price":       round(cur, 4),
+                "change_pct":  round(float(d.get("dp") or 0), 2),
+                "prev_close":  round(float(d.get("pc") or 0), 4),
+                "high":        round(float(d.get("h")  or 0), 4),
+                "low":         round(float(d.get("l")  or 0), 4),
+                "ts":          time.time(),
+            }
+            self._finnhub_cache[symbol] = payload
+            return payload
+        except Exception as e:
+            log.debug(f"Finnhub quote {symbol} failed: {e}")
+            return None
+
+    def get_finnhub_quotes_for_question(self, question: str) -> list:
+        """Extract any tickers mentioned in `question` and return a list of
+        their Finnhub quotes (empty if none matched or all lookups failed).
+        Used by the AI enrichment path."""
+        tickers = type(self)._extract_tickers(question)
+        if not tickers:
+            return []
+        out = []
+        for t in tickers[:4]:   # cap at 4 tickers/market to bound spend
+            q = self.get_finnhub_quote(t)
+            if q:
+                out.append(q)
+        return out
+
     def get_crypto_prices(self) -> dict:
         """CoinGecko free API — BTC, ETH, MATIC prices for crypto markets."""
         if time.time() - self._crypto_cache_time < 120 and self._crypto_cache:
@@ -2420,6 +2513,24 @@ class PolymarketBot:
                     "the forecast + its implied variance is usually a better "
                     "prior than the order-book mid."
                 )
+
+            # Stock quotes (Finnhub) — present only for markets that
+            # mention a tracked ticker. Real-time price + day's change lets
+            # Claude weigh whether the market's implied probability matches
+            # the underlying stock's actual trajectory.
+            fh_quotes = research.get("finnhub_quotes") or []
+            if fh_quotes:
+                lines = ["STOCK QUOTES (Finnhub, real-time):"]
+                for q in fh_quotes:
+                    chg = q.get("change_pct", 0)
+                    arrow = "↑" if chg > 0 else ("↓" if chg < 0 else "·")
+                    lines.append(
+                        f"  {q.get('symbol')}: ${q.get('price')} "
+                        f"{arrow}{abs(chg):.2f}% today · "
+                        f"range ${q.get('low')}–${q.get('high')} · "
+                        f"prev ${q.get('prev_close')}"
+                    )
+                ctx_parts.append("\n".join(lines))
 
             # Current trading regime — lets Claude weight calibration against
             # system-level risk posture. In cautious/hostile regimes it should
@@ -4417,6 +4528,15 @@ class PolymarketBot:
                                 if _city:
                                     _tasks["weather_forecast"] = asyncio.to_thread(
                                         self.get_weather_for_location, _city
+                                    )
+                            # Stock-ticker markets: if the question mentions one
+                            # of our tracked tickers (NVDA, TSLA, SPY, etc.),
+                            # fetch real-time Finnhub quotes. Silent if key unset.
+                            if FINNHUB_API_KEY:
+                                _tickers = type(self)._extract_tickers(c["question"])
+                                if _tickers:
+                                    _tasks["finnhub_quotes"] = asyncio.to_thread(
+                                        self.get_finnhub_quotes_for_question, c["question"]
                                     )
                             _k = list(_tasks.keys())
                             _v = await asyncio.gather(*_tasks.values(), return_exceptions=True)
