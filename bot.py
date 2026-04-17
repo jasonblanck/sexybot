@@ -77,6 +77,11 @@ FINNHUB_API_KEY    = os.getenv("FINNHUB_API_KEY", "")
 # down). No consumer code yet; adding the env var so it's available once we
 # decide how to wire it.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+# Polygon.io — stock/options/forex/crypto data. Used as a fallback for
+# Finnhub so ticker-mention markets still get enriched context when
+# Finnhub rate-limits or errors. Free tier is prev-close only; paid
+# gives real-time. Silent no-op if key is unset.
+POLYGON_API_KEY    = os.getenv("POLYGON_API_KEY", "")
 PAPER_MODE    = os.getenv("PAPER_MODE", "false").lower() == "true"
 PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "1000.0"))
 
@@ -1718,9 +1723,59 @@ class PolymarketBot:
             log.debug(f"Finnhub quote {symbol} failed: {e}")
             return None
 
+    # Polygon.io per-symbol cache (60s TTL, same as Finnhub).
+    _polygon_cache: dict = {}    # symbol → {price, change_pct, high, low, prev_close, ts}
+
+    def get_polygon_quote(self, symbol: str) -> Optional[dict]:
+        """Previous-close quote from Polygon.io, formatted to match the
+        Finnhub quote shape so downstream rendering doesn't care about the
+        source. Used as a fallback when Finnhub fails. Free-tier endpoint;
+        paid plans can swap in the real-time snapshot endpoint later."""
+        if not POLYGON_API_KEY or not symbol:
+            return None
+        symbol = symbol.upper().strip()
+        cached = self._polygon_cache.get(symbol)
+        if cached and time.time() - cached.get("ts", 0) < 60:
+            return cached
+        try:
+            import json as _j
+            url = (
+                f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?"
+                f"adjusted=true&apiKey={POLYGON_API_KEY}"
+            )
+            with _ureq.urlopen(url, timeout=5) as r:
+                d = _j.loads(r.read())
+            results = d.get("results") or []
+            if not results:
+                return None
+            row = results[0]
+            close   = float(row.get("c") or 0)
+            openp   = float(row.get("o") or 0)
+            if close <= 0:
+                return None
+            # Intraday change = (close - open) / open * 100
+            chg_pct = round(((close - openp) / openp * 100), 2) if openp > 0 else 0.0
+            payload = {
+                "symbol":      symbol,
+                "price":       round(close, 4),
+                "change_pct":  chg_pct,
+                "prev_close":  round(openp, 4),   # best proxy on prev-close endpoint
+                "high":        round(float(row.get("h") or 0), 4),
+                "low":         round(float(row.get("l") or 0), 4),
+                "source":      "polygon",
+                "ts":          time.time(),
+            }
+            self._polygon_cache[symbol] = payload
+            return payload
+        except Exception as e:
+            log.debug(f"Polygon quote {symbol} failed: {e}")
+            return None
+
     def get_finnhub_quotes_for_question(self, question: str) -> list:
         """Extract any tickers mentioned in `question` and return a list of
-        their Finnhub quotes (empty if none matched or all lookups failed).
+        their stock quotes. Tries Finnhub first (real-time when key is paid),
+        falls back to Polygon.io on any Finnhub miss so ticker-mention
+        markets still get enriched context during rate-limit / outage.
         Used by the AI enrichment path."""
         tickers = type(self)._extract_tickers(question)
         if not tickers:
@@ -1728,6 +1783,8 @@ class PolymarketBot:
         out = []
         for t in tickers[:4]:   # cap at 4 tickers/market to bound spend
             q = self.get_finnhub_quote(t)
+            if q is None and POLYGON_API_KEY:
+                q = self.get_polygon_quote(t)
             if q:
                 out.append(q)
         return out
