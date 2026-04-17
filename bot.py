@@ -126,6 +126,10 @@ STARTUP_CANCEL_OPEN    = os.getenv("STARTUP_CANCEL_OPEN", "true").lower() == "tr
 DAILY_SUMMARY_ENABLED  = os.getenv("DAILY_SUMMARY", "true").lower() == "true"
 DAILY_SUMMARY_UTC_HOUR = int(os.getenv("DAILY_SUMMARY_UTC_HOUR", "23"))    # 0-23
 DAILY_SUMMARY_UTC_MIN  = int(os.getenv("DAILY_SUMMARY_UTC_MIN",  "55"))
+# Real-time Telegram trade alerts. One message per fill / error — so the
+# operator gets phone notifications as trades happen instead of waiting
+# for the end-of-day digest. Silent no-op if TELEGRAM_* creds aren't set.
+TRADE_ALERTS_ENABLED   = os.getenv("TRADE_ALERTS", "true").lower() == "true"
 # Deep analysis: for trades above DEEP_ANALYZE_MIN_USD, fire a second pass
 # with a stronger model + server-side web_search to catch signals that the
 # fast pass missed. Expensive (~10-30s latency, $0.10-0.50/call) so only
@@ -889,6 +893,31 @@ class PolymarketBot:
         if result.get("status") and "error" not in status_str and status_str not in ("unmatched", "canceled", "cancelled", "no_match"):
             pos_args = (token_id, result.get("market",""), side, result.get("shares",0), amount_usdc)
         self._save_trade_and_position(result, pos_args)
+        # Real-time Telegram alert — fires on every attempt (success + failure)
+        # so the operator sees fills arrive on their phone as they happen.
+        # Silent no-op if creds unset or the env toggle is off.
+        if TRADE_ALERTS_ENABLED and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            try:
+                _is_err   = ("error" in status_str) or status_str in ("unmatched", "canceled", "cancelled", "no_match")
+                _emoji    = "❌" if _is_err else ("🧪" if DRY_RUN else ("🟢" if side.upper() == "BUY" else "🔴"))
+                _mkt_str  = (market or "(unknown market)")[:80]
+                _attr_bits = []
+                for _k in ("strategy", "category"):
+                    _v = result.get(_k)
+                    if _v:
+                        _attr_bits.append(f"{_k}={_v}")
+                _conf = result.get("ai_confidence")
+                if _conf is not None:
+                    _attr_bits.append(f"conf={_conf}%")
+                _attr_line = (" · " + " · ".join(_attr_bits)) if _attr_bits else ""
+                _msg = (
+                    f"{_emoji} {side.upper()} ${amount_usdc:.2f} @ ${price:.4f}\n"
+                    f"{_mkt_str}\n"
+                    f"status: {result.get('status','?')}{_attr_line}"
+                )
+                self.send_telegram(_msg)
+            except Exception as _e:
+                log.debug(f"trade alert telegram failed: {_e}")
         return result
 
     def place_limit_order(
@@ -934,6 +963,20 @@ class PolymarketBot:
         if len(self.trades) > 1000:
             self.trades = self.trades[-1000:]
         self.save_trade(result)  # persist limit orders — was missing, lost on restart
+        # Real-time Telegram alert on every limit placement (success + failure).
+        if TRADE_ALERTS_ENABLED and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            try:
+                _status_l = str(result.get("status", "")).lower()
+                _is_err   = ("error" in _status_l)
+                _emoji    = "❌" if _is_err else ("🧪" if DRY_RUN else "🟡")
+                _msg = (
+                    f"{_emoji} LIMIT {side.upper()} {size:.2f} @ ${price:.4f}\n"
+                    f"token {token_id[:16]}…\n"
+                    f"status: {result.get('status','?')}"
+                )
+                self.send_telegram(_msg)
+            except Exception as _e:
+                log.debug(f"limit trade alert failed: {_e}")
         return result
 
     async def _execute_order(
