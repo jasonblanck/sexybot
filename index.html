@@ -198,6 +198,62 @@ body[data-theme="light"] .card{box-shadow:var(--hero-shadow);}
 .theme-toggle:hover{color:var(--accent);border-color:var(--accent);}
 .theme-toggle svg{width:15px;height:15px;}
 
+/* ── BFO-STYLE SHARED UTILITIES ────────────────────────────────────────────
+   Pills, counters, source footers, and row layouts to give every panel a
+   consistent header + footer treatment. No font/color changes — everything
+   reads from the existing CSS custom properties. */
+
+/* Pills that live in the right-hand side of a .panel-title */
+.pill{font-family:var(--mono);font-size:9px;letter-spacing:1.2px;text-transform:uppercase;padding:2px 8px;border-radius:999px;display:inline-flex;align-items:center;gap:5px;border:1px solid transparent;line-height:1.5;}
+.pill-live{color:var(--green);background:rgba(0,204,102,0.10);border-color:rgba(0,204,102,0.35);}
+.pill-live::before{content:'';width:5px;height:5px;border-radius:50%;background:var(--green);animation:blink 1.5s infinite;}
+.pill-hot{color:var(--accent2);background:rgba(255,170,0,0.10);border-color:rgba(255,170,0,0.35);}
+.pill-count{color:var(--text2);background:transparent;border-color:var(--border2);}
+body[data-theme="light"] .pill-live{background:#ecfdf5;border-color:#a7f3d0;}
+body[data-theme="light"] .pill-hot{background:#fef3c7;border-color:#fcd34d;}
+body[data-theme="light"] .pill-count{background:#f8fafc;border-color:var(--border);}
+
+/* Source / refresh footer at the bottom of a data panel */
+.panel-footer{margin-top:12px;padding-top:8px;border-top:1px solid var(--border2);font-family:var(--mono);font-size:9px;letter-spacing:1px;color:var(--text3);text-transform:uppercase;display:flex;justify-content:space-between;gap:8px;}
+body[data-theme="light"] .panel-footer{border-top-color:var(--border);}
+
+/* Compact segmented control — used for mover-panel sub-tabs */
+.ptabs{display:inline-flex;gap:4px;padding:2px;border:1px solid var(--border2);border-radius:6px;background:transparent;}
+.ptab{font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:3px 8px;border:none;background:transparent;color:var(--text2);cursor:pointer;border-radius:4px;transition:color .15s,background .15s;text-transform:uppercase;}
+.ptab:hover{color:var(--text);}
+.ptab.on{background:var(--accent);color:#000;}
+body[data-theme="light"] .ptab.on{color:#fff;}
+
+/* Volatility matrix heat grid — compact version tuned to sexybot row width */
+.vmx-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-top:6px;}
+.vmx-cell{padding:8px 10px;border-radius:4px;display:flex;flex-direction:column;gap:3px;min-height:52px;justify-content:space-between;border:1px solid var(--border2);background:var(--panel);transition:filter .15s;}
+.vmx-cell:hover{filter:brightness(1.08);}
+.vmx-sym{font-family:var(--mono);font-size:9px;letter-spacing:1.2px;color:var(--text2);}
+.vmx-val{font-family:var(--mono);font-size:15px;font-weight:500;}
+.vmx-cell.cool{background:rgba(0,204,102,0.08);border-color:rgba(0,204,102,0.25);}
+.vmx-cell.cool .vmx-val{color:var(--green);}
+.vmx-cell.mild{background:rgba(255,170,0,0.08);border-color:rgba(255,170,0,0.25);}
+.vmx-cell.mild .vmx-val{color:var(--accent2);}
+.vmx-cell.hot{background:rgba(255,51,85,0.10);border-color:rgba(255,51,85,0.30);}
+.vmx-cell.hot .vmx-val{color:var(--red);}
+body[data-theme="light"] .vmx-cell.cool{background:#ecfdf5;border-color:#a7f3d0;}
+body[data-theme="light"] .vmx-cell.mild{background:#fef3c7;border-color:#fcd34d;}
+body[data-theme="light"] .vmx-cell.hot{background:#ffe4e6;border-color:#fda4af;}
+.vmx-scale{display:flex;justify-content:space-between;font-family:var(--mono);font-size:8px;letter-spacing:1px;color:var(--text3);margin-top:8px;padding-top:6px;border-top:1px solid var(--border2);text-transform:uppercase;}
+.vmx-scale-bar{flex:1;height:2px;margin:auto 8px;background:linear-gradient(90deg,var(--green),var(--accent2),var(--red));border-radius:1px;}
+body[data-theme="light"] .vmx-scale{border-top-color:var(--border);}
+
+/* Nicer row layout for the Market Movers list */
+.mover-row{display:grid;grid-template-columns:28px 1fr auto;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--border2);}
+.mover-row:last-child{border-bottom:none;}
+.mover-avatar{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:11px;font-weight:500;background:rgba(51,153,255,0.10);color:var(--blue);border:1px solid rgba(51,153,255,0.25);}
+body[data-theme="light"] .mover-avatar{background:#dbeafe;border-color:#bfdbfe;color:#1e40af;}
+.mover-name{font-size:12px;color:var(--text);line-height:1.2;}
+.mover-ticker{font-family:var(--mono);font-size:9px;color:var(--text3);letter-spacing:1px;margin-top:1px;}
+.mover-price{font-family:var(--mono);font-size:12px;text-align:right;}
+.mover-chg{font-family:var(--mono);font-size:10px;text-align:right;margin-top:1px;}
+body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
+
 /* ── MOBILE BOTTOM NAV ── */
 .mob-nav{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--hdr-bg);border-top:1px solid var(--accent);z-index:200;height:56px;padding-bottom:env(safe-area-inset-bottom,0);}
 .mob-nav-inner{display:flex;height:56px;}
@@ -410,7 +466,7 @@ body[data-theme="light"] .card{box-shadow:var(--hero-shadow);}
       </div>
     </div>
     <div class="panel">
-      <div class="panel-title">FED / MACRO</div>
+      <div class="panel-title">FED / MACRO <span class="pill pill-live">LIVE</span></div>
       <div class="fred-grid" id="fred-data">
         <div class="fred-item"><div class="fred-lbl">FEDFUNDS</div><div class="fred-val o">—</div></div>
         <div class="fred-item"><div class="fred-lbl">CPI</div><div class="fred-val r">—</div></div>
@@ -423,6 +479,7 @@ body[data-theme="light"] .card{box-shadow:var(--hero-shadow);}
         <div class="stat-row"><span class="stat-lbl">10Y TREASURY</span><span class="stat-val" id="mkt-t10y">—</span></div>
         <div class="stat-row"><span class="stat-lbl">FEAR &amp; GREED</span><span class="stat-val" id="mkt-fg">—</span></div>
       </div>
+      <div class="panel-footer"><span>Source · FRED · Polygon</span><span>refresh 5m</span></div>
     </div>
     <div class="panel">
       <div class="panel-title">WEATHER · NYC</div>
@@ -434,13 +491,15 @@ body[data-theme="light"] .card{box-shadow:var(--hero-shadow);}
       <div class="stat-row"><span class="stat-lbl">Precip</span><span class="stat-val" id="wprec">—</span></div>
       <div class="stat-row"><span class="stat-lbl">UV Index</span><span class="stat-val" id="wuv">—</span></div>
       <div id="wforecast" style="margin-top:8px;display:flex;gap:4px;justify-content:space-between"></div>
+      <div class="panel-footer"><span>Source · Open-Meteo</span><span>refresh 10m</span></div>
     </div>
     <div class="panel">
-      <div class="panel-title">CRYPTO</div>
+      <div class="panel-title">CRYPTO <span class="pill pill-live">LIVE</span></div>
       <div class="crypto-row"><span class="crypto-sym o">BTC</span><span class="crypto-price" id="cbtc">—</span><span id="cbtcc">—</span></div>
       <div class="crypto-row"><span class="crypto-sym b">ETH</span><span class="crypto-price" id="ceth">—</span><span id="cethc">—</span></div>
       <div class="crypto-row"><span class="crypto-sym p">SOL</span><span class="crypto-price" id="csol">—</span><span id="csolc">—</span></div>
       <div class="crypto-row"><span class="crypto-sym g">POL</span><span class="crypto-price" id="cpol">—</span><span id="cpolc">—</span></div>
+      <div class="panel-footer"><span>Source · CoinGecko</span><span>refresh 30s</span></div>
     </div>
   </div>
   <div class="col">
@@ -489,25 +548,52 @@ body[data-theme="light"] .card{box-shadow:var(--hero-shadow);}
       <tbody id="mkt-body"><tr><td colspan="4" style="color:var(--text3);padding:12px 0;text-align:center">loading…</td></tr></tbody></table>
     </div>
     <div class="panel" id="positions-panel">
-      <div class="panel-title">OPEN POSITIONS <span id="pos-count" style="color:var(--text3)">0</span></div>
+      <div class="panel-title">OPEN POSITIONS <span class="pill pill-count" id="pos-count">0</span></div>
       <div id="positions-list"><div style="color:var(--text3);font-size:11px;padding:8px 0">no open positions</div></div>
     </div>
     <div class="panel" style="flex:1;display:flex;flex-direction:column;border-bottom:1px solid var(--border2);">
-      <div class="panel-title">LIVE SIGNALS <span id="sig-count">0</span></div>
+      <div class="panel-title">LIVE SIGNALS
+        <span style="display:inline-flex;align-items:center;gap:6px">
+          <span class="pill pill-count" id="sig-count">0</span>
+          <span class="pill pill-live">LIVE</span>
+        </span>
+      </div>
       <div class="feed" id="sig-feed"><div style="color:var(--text3);font-size:11px;padding:12px 0">waiting…</div></div>
     </div>
   </div>
   <div class="col">
+    <div class="panel" id="vmx-panel">
+      <div class="panel-title">VOLATILITY MATRIX · 1D
+        <span class="pill pill-hot" id="vmx-hot">0 HOT</span>
+      </div>
+      <div class="vmx-grid" id="vmx-grid">
+        <div class="vmx-cell"><div class="vmx-sym">VIX</div><div class="vmx-val" id="vmx-vix">—</div></div>
+        <div class="vmx-cell"><div class="vmx-sym">F&amp;G</div><div class="vmx-val" id="vmx-fg">—</div></div>
+        <div class="vmx-cell"><div class="vmx-sym">GAS</div><div class="vmx-val" id="vmx-gas">—</div></div>
+        <div class="vmx-cell"><div class="vmx-sym">BTC</div><div class="vmx-val" id="vmx-btc">—</div></div>
+        <div class="vmx-cell"><div class="vmx-sym">ETH</div><div class="vmx-val" id="vmx-eth">—</div></div>
+        <div class="vmx-cell"><div class="vmx-sym">SOL</div><div class="vmx-val" id="vmx-sol">—</div></div>
+      </div>
+      <div class="vmx-scale">
+        <span>CALM</span><span class="vmx-scale-bar"></span><span>HOT</span>
+      </div>
+    </div>
     <div class="panel">
-      <div class="panel-title">MARKET MOVERS <span id="fmp-sentiment" style="font-size:9px"></span></div>
+      <div class="panel-title">MARKET MOVERS
+        <span style="display:inline-flex;align-items:center;gap:6px">
+          <span id="fmp-sentiment" style="font-size:9px"></span>
+          <span class="pill pill-live">LIVE</span>
+        </span>
+      </div>
       <div id="fmp-movers"><div style="color:var(--text3);font-size:11px;padding:4px 0">loading…</div></div>
+      <div class="panel-footer"><span>Source · Polygon · FMP</span><span>refresh 5m</span></div>
     </div>
     <div class="panel">
       <div class="panel-title">TRADE HISTORY</div>
       <div class="tlog" id="tlog"><div style="color:var(--text3);font-size:11px;padding:8px 0">no trades yet</div></div>
     </div>
     <div class="panel" style="flex:1;display:flex;flex-direction:column;border-bottom:1px solid var(--border2);">
-      <div class="panel-title">BOT LOG</div>
+      <div class="panel-title">BOT LOG <span class="pill pill-live">LIVE</span></div>
       <div class="blog" id="blog"><div class="li">waiting…</div></div>
     </div>
   </div>
@@ -999,6 +1085,7 @@ async function fetchBot(){
     document.getElementById('port-sub').textContent='cash '+fmt$(d.balance||0)+' + positions '+fmt$(d.positions_value||0);
     if(d.volatility){const vc={'normal':'g','elevated':'y','high':'o','extreme':'r'};const vl=d.volatility;document.getElementById('vol-state').innerHTML=`<span class="${vc[vl]||'y'}">⚡ ${vl.toUpperCase()}</span>`;}
     if(d.gas&&d.gas.gwei!=null){const g=d.gas;const gc=g.multiplier>=4?'r':g.multiplier>=2.5?'o':g.multiplier>=1.5?'y':'g';document.getElementById('gas-state').innerHTML=`<span class="${gc}">${g.gwei} gwei · ${g.multiplier}x</span>`;}
+    syncVmx();
     const wr=trades.length>0?Math.round(filled.length/trades.length*100):0;
     document.getElementById('winrate').textContent=wr+'%';
     document.getElementById('wrfill').style.width=wr+'%';
@@ -1095,6 +1182,7 @@ async function fetchCrypto(){
     const pol=d['polygon-ecosystem-token']||d['matic-network'];
     if(pol&&!isNaN(pol.usd)){document.getElementById('cpol').textContent=fm(pol.usd);document.getElementById('cpolc').innerHTML=ch(pol.usd_24h_change);}
     syncWatchCrypto();
+    syncVmx();
   }catch(e){}
 }
 
@@ -1108,6 +1196,7 @@ async function fetchMarketData(){
     if(d.oil){const o=d.oil;document.getElementById('mkt-oil').innerHTML='$'+parseFloat(o.price).toFixed(2)+fmtChg(o.change);}
     if(d.t10y){const t=d.t10y;document.getElementById('mkt-t10y').innerHTML=parseFloat(t.price).toFixed(3)+'%'+fmtChg(t.change);document.getElementById('wm-t10y').innerHTML=parseFloat(t.price).toFixed(3)+'%'+fmtChg(t.change);}
     if(d.fear_greed){const fg=d.fear_greed;const score=fg.score;const col=score<=25?'#ff3355':score<=45?'#ff9900':score<=55?'#ffcc00':score<=75?'#99cc00':'#00cc66';const html=`<span style="color:${col}">${score} — ${safeHtml(fg.rating)}</span>`;document.getElementById('mkt-fg').innerHTML=html;document.getElementById('wm-fg').innerHTML=html;}
+    syncVmx();
   }catch(e){}
 }
 
@@ -1298,6 +1387,54 @@ async function fetchWatchMarkets(){
   }catch(e){}
 }
 function syncWatchMacro(){if(_mktDataCache.vix)document.getElementById('wm-vix').innerHTML=document.getElementById('mkt-vix').innerHTML;if(_mktDataCache.t10y)document.getElementById('wm-t10y').innerHTML=document.getElementById('mkt-t10y').innerHTML;if(_mktDataCache.fear_greed)document.getElementById('wm-fg').innerHTML=document.getElementById('mkt-fg').innerHTML;}
+
+/* ── VOLATILITY MATRIX (BFO-style heat grid) ──────────────────────────────
+   Reads already-fetched values off the DOM and maps them onto heat cells.
+   Rules per cell:
+     VIX         <15 cool, 15-22 mild, >22 hot
+     FEAR&GREED  50 mild; extremes (<25 fear or >75 greed) are hot
+     GAS mult    <1.5 cool, 1.5-2.5 mild, >2.5 hot
+     BTC/ETH/SOL |24h %| <2 cool, 2-5 mild, >5 hot
+*/
+function _vmxClass(level){return level<=1?'cool':level===2?'mild':'hot';}
+function _vmxSet(id,text,level){
+  const cell=document.getElementById(id);if(!cell)return;
+  cell.textContent=text;
+  const box=cell.closest('.vmx-cell');if(!box)return;
+  box.classList.remove('cool','mild','hot');
+  box.classList.add(_vmxClass(level));
+}
+function _parseChgPct(html){
+  if(!html)return null;
+  // Strips HTML tags and pulls the first signed percentage off the string.
+  const m=String(html).replace(/<[^>]+>/g,'').match(/-?\d+(?:\.\d+)?/);
+  return m?parseFloat(m[0]):null;
+}
+function syncVmx(){
+  // VIX
+  const vixTxt=(document.getElementById('mkt-vix')||{}).textContent||'';
+  const vix=parseFloat(vixTxt);
+  if(!isNaN(vix))_vmxSet('vmx-vix',vix.toFixed(1),vix<15?1:vix<22?2:3);
+  // Fear & Greed (0-100). Extreme fear or extreme greed both register as hot.
+  const fgHtml=(document.getElementById('mkt-fg')||{}).innerHTML||'';
+  const fg=parseInt((fgHtml.match(/>(\d+)/)||[])[1]||'NaN',10);
+  if(!isNaN(fg)){
+    const dist=Math.abs(fg-50);
+    _vmxSet('vmx-fg',String(fg),dist<10?1:dist<25?2:3);
+  }
+  // Gas multiplier from status panel ("X gwei · Yx")
+  const gasTxt=(document.getElementById('gas-state')||{}).textContent||'';
+  const gasM=parseFloat((gasTxt.match(/(\d+(?:\.\d+)?)x/)||[])[1]);
+  if(!isNaN(gasM))_vmxSet('vmx-gas',gasM.toFixed(1)+'x',gasM<1.5?1:gasM<2.5?2:3);
+  // Crypto 24h change — magnitude drives the heat regardless of sign.
+  [['vmx-btc','cbtcc'],['vmx-eth','cethc'],['vmx-sol','csolc']].forEach(([dst,src])=>{
+    const pct=_parseChgPct((document.getElementById(src)||{}).innerHTML);
+    if(pct!=null){const mag=Math.abs(pct);_vmxSet(dst,(pct>=0?'+':'')+pct.toFixed(1)+'%',mag<2?1:mag<5?2:3);}
+  });
+  // Update "N HOT" counter
+  const hot=document.querySelectorAll('#vmx-grid .vmx-cell.hot').length;
+  const pill=document.getElementById('vmx-hot');if(pill)pill.textContent=hot+' HOT';
+}
 function syncWatchCrypto(){
   const d=_cryptoCache;const fm=n=>'$'+Number(n).toLocaleString('en-US',{maximumFractionDigits:2});const ch=n=>{const c=parseFloat(n||0).toFixed(2);return`<span class="${c>=0?'g':'r'}">${c>=0?'+':''}${c}%</span>`;};
   if(d.bitcoin){document.getElementById('wc-btc').textContent=fm(d.bitcoin.usd);document.getElementById('wc-btcc').innerHTML=ch(d.bitcoin.usd_24h_change);}
