@@ -24,10 +24,8 @@ MIN_EV              = 0.0
 LOW_BALANCE         = 50.0
 CRITICAL_BALANCE    = 10.0
 PMUSD_SCALAR        = 1_000_000
-# Minimum price for a YES BUY. Apr 2026 backtest: both resolved YES BUYs
-# below 0.40 (Bitcoin $78k @ 0.36, Hezbollah ceasefire @ 0.17) were losses
-# totalling –$2.29. The bot's 0.278 payoff ratio needs near-perfect
-# accuracy at low prices, which the data does not support.
+# Payoff ratio <1 makes sub-0.30 YES BUYs unprofitable unless accuracy is
+# near-perfect; block them at the gate.
 MIN_YES_BUY_PRICE   = float(os.getenv("MIN_YES_BUY_PRICE", "0.30"))
 
 MAX_DRAWDOWN_USD    = float(os.getenv("MAX_DRAWDOWN_USD", "50.0"))   # halt if peak-to-trough > $50
@@ -154,8 +152,7 @@ class ExecutionGate:
             execution_price = book.best_ask
             effective_price = execution_price * (1 + self.slippage_rate)
             ev_net          = true_prob - effective_price
-            # Low-price underdog BUY guard — skip anything too cheap
-            # regardless of EV. See MIN_YES_BUY_PRICE rationale above.
+            # Underdog-BUY guard — see MIN_YES_BUY_PRICE.
             if execution_price < self.min_yes_buy_price:
                 return GateVerdict(
                     passed=False,
@@ -286,9 +283,8 @@ def kelly_size(
     theoretical full-Kelly bet, protecting against model overconfidence and
     undetected oracle risk ("black swan" resolution disputes).
 
-    `max_pct_of_balance` hard-caps the bet at 5% of the wallet — Apr 2026
-    backtest showed a payoff ratio of 0.278 where a single loss erased four
-    wins, so concentration risk is now the dominant threat.
+    `max_pct_of_balance` hard-caps the bet at a fraction of the wallet to
+    keep single-loss impact bounded when the payoff ratio is poor.
 
     Returns 0.0 when there is no positive edge.
     """

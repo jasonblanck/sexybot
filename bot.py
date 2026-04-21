@@ -48,6 +48,9 @@ STRATEGY       = os.getenv("STRATEGY", "momentum")
 MAX_ORDER_SIZE = float(os.getenv("MAX_ORDER_SIZE", "10"))
 DRY_RUN        = os.getenv("DRY_RUN", "true").lower() != "false"
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "500"))
+# Same env var as risk.py ExecutionGate — kept in sync so the dashboard path
+# and the main_v2.py pipeline share one underdog-guard threshold.
+MIN_YES_BUY_PRICE = float(os.getenv("MIN_YES_BUY_PRICE", "0.30"))
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 API_SECRET_KEY    = os.getenv("API_SECRET_KEY", "")
@@ -343,12 +346,8 @@ class PolymarketBot:
         # Spend-alert task + latch (one ping per UTC day when exceeded)
         self._spend_monitor_task:   Optional[asyncio.Task] = None
         self._spend_alert_sent_ymd: str = ""
-        # Balance-error circuit breaker: counts consecutive 'not enough balance'
-        # order rejections; when this exceeds 2 the bot halts order submission
-        # for the rest of the session until a successful order or manual reset.
-        # Context: Apr 9 2026 backtest — ~459 failed orders fired in 70 min
-        # against a $0.86 balance because no counter existed to trip on
-        # repeated balance rejections.
+        # Trip after 2 consecutive insufficient-balance rejections; requires
+        # a restart to clear (intentional — operator must top up and verify).
         self._balance_error_streak: int = 0
         self._balance_halt_tripped: bool = False
 
@@ -990,51 +989,43 @@ class PolymarketBot:
             self._log(f"Cancel failed: {e}", "error")
 
     # ── Balance circuit-breaker helpers ───────────────────────────────────────
-    @staticmethod
-    def _is_balance_error(result: Optional[dict]) -> bool:
-        """Detect whether a trade result carries a 'not enough balance' style
-        rejection. Matches both the execution error strings surfaced by
-        py_clob_client and the dashboard's simulated error results."""
-        if not result:
-            return False
-        if str(result.get("status", "")).lower() != "error":
+    # py_clob_client surfaces balance shortfalls as plain strings (no structured
+    # error code), so we substring-match the common phrasings.
+    _BALANCE_ERROR_NEEDLES = (
+        "not enough balance",
+        "insufficient balance",
+        "insufficient funds",
+        "balance too low",
+        "exceeds balance",
+    )
+
+    @classmethod
+    def _is_balance_error(cls, result: Optional[dict]) -> bool:
+        if not result or str(result.get("status", "")).lower() != "error":
             return False
         blob = " ".join(
             str(result.get(k, "")) for k in ("error", "message", "reason", "detail")
         ).lower()
-        needles = (
-            "not enough balance",
-            "insufficient balance",
-            "insufficient funds",
-            "balance too low",
-            "exceeds balance",
-        )
-        return any(n in blob for n in needles)
+        return any(n in blob for n in cls._BALANCE_ERROR_NEEDLES)
 
     def _note_order_outcome(self, result: Optional[dict]) -> None:
-        """Update the balance-error streak and trip the halt on 2 in a row."""
+        """Update the balance-error streak; trip the halt on 2 in a row."""
         if self._is_balance_error(result):
             self._balance_error_streak += 1
             if self._balance_error_streak >= 2 and not self._balance_halt_tripped:
                 self._balance_halt_tripped = True
                 self._log(
-                    "🛑 BALANCE CIRCUIT-BREAKER TRIPPED — 2 consecutive 'not enough balance' "
-                    "errors. Halting all order submission for this session. Top up USDC, "
-                    "then restart sexybot to resume.",
+                    "🛑 BALANCE CIRCUIT-BREAKER TRIPPED — 2 consecutive insufficient-balance "
+                    "errors. Halting order submission; top up USDC and restart to resume.",
                     "error",
                 )
-                try:
-                    self.send_telegram(
-                        "🛑 sexybot balance circuit-breaker tripped — 2 consecutive insufficient-balance "
-                        "errors. Order submission halted; top up USDC and restart."
-                    )
-                except Exception:
-                    pass
+                self.send_telegram(
+                    "🛑 sexybot balance circuit-breaker tripped — 2 consecutive insufficient-balance "
+                    "errors. Order submission halted; top up USDC and restart."
+                )
             return
         status = str((result or {}).get("status", "")).lower()
-        # Clear the streak on any non-error outcome (filled / unmatched /
-        # cancelled etc. — none of those indicate a balance problem).
-        if result and "error" not in status:
+        if status and "error" not in status:
             self._balance_error_streak = 0
 
     # ── Strategies ────────────────────────────────────────────────────────────
@@ -1980,9 +1971,7 @@ class PolymarketBot:
         if kelly_f <= 0.01:       # no meaningful edge
             return 0.0
         size = bankroll * kelly_f * fraction
-        # 5% of wallet cap — payoff ratio of 0.278 in the Apr backtest meant any
-        # single loss at 20% erased four wins. Tighten to 5% until the payoff
-        # ratio improves.
+        # 5% of wallet cap — keeps single-loss impact small while payoff ratio <1.
         return round(min(size, MAX_ORDER_SIZE, bankroll * 0.05), 2)
 
     def log_brier(self, market: str, token_id: str, side: str,
@@ -4501,6 +4490,16 @@ class PolymarketBot:
 
         while self.running:
             try:
+                # Once the balance circuit-breaker trips, skip every bit of
+                # cycle work (markets, regime, AI, balance fetch) until a
+                # restart clears it. Operator must top up + restart anyway.
+                if self._balance_halt_tripped and not PAPER_MODE:
+                    try:
+                        await asyncio.sleep(interval)
+                    except asyncio.CancelledError:
+                        break
+                    continue
+
                 _ai_failures = 0  # circuit breaker: disable AI mid-cycle after 3 consecutive failures
                 markets = await asyncio.to_thread(self.get_markets, 30)
                 self._log(f"Scanning {len(markets)} markets…")
@@ -4572,16 +4571,9 @@ class PolymarketBot:
                     cycle_cash = await asyncio.to_thread(self.get_balance, True)
                     self._log(f"Cash: ${cycle_cash:.2f}")
 
-                # ── Balance circuit-breaker ───────────────────────────────────
-                # Skip the whole cycle if a prior run tripped the halt, or if
-                # the wallet is below the $1 Polymarket notional minimum.
-                # (Apr 9 backtest: $0.86 balance + $3-$5 orders looped 45×.)
-                if self._balance_halt_tripped and not PAPER_MODE:
-                    try:
-                        await asyncio.sleep(interval)
-                    except asyncio.CancelledError:
-                        break
-                    continue
+                # Skip the cycle if the wallet can't clear the $1 Polymarket
+                # notional minimum. The halt branch is handled at the top of
+                # the loop before any expensive work fires.
                 if not PAPER_MODE and cycle_cash < 1.0:
                     self._log(
                         f"WALLET BELOW MIN NOTIONAL: ${cycle_cash:.2f} < $1.00 — skipping cycle",
@@ -4593,9 +4585,7 @@ class PolymarketBot:
                         break
                     continue
 
-                # Per-cycle dedupe: prevents re-submitting an order to the same
-                # token_id after a balance rejection (Apr 15 LoL Nongshim Red
-                # Force fired 5 identical retries in 1 min).
+                # Per-cycle dedupe: one order attempt per token_id per cycle.
                 _traded_tokens_this_cycle: set = set()
 
                 # ── Phase 1: rule-based candidate collection (fast, no I/O) ──
@@ -4766,9 +4756,7 @@ class PolymarketBot:
                         self.running = False
                         break
 
-                    # ── Balance circuit-breaker mid-cycle short-circuit ───────
-                    # A rejection handled a few iterations ago may have tripped
-                    # the halt. Stop submitting further orders this cycle.
+                    # Stop mid-cycle if a rejection this loop tripped the halt.
                     if self._balance_halt_tripped and not PAPER_MODE:
                         sig_record["skip_reason"] = "balance circuit-breaker tripped"
                         break
@@ -4778,8 +4766,6 @@ class PolymarketBot:
                         sig_record["skip_reason"] = "already have position"
                         continue
 
-                    # Per-cycle dedupe guard (Apr 15 backtest: repeat retries
-                    # against the same token burned ~5 rows in 60 seconds).
                     _sig_tid = signal.get("token_id")
                     if _sig_tid and _sig_tid in _traded_tokens_this_cycle:
                         sig_record["skip_reason"] = "already attempted this cycle"
@@ -4793,20 +4779,18 @@ class PolymarketBot:
                         continue
 
                     # Determine entry price for Kelly (price of the side we're buying)
-                    entry_price = yes_p if "YES" in signal.get("signal","") else (1 - yes_p)
+                    is_yes_buy  = "YES" in signal.get("signal", "")
+                    entry_price = yes_p if is_yes_buy else (1 - yes_p)
 
-                    # ── Low-price underdog-YES guard ──────────────────────────
-                    # Apr backtest: the two resolved YES buys below 0.40
-                    # (Bitcoin $78k @ 0.36, Hezbollah ceasefire @ 0.17) both
-                    # lost, totalling –$2.29. With a 0.278 payoff ratio the
-                    # bot needs near-perfect accuracy at low prices, which the
-                    # data does not support.
-                    if "YES" in signal.get("signal","") and entry_price < 0.30:
+                    # Block YES buys priced as underdogs — payoff ratio <1 makes
+                    # cheap longs unprofitable unless accuracy is near-perfect.
+                    if is_yes_buy and entry_price < MIN_YES_BUY_PRICE:
                         self._log(
-                            f"LOW-PRICE YES SKIP: price={entry_price:.3f} < 0.30 {question[:40]}"
+                            f"LOW-PRICE YES SKIP: price={entry_price:.3f} < {MIN_YES_BUY_PRICE:.2f} "
+                            f"{question[:40]}"
                         )
                         sig_record["skip_reason"] = (
-                            f"YES underdog at {entry_price:.3f} < 0.30 (payoff-ratio guard)"
+                            f"YES underdog at {entry_price:.3f} < {MIN_YES_BUY_PRICE:.2f}"
                         )
                         continue
 
@@ -4849,11 +4833,9 @@ class PolymarketBot:
                         self._log(f"SKIP: token_id from market data failed format check ({_exec_tid[:20]})", "error")
                         continue
 
-                    # ── Pre-flight balance check ──────────────────────────────
-                    # Cheapest possible guard against the Apr 9 error storm:
-                    # never send an order the wallet clearly cannot cover.
-                    # `amt` is a dollar figure for market/limit BUY alike
-                    # (see place_market_order and place_limit_order).
+                    # Pre-flight balance check: `amt` is a dollar figure for
+                    # both market and limit BUYs (see place_market_order /
+                    # place_limit_order).
                     if not PAPER_MODE and amt > cycle_cash:
                         self._log(
                             f"PRE-FLIGHT BALANCE SKIP: order ${amt:.2f} > cash ${cycle_cash:.2f} "
