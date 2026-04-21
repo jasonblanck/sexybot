@@ -28,7 +28,9 @@
 }
 body[data-theme="light"]{--bg:#f3f5f8;--panel:#ffffff;--panel-2:#fafbfc;--border:#e2e6eb;--border2:#e5e9ef;--accent:#ff6600;--accent2:#f59e0b;--green:#0d9f5f;--red:#e11d48;--blue:#2563eb;--purple:#8b5cf6;--text:#0f172a;--text2:#64748b;--text3:#94a3b8;--hdr-bg:#ffffff;--row-hover:#f8fafc;--chart-grid:#eef1f5;--chart-axis:#94a3b8;--panel-hover:#f8fafc;--btn-secondary-bg:#f1f5f9;--btn-secondary-border:#e2e8f0;--hero-bg:#ffffff;--ring:0 0 0 1px rgba(15,23,42,0.04) inset;--hero-shadow:var(--ring),0 1px 3px rgba(15,23,42,0.06),0 1px 2px rgba(15,23,42,0.04);--pulse-green:0 0 0 4px rgba(13,159,95,0.12),0 0 20px rgba(13,159,95,0.25);--pulse-red:0 0 0 4px rgba(225,29,72,0.12),0 0 20px rgba(225,29,72,0.25);}
 *{margin:0;padding:0;box-sizing:border-box;}html,body{height:100%;}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13px;line-height:1.5;transition:background .2s,color .2s;}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13px;line-height:1.5;transition:background .2s,color .2s;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;}
+/* Monospace numerics align by column — TradingView convention. */
+.mono,code,kbd,pre,.stat-val,.big-num,.hero-number,.hero-pnl-number,.sub-num,.crypto-price,.tlog-amt,.feed-conf,.fred-val,.mover-price,.mover-chg,.vmx-val,.pill{font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;}
 /* ── HEADER / NAV ── */
 .hdr{height:44px;background:var(--hdr-bg);border-bottom:1px solid var(--accent);display:flex;align-items:center;justify-content:space-between;padding:0 20px;position:sticky;top:0;z-index:100;transition:background .2s;}
 .hdr-logo{font-family:var(--mono);font-size:15px;font-weight:500;color:var(--accent);letter-spacing:3px;white-space:nowrap;}
@@ -50,12 +52,13 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
    Panels stack on a --border-colored gap so each card reads as its own
    surface. Subtle inner ring + soft top-shadow gives depth without
    resorting to heavy borders (Vercel-style). */
-.panel{background:var(--panel);padding:16px 18px;box-shadow:var(--ring);position:relative;}
-.panel-title{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--accent);margin-bottom:12px;padding-bottom:6px;border-bottom:1px solid var(--border2);display:flex;align-items:center;justify-content:space-between;}
+.panel{background:var(--panel);padding:18px 20px;box-shadow:var(--ring);position:relative;}
+.panel-title{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--accent);margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;}
 .panel-title span{color:var(--text3);font-size:9px;}
-.stat-row{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #1a1a1a;}
+.stat-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);gap:12px;min-height:26px;}
 .stat-row:last-child{border-bottom:none;}
-.stat-lbl{color:var(--text2);font-size:12px;}.stat-val{font-family:var(--mono);font-size:12px;font-weight:500;}
+.stat-lbl{color:var(--text2);font-size:12px;letter-spacing:0.2px;}
+.stat-val{font-family:var(--mono);font-size:12px;font-weight:500;white-space:nowrap;}
 .g{color:var(--green);}.r{color:var(--red);}.b{color:var(--blue);}.o{color:var(--accent);}.y{color:var(--accent2);}.p{color:var(--purple);}
 .big-num{font-family:var(--mono);font-size:32px;font-weight:500;letter-spacing:-1px;line-height:1;margin:4px 0;}
 .sub-num{font-size:11px;color:var(--text2);font-family:var(--mono);}
@@ -64,7 +67,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .cf{padding:2px 10px;border-radius:2px;border:1px solid var(--border2);font-family:var(--mono);font-size:10px;cursor:pointer;background:transparent;color:var(--text2);letter-spacing:1px;}
 .cf.on{background:var(--accent);border-color:var(--accent);color:#000;font-weight:500;}
 .feed{overflow-y:auto;flex:1;min-height:0;scrollbar-width:thin;scrollbar-color:#333 #111;}
-.feed-item{display:grid;grid-template-columns:50px 1fr 48px;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid #1a1a1a;font-size:11px;}
+.feed-item{display:grid;grid-template-columns:50px 1fr 48px;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:11px;min-height:32px;}
 .feed-item:last-child{border-bottom:none;}
 .badge{font-family:var(--mono);font-size:9px;font-weight:500;padding:2px 6px;border-radius:2px;text-align:center;letter-spacing:1px;}
 .badge-y{background:#00cc6618;color:var(--green);border:1px solid #00cc6630;}
@@ -76,27 +79,34 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .feed-mkt a{color:inherit;text-decoration:none;}.feed-mkt a:hover{color:var(--accent);}
 .feed-conf{font-family:var(--mono);color:var(--text2);text-align:right;font-size:10px;}
 .tlog{overflow-y:auto;max-height:220px;scrollbar-width:thin;scrollbar-color:#333 #111;}
-.tlog-item{display:grid;grid-template-columns:1fr 40px 60px;gap:6px;align-items:center;padding:5px 0;border-bottom:1px solid #1a1a1a;font-size:11px;}
+.tlog-item{display:grid;grid-template-columns:1fr 40px 60px;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:11px;min-height:30px;}
 .tlog-item:last-child{border-bottom:none;}
 .tlog-mkt{color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .tlog-amt{font-family:var(--mono);text-align:right;color:var(--text);}
 .blog{font-family:var(--mono);font-size:10px;line-height:1.7;overflow-y:auto;flex:1;min-height:0;scrollbar-width:thin;scrollbar-color:#333 #111;color:var(--text3);}
 .blog .li{color:#4488ff;}.blog .le{color:var(--red);}.blog .ls{color:var(--green);}.blog .lo{color:var(--accent2);}
 .mkt-table{width:100%;border-collapse:collapse;}
-.mkt-table th{font-family:var(--mono);font-size:9px;letter-spacing:1px;color:var(--text3);text-align:left;padding:4px 0;border-bottom:1px solid var(--border2);}
+.mkt-table th{font-family:var(--mono);font-size:9px;letter-spacing:1.2px;color:var(--text3);text-align:left;padding:6px 0;border-bottom:1px solid var(--border2);text-transform:uppercase;}
 .mkt-table th:not(:first-child){text-align:right;}
-.mkt-table td{padding:6px 0;border-bottom:1px solid #1a1a1a;font-size:11px;vertical-align:middle;}
-.mkt-table td:not(:first-child){text-align:right;font-family:var(--mono);}
+.mkt-table td{padding:8px 0;border-bottom:1px solid var(--border);font-size:11px;vertical-align:middle;}
+.mkt-table td:not(:first-child){text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;}
 .mkt-table tr:last-child td{border-bottom:none;}
+.mkt-table tr:hover td{background:var(--row-hover);}
 .mkt-link{color:var(--text);text-decoration:none;font-size:11px;}.mkt-link:hover{color:var(--accent);}
 .wr-bar{height:4px;background:#1a1a1a;border-radius:2px;margin-top:6px;overflow:hidden;}
 .wr-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:2px;transition:width 0.6s ease;}
-.fred-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
-.fred-item{padding:10px;background:#0a0a0a;border:1px solid var(--border2);border-radius:4px;}
-.fred-lbl{font-size:10px;color:var(--text3);margin-bottom:3px;font-family:var(--mono);letter-spacing:1px;}
-.fred-val{font-family:var(--mono);font-size:18px;font-weight:500;}
+.fred-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+.fred-item{padding:12px 14px;background:var(--panel-2);border:1px solid var(--border);border-radius:6px;}
+.fred-lbl{font-size:9px;color:var(--text3);margin-bottom:4px;font-family:var(--mono);letter-spacing:1.2px;text-transform:uppercase;}
+.fred-val{font-family:var(--mono);font-size:18px;font-weight:500;line-height:1.1;letter-spacing:-0.3px;}
 .fred-date{font-size:9px;color:var(--text3);margin-top:2px;}
-.crypto-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #1a1a1a;}
+
+/* "See all →" footer link — TradingView/BFO pattern. Sits at the bottom
+   of scrollable feeds when the data has a deeper view to drill into. */
+.see-all{display:flex;justify-content:flex-end;padding:8px 0 0;border-top:1px solid var(--border);margin-top:8px;}
+.see-all a{font-family:var(--mono);font-size:10px;letter-spacing:1px;color:var(--blue);text-decoration:none;text-transform:uppercase;transition:color .15s;}
+.see-all a:hover{color:var(--accent);}
+.crypto-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);gap:10px;min-height:30px;}
 .crypto-row:last-child{border-bottom:none;}
 .crypto-sym{font-family:var(--mono);font-size:12px;font-weight:500;}
 .crypto-price{font-family:var(--mono);font-size:12px;}
@@ -111,7 +121,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .card{background:var(--panel);border:1px solid var(--border2);border-radius:6px;padding:18px 20px;}
 .card-title{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--accent);margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--border2);}
 /* ── ACTIVITY PAGE ── */
-.act-item{padding:12px 0;border-bottom:1px solid #1a1a1a;display:grid;grid-template-columns:70px 60px 1fr 60px 80px;gap:10px;align-items:center;font-size:11px;}
+.act-item{padding:12px 0;border-bottom:1px solid var(--border);display:grid;grid-template-columns:70px 60px 1fr 60px 80px;gap:10px;align-items:center;font-size:11px;}
 .act-item:last-child{border-bottom:none;}
 .act-time{font-family:var(--mono);font-size:10px;color:var(--text3);}
 .act-mkt{color:var(--text);line-height:1.4;}
@@ -124,7 +134,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 /* ── DATA TABLE ── */
 .dt{width:100%;border-collapse:collapse;}
 .dt th{font-family:var(--mono);font-size:9px;letter-spacing:1px;color:var(--text3);text-align:left;padding:6px 8px;border-bottom:1px solid var(--border2);white-space:nowrap;}
-.dt td{padding:8px 8px;border-bottom:1px solid #1a1a1a;font-size:11px;vertical-align:middle;}
+.dt td{padding:10px 8px;border-bottom:1px solid var(--border);font-size:11px;vertical-align:middle;font-variant-numeric:tabular-nums;}
 .dt td:first-child{color:var(--text);}
 .dt tr:last-child td{border-bottom:none;}
 .dt tr:hover td{background:#161616;}
@@ -320,7 +330,7 @@ body[data-theme="light"] .vmx-cell.hot{background:#ffe4e6;border-color:#fda4af;}
 body[data-theme="light"] .vmx-scale{border-top-color:var(--border);}
 
 /* Nicer row layout for the Market Movers list */
-.mover-row{display:grid;grid-template-columns:28px 1fr auto;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--border2);}
+.mover-row{display:grid;grid-template-columns:32px 1fr auto;gap:12px;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);min-height:44px;}
 .mover-row:last-child{border-bottom:none;}
 .mover-avatar{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:11px;font-weight:500;background:rgba(51,153,255,0.10);color:var(--blue);border:1px solid rgba(51,153,255,0.25);}
 body[data-theme="light"] .mover-avatar{background:#dbeafe;border-color:#bfdbfe;color:#1e40af;}
@@ -643,6 +653,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
         </span>
       </div>
       <div class="feed" id="sig-feed"><div style="color:var(--text3);font-size:11px;padding:12px 0">waiting…</div></div>
+      <div class="see-all"><a href="#activity" onclick="showPage('activity',document.querySelector('.nav-link[href=\'#activity\']'))">See all →</a></div>
     </div>
   </div>
   <div class="col">
@@ -675,6 +686,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
     <div class="panel">
       <div class="panel-title">TRADE HISTORY</div>
       <div class="tlog" id="tlog"><div style="color:var(--text3);font-size:11px;padding:8px 0">no trades yet</div></div>
+      <div class="see-all"><a href="#trades" onclick="showPage('trades',document.querySelector('.nav-link[href=\'#trades\']'))">See all →</a></div>
     </div>
     <div class="panel panel-term" style="flex:1;display:flex;flex-direction:column;border-bottom:1px solid var(--border2);">
       <div class="term-head">
