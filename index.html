@@ -78,6 +78,12 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
   .mc-cell{flex:1 1 140px;padding:12px 14px;}
   .mc-val{font-size:22px;}
   .mc-actions{flex:1 1 100%;}
+  /* Position Sizer form: stack rows so labels + inputs don't clip. */
+  .ps-form{grid-template-columns:1fr!important;}
+  /* Kill-bar clears the fixed 56px mob-nav at the bottom of the viewport. */
+  .kill-bar{margin-bottom:56px;}
+  /* Any page content above the bottom nav gets breathing room. */
+  .page{padding-bottom:70px;}
 }
 /* ── PANELS ──
    Panels stack on a --border-colored gap so each card reads as its own
@@ -869,7 +875,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <div style="font-family:var(--mono);font-size:32px;font-weight:500;letter-spacing:-1px;" id="ps-rec-big">$—</div>
     </div>
   </div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px 24px;align-items:center;">
+  <div class="ps-form" style="display:grid;grid-template-columns:1fr 1fr;gap:14px 24px;align-items:center;">
     <div style="display:flex;align-items:center;gap:10px;">
       <label style="font-size:11px;color:var(--text2);white-space:nowrap;min-width:130px;">Total Bankroll ($)</label>
       <input id="ps-bankroll" type="number" value="10000" min="1" step="100" style="flex:1;background:#1a1a1a;border:1px solid var(--border2);color:var(--text);font-family:var(--mono);font-size:12px;padding:6px 10px;border-radius:4px;outline:none;" oninput="psCalc()">
