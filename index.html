@@ -6,17 +6,18 @@
 <title>SEXYBOT</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0d0d0d;--panel:#111111;--border:#222222;--border2:#2a2a2a;--accent:#ff6600;--accent2:#ffaa00;--green:#00cc66;--red:#ff3355;--blue:#3399ff;--purple:#aa55ff;--text:#e8e8e8;--text2:#999999;--text3:#555555;--mono:'DM Mono',monospace;--sans:'DM Sans',sans-serif;}
+:root{--bg:#0d0d0d;--panel:#111111;--border:#222222;--border2:#2a2a2a;--accent:#ff6600;--accent2:#ffaa00;--green:#00cc66;--red:#ff3355;--blue:#3399ff;--purple:#aa55ff;--text:#e8e8e8;--text2:#999999;--text3:#555555;--mono:'DM Mono',monospace;--sans:'DM Sans',sans-serif;--hdr-bg:#000;--row-hover:#161616;--chart-grid:#1a1a1a;--chart-axis:#444;--panel-hover:#1a1a1a;--btn-secondary-bg:#1a1a1a;--btn-secondary-border:#2a2a2a;--hero-bg:#111111;--hero-shadow:none;}
+body[data-theme="light"]{--bg:#f3f5f8;--panel:#ffffff;--border:#e2e6eb;--border2:#e5e9ef;--accent:#ff6600;--accent2:#f59e0b;--green:#0d9f5f;--red:#e11d48;--blue:#2563eb;--purple:#8b5cf6;--text:#0f172a;--text2:#64748b;--text3:#94a3b8;--hdr-bg:#ffffff;--row-hover:#f8fafc;--chart-grid:#eef1f5;--chart-axis:#94a3b8;--panel-hover:#f8fafc;--btn-secondary-bg:#f1f5f9;--btn-secondary-border:#e2e8f0;--hero-bg:#ffffff;--hero-shadow:0 1px 3px rgba(15,23,42,0.06),0 1px 2px rgba(15,23,42,0.04);}
 *{margin:0;padding:0;box-sizing:border-box;}html,body{height:100%;}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13px;line-height:1.5;}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13px;line-height:1.5;transition:background .2s,color .2s;}
 /* ── HEADER / NAV ── */
-.hdr{height:44px;background:#000;border-bottom:1px solid var(--accent);display:flex;align-items:center;justify-content:space-between;padding:0 20px;position:sticky;top:0;z-index:100;}
+.hdr{height:44px;background:var(--hdr-bg);border-bottom:1px solid var(--accent);display:flex;align-items:center;justify-content:space-between;padding:0 20px;position:sticky;top:0;z-index:100;transition:background .2s;}
 .hdr-logo{font-family:var(--mono);font-size:15px;font-weight:500;color:var(--accent);letter-spacing:3px;white-space:nowrap;}
-.hdr-logo span{color:#fff;}
+.hdr-logo span{color:var(--text);}
 .hdr-nav{display:flex;align-items:center;gap:2px;}
 .nav-link{font-family:var(--mono);font-size:11px;color:var(--text2);text-decoration:none;padding:5px 12px;border-radius:3px;letter-spacing:1px;transition:color .15s,background .15s;}
-.nav-link:hover{color:var(--text);background:#1a1a1a;}
-.nav-link.active{color:var(--accent);background:#1a0a00;}
+.nav-link:hover{color:var(--text);background:var(--panel-hover);}
+.nav-link.active{color:var(--accent);background:var(--panel-hover);}
 .hdr-right{display:flex;align-items:center;gap:12px;font-family:var(--mono);font-size:11px;color:var(--text2);}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--green);flex-shrink:0;}.dot.off{background:var(--red);}.dot.pulse{animation:blink 1.5s infinite;}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}
@@ -133,8 +134,72 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .view-toggle{background:transparent;border:1px solid var(--border2);color:var(--text2);font-family:var(--mono);font-size:11px;padding:4px 10px;border-radius:3px;cursor:pointer;letter-spacing:1px;transition:color .15s,border-color .15s;white-space:nowrap;}
 .view-toggle:hover{color:var(--accent);border-color:var(--accent);}
 
+/* ── HERO (Portfolio + P&L) ── */
+.hero-row{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);}
+.hero-card{background:var(--hero-bg);padding:22px 24px;box-shadow:var(--hero-shadow);transition:background .2s;}
+.hero-eyebrow{display:flex;align-items:center;justify-content:space-between;color:var(--text2);font-size:12px;margin-bottom:10px;}
+.hero-eyebrow-avail{color:var(--text2);font-size:12px;}
+.hero-eyebrow-avail .g{font-family:var(--mono);font-weight:600;}
+.hero-number{font-family:var(--mono);font-size:40px;font-weight:500;letter-spacing:-1.5px;line-height:1.05;color:var(--text);}
+.hero-pnl-number{font-family:var(--mono);font-size:40px;font-weight:500;letter-spacing:-1.5px;line-height:1.05;}
+.hero-delta{font-size:12px;margin-top:4px;color:var(--text2);}
+.hero-delta .chg-pos{color:var(--green);font-weight:600;}
+.hero-delta .chg-neg{color:var(--red);font-weight:600;}
+.hero-actions{display:flex;gap:10px;margin-top:18px;}
+.hero-btn{flex:1;border-radius:8px;padding:11px 0;font-size:12px;font-weight:700;cursor:pointer;text-align:center;text-decoration:none;display:block;letter-spacing:.3px;transition:filter .15s,background .15s;}
+.hero-btn-primary{background:#3b82f6;color:#fff;border:none;}
+.hero-btn-primary:hover{filter:brightness(1.08);}
+.hero-btn-secondary{background:var(--btn-secondary-bg);color:var(--text);border:1px solid var(--btn-secondary-border);}
+.hero-btn-secondary:hover{background:var(--panel-hover);}
+.hero-range{display:flex;gap:6px;}
+.hero-mini{position:relative;height:60px;margin-top:6px;}
+[data-view="mobile"] .hero-row{grid-template-columns:1fr;}
+[data-view="mobile"] .hero-number,[data-view="mobile"] .hero-pnl-number{font-size:30px;}
+
+/* ── DESKTOP LIGHT-MODE POLISH ──
+   The base styles are dark-first, so the light overrides target the
+   remaining hardcoded colors that can't be driven by CSS vars alone. */
+body[data-theme="light"] .blog{color:var(--text3);}
+body[data-theme="light"] .blog .li{color:#2563eb;}
+body[data-theme="light"] .blog .le{color:var(--red);}
+body[data-theme="light"] .blog .ls{color:var(--green);}
+body[data-theme="light"] .blog .lo{color:var(--accent2);}
+body[data-theme="light"] .badge-y{background:#d1fae5;color:#047857;border-color:#a7f3d0;}
+body[data-theme="light"] .badge-n{background:#ffe4e6;color:#be123c;border-color:#fda4af;}
+body[data-theme="light"] .badge-traded{background:#dbeafe;color:#1e40af;border-color:#bfdbfe;}
+body[data-theme="light"] .badge-skip{background:#f1f5f9;color:#475569;border-color:#e2e8f0;}
+body[data-theme="light"] .badge-block{background:#ffe4e6;color:#be123c;border-color:#fda4af;}
+body[data-theme="light"] .wr-bar{background:var(--border);}
+body[data-theme="light"] .cf{color:var(--text2);}
+body[data-theme="light"] .cf.on{color:#fff;}
+body[data-theme="light"] .stoggle-slider{background:#cbd5e1;}
+body[data-theme="light"] .stoggle-slider:before{background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.15);}
+body[data-theme="light"] .stoggle input:checked+.stoggle-slider:before{background:#fff;}
+body[data-theme="light"] .sinput,body[data-theme="light"] .sselect{background:#fff;border:1px solid var(--border);color:var(--text);}
+body[data-theme="light"] .srow{background:#fff;border:1px solid var(--border);}
+body[data-theme="light"] .fred-item{background:#f8fafc;border:1px solid var(--border);}
+body[data-theme="light"] .log-wrap{background:#f8fafc;border-color:var(--border);}
+body[data-theme="light"] .mob-port-bar{background:#fff;border-bottom:1px solid var(--border);}
+body[data-theme="light"] .stat-row{border-bottom:1px solid var(--border);}
+body[data-theme="light"] .feed-item,body[data-theme="light"] .tlog-item,body[data-theme="light"] .dt td,body[data-theme="light"] .mkt-table td,body[data-theme="light"] .act-item{border-bottom:1px solid var(--border);}
+body[data-theme="light"] .dt tr:hover td{background:var(--row-hover);}
+body[data-theme="light"] .feed,body[data-theme="light"] .tlog,body[data-theme="light"] .blog{scrollbar-color:#cbd5e1 transparent;}
+body[data-theme="light"] .hdr{border-bottom:1px solid var(--border);box-shadow:0 1px 2px rgba(15,23,42,0.04);}
+body[data-theme="light"] .hero-btn-primary{background:#2563eb;}
+body[data-theme="light"] .sbtn{color:#fff;}
+body[data-theme="light"] .tabs{background:var(--border);}
+body[data-theme="light"] .tab{background:#fff;color:var(--text2);}
+body[data-theme="light"] .tab.on{background:var(--accent);color:#fff;}
+body[data-theme="light"] .kill-bar{background:#fff;}
+body[data-theme="light"] .card{box-shadow:var(--hero-shadow);}
+
+/* Theme toggle button */
+.theme-toggle{background:transparent;border:1px solid var(--border2);color:var(--text2);width:32px;height:28px;border-radius:3px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;transition:color .15s,border-color .15s,background .15s;}
+.theme-toggle:hover{color:var(--accent);border-color:var(--accent);}
+.theme-toggle svg{width:15px;height:15px;}
+
 /* ── MOBILE BOTTOM NAV ── */
-.mob-nav{display:none;position:fixed;bottom:0;left:0;right:0;background:#000;border-top:1px solid var(--accent);z-index:200;height:56px;padding-bottom:env(safe-area-inset-bottom,0);}
+.mob-nav{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--hdr-bg);border-top:1px solid var(--accent);z-index:200;height:56px;padding-bottom:env(safe-area-inset-bottom,0);}
 .mob-nav-inner{display:flex;height:56px;}
 .mob-tab{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;cursor:pointer;color:var(--text3);font-family:var(--mono);font-size:8px;letter-spacing:1px;border:none;background:transparent;padding:0;transition:color .15s;}
 .mob-tab.active{color:var(--accent);}
@@ -240,6 +305,10 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
     <span id="clock">—</span>
     <div class="dot pulse" id="sdot"></div>
     <span id="stext">connecting</span>
+    <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle light/dark mode" aria-label="Toggle theme">
+      <svg id="theme-icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <svg id="theme-icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+    </button>
     <button class="view-toggle" id="view-toggle-btn" onclick="toggleView()" title="Switch desktop/mobile view">📱 MOBILE</button>
     <button class="view-toggle" onclick="logoutBot()" title="Log out and return to login page" style="color:#ff6680;border-color:#ff668044;">⏻ LOG OUT</button>
   </div>
@@ -375,32 +444,32 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
     </div>
   </div>
   <div class="col">
-    <div style="display:flex;gap:1px;background:var(--border)">
-      <div class="panel" style="flex:1;background:var(--panel)">
-        <div style="font-size:11px;color:var(--text2);margin-bottom:6px;display:flex;align-items:center;justify-content:space-between;">
+    <div class="hero-row">
+      <div class="hero-card">
+        <div class="hero-eyebrow">
           <span>Portfolio</span>
-          <span style="font-size:11px;color:var(--text2)">Available <span class="g" id="pc-avail" style="font-family:var(--mono);font-weight:600">—</span></span>
+          <span class="hero-eyebrow-avail">Available <span class="g" id="pc-avail" style="font-family:var(--mono);font-weight:600">—</span></span>
         </div>
-        <div style="font-family:var(--mono);font-size:28px;font-weight:500;letter-spacing:-1px;margin-bottom:4px" id="pc-total">$—</div>
-        <div style="font-size:11px;margin-bottom:14px" id="pc-pnl-day">—</div>
-        <div style="display:flex;gap:8px">
-          <a href="https://polymarket.com/wallet" target="_blank" style="flex:1;background:#3b82f6;color:#fff;border:none;border-radius:6px;padding:9px 0;font-size:12px;font-weight:700;cursor:pointer;text-align:center;text-decoration:none;display:block;">↓ Deposit</a>
-          <a href="https://polymarket.com/wallet" target="_blank" style="flex:1;background:#1a1a1a;color:var(--text);border:1px solid var(--border2);border-radius:6px;padding:9px 0;font-size:12px;font-weight:700;cursor:pointer;text-align:center;text-decoration:none;display:block;">↑ Withdraw</a>
+        <div class="hero-number" id="pc-total">$—</div>
+        <div class="hero-delta" id="pc-pnl-day">—</div>
+        <div class="hero-actions">
+          <a href="https://polymarket.com/wallet" target="_blank" class="hero-btn hero-btn-primary">↓ Deposit</a>
+          <a href="https://polymarket.com/wallet" target="_blank" class="hero-btn hero-btn-secondary">↑ Withdraw</a>
         </div>
       </div>
-      <div class="panel" style="flex:1;background:var(--panel)">
-        <div style="font-size:11px;color:var(--text2);margin-bottom:6px;display:flex;align-items:center;justify-content:space-between;">
-          <span style="display:flex;align-items:center;gap:5px"><span class="g">▲</span> Profit/Loss</span>
-          <span style="display:flex;gap:6px">
+      <div class="hero-card">
+        <div class="hero-eyebrow">
+          <span style="display:flex;align-items:center;gap:5px"><span id="pc-pnl-icon" class="g">▲</span> Profit/Loss</span>
+          <span class="hero-range">
             <button class="cf on" onclick="setPnlFilter('1D',this)" id="pf-1d">1D</button>
             <button class="cf" onclick="setPnlFilter('1W',this)" id="pf-1w">1W</button>
             <button class="cf" onclick="setPnlFilter('1M',this)" id="pf-1m">1M</button>
             <button class="cf" onclick="setPnlFilter('ALL',this)" id="pf-all">ALL</button>
           </span>
         </div>
-        <div style="font-family:var(--mono);font-size:28px;font-weight:500;letter-spacing:-1px;margin-bottom:2px" id="pc-pnl">$—</div>
-        <div style="font-size:10px;color:var(--text2);margin-bottom:8px" id="pc-pnl-label">All time</div>
-        <div style="position:relative;height:60px"><canvas id="mini-pnl-chart"></canvas></div>
+        <div class="hero-pnl-number" id="pc-pnl">$—</div>
+        <div class="hero-delta" id="pc-pnl-label">All time</div>
+        <div class="hero-mini"><canvas id="mini-pnl-chart"></canvas></div>
       </div>
     </div>
     <div class="panel">
@@ -842,9 +911,44 @@ window.addEventListener('hashchange',()=>{
 /* ── P&L CHART (dashboard) ── */
 function setFilter(f,btn){activeFilter=f;[btn.closest('div').querySelectorAll('.cf')].forEach(grp=>grp.forEach(b=>b.classList.remove('on')));btn.classList.add('on');renderChart();}
 function filterTrades(trades){if(activeFilter==='ALL')return trades;const now=Date.now();const w={'1D':86400000,'1W':604800000,'1M':2592000000};return trades.filter(t=>(now-new Date(t.time||0).getTime())<=(w[activeFilter]||86400000));}
+function _chartColors(){
+  const cs=getComputedStyle(document.body);
+  return {
+    grid: cs.getPropertyValue('--chart-grid').trim()||'#1a1a1a',
+    axis: cs.getPropertyValue('--chart-axis').trim()||'#555',
+    text: cs.getPropertyValue('--text').trim()||'#e8e8e8',
+    panel: cs.getPropertyValue('--panel').trim()||'#111',
+    border: cs.getPropertyValue('--border2').trim()||'#2a2a2a',
+  };
+}
 function initChart(){
   const ctx=document.getElementById('pnl-chart').getContext('2d');
-  pnlChart=new Chart(ctx,{type:'line',data:{labels:['now'],datasets:[{data:[0],borderColor:'#ff6600',backgroundColor:'rgba(255,102,0,0.08)',borderWidth:2,pointRadius:0,tension:0.4,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#444',font:{family:'DM Mono',size:9},maxTicksLimit:6},grid:{color:'#1a1a1a'}},y:{grid:{color:'#1a1a1a'},ticks:{color:'#555',font:{family:'DM Mono',size:10},callback:v=>'$'+v.toFixed(2)}}}}});
+  const c=_chartColors();
+  pnlChart=new Chart(ctx,{
+    type:'line',
+    data:{labels:['now'],datasets:[{data:[0],borderColor:'#ff6600',backgroundColor:'rgba(255,102,0,0.08)',borderWidth:2,pointRadius:0,pointHoverRadius:5,pointHoverBorderWidth:2,pointHoverBackgroundColor:'#fff',tension:0.4,fill:true}]},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      interaction:{mode:'index',intersect:false},
+      plugins:{
+        legend:{display:false},
+        tooltip:{
+          enabled:true,
+          backgroundColor:c.panel,titleColor:c.text,bodyColor:c.text,
+          borderColor:c.border,borderWidth:1,
+          titleFont:{family:'DM Mono',size:10,weight:'500'},
+          bodyFont:{family:'DM Mono',size:11,weight:'500'},
+          padding:10,displayColors:false,
+          callbacks:{label:ctx=>'$'+Number(ctx.parsed.y).toFixed(2)}
+        }
+      },
+      hover:{mode:'index',intersect:false},
+      scales:{
+        x:{ticks:{color:c.axis,font:{family:'DM Mono',size:9},maxTicksLimit:6},grid:{color:c.grid,drawTicks:false}},
+        y:{grid:{color:c.grid,drawTicks:false},ticks:{color:c.axis,font:{family:'DM Mono',size:10},callback:v=>'$'+v.toFixed(2)}}
+      }
+    }
+  });
 }
 function renderChart(){
   if(!pnlChart)return;
@@ -852,9 +956,25 @@ function renderChart(){
   filtered.forEach(t=>{const filled=t.status==='matched'||t.status==='simulated';if(filled)cum=parseFloat((cum+(t.amount_usdc||t.amount||0)*0.02).toFixed(2));labels.push(new Date(t.time||Date.now()).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}));data.push(cum);});
   if(_totalPnl!==0&&data.length>0){const scale=_totalPnl/data[data.length-1];for(let i=0;i<data.length;i++)data[i]=parseFloat((data[i]*scale).toFixed(2));}
   if(labels.length===0){labels.push('now');data.push(_totalPnl||0);}
-  pnlChart.data.labels=labels;pnlChart.data.datasets[0].data=data;pnlChart.data.datasets[0].borderColor=(_totalPnl>=0)?'#ff6600':'#ff3355';pnlChart.update('none');
+  pnlChart.data.labels=labels;pnlChart.data.datasets[0].data=data;
+  pnlChart.data.datasets[0].borderColor=(_totalPnl>=0)?'#ff6600':'#ff3355';
+  pnlChart.data.datasets[0].backgroundColor=(_totalPnl>=0)?'rgba(255,102,0,0.08)':'rgba(255,51,85,0.08)';
+  pnlChart.update('none');
 }
 function updateChart(trades){allTrades=trades;renderChart();}
+function _applyChartTheme(){
+  const c=_chartColors();
+  [pnlChart].forEach(ch=>{
+    if(!ch)return;
+    ch.options.scales.x.ticks.color=c.axis;
+    ch.options.scales.x.grid.color=c.grid;
+    ch.options.scales.y.ticks.color=c.axis;
+    ch.options.scales.y.grid.color=c.grid;
+    const tt=ch.options.plugins.tooltip;
+    if(tt){tt.backgroundColor=c.panel;tt.titleColor=c.text;tt.bodyColor=c.text;tt.borderColor=c.border;}
+    ch.update('none');
+  });
+}
 
 /* ── FETCH BOT STATUS (dashboard) ── */
 async function fetchBot(){
@@ -1002,8 +1122,9 @@ async function fetchPortfolio(){
     const pnl=d.total_pnl||0;const pct=d.pct_pnl||0;
     _totalPnl=pnl;renderChart();
     const sign=pnl>=0?'+':'';const cls=pnl>=0?'g':'r';
-    document.getElementById('pc-pnl').textContent=sign+fmt$(pnl);document.getElementById('pc-pnl').className=cls;
+    document.getElementById('pc-pnl').textContent=sign+fmt$(pnl);document.getElementById('pc-pnl').className='hero-pnl-number '+cls;
     document.getElementById('pc-pnl-day').innerHTML=`<span class="${cls}">${sign}${fmt$(pnl)} (${sign}${pct.toFixed(2)}%)</span> all time`;
+    const pIcon=document.getElementById('pc-pnl-icon');if(pIcon){pIcon.textContent=pnl>=0?'▲':'▼';pIcon.className=cls;}
     const positions=d.positions||[];
     document.getElementById('pos-count').textContent=positions.length;
     if(positions.length>0){
@@ -1015,7 +1136,8 @@ async function fetchPortfolio(){
       const vals=positions.map(p=>p.current_value);
       const ctx=document.getElementById('mini-pnl-chart').getContext('2d');
       if(miniPnlChart)miniPnlChart.destroy();
-      miniPnlChart=new Chart(ctx,{type:'line',data:{labels:positions.map((_,i)=>i),datasets:[{data:vals,borderColor:pnl>=0?'#00cc66':'#ff3355',borderWidth:2,pointRadius:0,fill:true,backgroundColor:pnl>=0?'rgba(0,204,102,0.08)':'rgba(255,51,85,0.08)',tension:0.4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{enabled:false}},scales:{x:{display:false},y:{display:false}}}});
+      const _mc=_chartColors();
+      miniPnlChart=new Chart(ctx,{type:'line',data:{labels:positions.map((_,i)=>i),datasets:[{data:vals,borderColor:pnl>=0?'#00cc66':'#ff3355',borderWidth:2,pointRadius:0,pointHoverRadius:4,pointHoverBackgroundColor:'#fff',pointHoverBorderWidth:2,fill:true,backgroundColor:pnl>=0?'rgba(0,204,102,0.08)':'rgba(255,51,85,0.08)',tension:0.4}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:{enabled:true,backgroundColor:_mc.panel,titleColor:_mc.text,bodyColor:_mc.text,borderColor:_mc.border,borderWidth:1,titleFont:{family:'DM Mono',size:10},bodyFont:{family:'DM Mono',size:11},padding:8,displayColors:false,callbacks:{title:()=>'',label:ctx=>'$'+Number(ctx.parsed.y).toFixed(2)}}},scales:{x:{display:false},y:{display:false}}}});
     }else{document.getElementById('positions-list').innerHTML='<div style="color:var(--text3);font-size:11px;padding:8px 0">no open positions</div>';}
     // sync positions page
     _portfolioCache=d;
@@ -1783,6 +1905,24 @@ function toggleView(){
   var cur = document.documentElement.getAttribute('data-view') || 'desktop';
   applyView(cur==='mobile' ? 'desktop' : 'mobile');
 }
+function applyTheme(theme){
+  if(theme!=='light') theme='dark';
+  if(theme==='light') document.body.setAttribute('data-theme','light');
+  else document.body.removeAttribute('data-theme');
+  var moon=document.getElementById('theme-icon-moon'),sun=document.getElementById('theme-icon-sun');
+  if(moon&&sun){moon.style.display=theme==='light'?'none':'';sun.style.display=theme==='light'?'':'none';}
+  try{localStorage.setItem('sbTheme',theme);}catch(e){}
+  if(typeof _applyChartTheme==='function') _applyChartTheme();
+}
+function toggleTheme(){
+  var cur=document.body.getAttribute('data-theme')==='light'?'light':'dark';
+  applyTheme(cur==='light'?'dark':'light');
+}
+(function(){
+  var saved='dark';
+  try{saved=localStorage.getItem('sbTheme')||'dark';}catch(e){}
+  applyTheme(saved);
+})();
 function mobActivate(el){
   document.querySelectorAll('.mob-tab').forEach(t=>t.classList.remove('active'));
   el.classList.add('active');
