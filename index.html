@@ -540,7 +540,13 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
           <button class="cf" onclick="setFilter('ALL',this)">ALL</button>
         </div>
       </div>
-      <div class="chart-wrap"><canvas id="pnl-chart"></canvas></div>
+      <div class="chart-wrap">
+        <canvas id="pnl-chart"></canvas>
+        <div id="pnl-empty" style="display:none;position:absolute;inset:0;align-items:center;justify-content:center;flex-direction:column;gap:6px;pointer-events:none;">
+          <div style="font-family:var(--mono);font-size:11px;letter-spacing:1.5px;color:var(--text2);text-transform:uppercase;">No P&amp;L activity in window</div>
+          <div style="font-size:11px;color:var(--text3);">Try <span style="color:var(--accent);">1W</span>, <span style="color:var(--accent);">1M</span>, or <span style="color:var(--accent);">ALL</span></div>
+        </div>
+      </div>
     </div>
     <div class="panel">
       <div class="panel-title">ACTIVE MARKETS</div>
@@ -1038,10 +1044,13 @@ function initChart(){
 }
 function renderChart(){
   if(!pnlChart)return;
+  const empty=document.getElementById('pnl-empty');
   const filtered=filterTrades(allTrades);const labels=[];const data=[];let cum=0;
   filtered.forEach(t=>{const filled=t.status==='matched'||t.status==='simulated';if(filled)cum=parseFloat((cum+(t.amount_usdc||t.amount||0)*0.02).toFixed(2));labels.push(new Date(t.time||Date.now()).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}));data.push(cum);});
   if(_totalPnl!==0&&data.length>0){const scale=_totalPnl/data[data.length-1];for(let i=0;i<data.length;i++)data[i]=parseFloat((data[i]*scale).toFixed(2));}
-  if(labels.length===0){labels.push('now');data.push(_totalPnl||0);}
+  const hasPoints=labels.length>0;
+  if(!hasPoints){labels.push('now');data.push(_totalPnl||0);}
+  if(empty) empty.style.display=(!hasPoints&&activeFilter!=='ALL')?'flex':'none';
   pnlChart.data.labels=labels;pnlChart.data.datasets[0].data=data;
   pnlChart.data.datasets[0].borderColor=(_totalPnl>=0)?'#ff6600':'#ff3355';
   pnlChart.data.datasets[0].backgroundColor=(_totalPnl>=0)?'rgba(255,102,0,0.08)':'rgba(255,51,85,0.08)';
