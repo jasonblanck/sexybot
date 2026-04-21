@@ -385,10 +385,10 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
 <div class="main">
   <div class="col">
     <div class="panel">
-      <div class="panel-title">PORTFOLIO</div>
-      <div class="big-num g" id="port-val">$—</div>
-      <div class="sub-num" id="port-sub">loading…</div>
-      <div style="margin-top:14px">
+      <div class="panel-title">BOT STATS</div>
+      <span id="port-val" style="display:none">$—</span>
+      <span id="port-sub" style="display:none"></span>
+      <div>
         <div class="stat-row"><span class="stat-lbl">Cash Balance</span><span class="stat-val g" id="cash-balance">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Deployed</span><span class="stat-val o" id="deployed">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Trades</span><span class="stat-val b" id="ntrades">—</span></div>
@@ -570,7 +570,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
   <div class="col">
     <div class="panel" id="vmx-panel">
       <div class="panel-title">VOLATILITY MATRIX · 1D
-        <span class="pill pill-hot" id="vmx-hot">0 HOT</span>
+        <span class="pill pill-count" id="vmx-hot">0 HOT</span>
       </div>
       <div class="vmx-grid" id="vmx-grid">
         <div class="vmx-cell"><div class="vmx-sym">VIX</div><div class="vmx-val" id="vmx-vix">—</div></div>
@@ -1281,11 +1281,12 @@ async function fetchFMP(){
     const r=await fetch(`${BOT}/fmp`);const d=await r.json();
     const s=d._sentiment||{};const sc=s.spy_change_pct||0;const scls=sc>=0?'g':'r';
     document.getElementById('fmp-sentiment').innerHTML=`<span class="${scls}">SPY ${sc>=0?'+':''}${sc.toFixed(2)}% · ${s.up_count||0}/${s.total||0} up</span>`;
+    const names={SPY:'S&P 500 ETF',AAPL:'Apple Inc.',MSFT:'Microsoft Corp.',NVDA:'NVIDIA Corp.',TSLA:'Tesla, Inc.',META:'Meta Platforms',AMZN:'Amazon.com'};
     const tickers=['SPY','AAPL','MSFT','NVDA','TSLA','META','AMZN'];
     const rows=tickers.filter(t=>d[t]).map(t=>{
       const q=d[t];const c=q.change_pct||0;const cls=c>=0?'g':'r';const sign=c>=0?'+':'';
       const price=q.price!=null?'$'+Number(q.price).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}):'—';
-      return`<div class="crypto-row"><span class="crypto-sym ${cls}" style="font-size:10px;width:38px">${t}</span><span class="crypto-price" style="font-size:11px">${price}</span><span class="${cls}" style="font-family:var(--mono);font-size:10px">${sign}${c.toFixed(2)}%</span></div>`;
+      return`<div class="mover-row"><div class="mover-avatar">${t.charAt(0)}</div><div><div class="mover-name">${names[t]||t}</div><div class="mover-ticker">${t}</div></div><div><div class="mover-price">${price}</div><div class="mover-chg ${cls}">${sign}${c.toFixed(2)}%</div></div></div>`;
     });
     document.getElementById('fmp-movers').innerHTML=rows.join('')||'<div style="color:var(--text3);font-size:11px;padding:4px 0">no data</div>';
   }catch(e){}
@@ -1440,9 +1441,14 @@ function syncVmx(){
     const pct=_parseChgPct((document.getElementById(src)||{}).innerHTML);
     if(pct!=null){const mag=Math.abs(pct);_vmxSet(dst,(pct>=0?'+':'')+pct.toFixed(1)+'%',mag<2?1:mag<5?2:3);}
   });
-  // Update "N HOT" counter
+  // Update "N HOT" counter — neutral pill when 0, amber pill when any cell is hot.
   const hot=document.querySelectorAll('#vmx-grid .vmx-cell.hot').length;
-  const pill=document.getElementById('vmx-hot');if(pill)pill.textContent=hot+' HOT';
+  const pill=document.getElementById('vmx-hot');
+  if(pill){
+    pill.textContent=hot+' HOT';
+    pill.classList.toggle('pill-hot',hot>0);
+    pill.classList.toggle('pill-count',hot===0);
+  }
 }
 function syncWatchCrypto(){
   const d=_cryptoCache;const fm=n=>'$'+Number(n).toLocaleString('en-US',{maximumFractionDigits:2});const ch=n=>{const c=parseFloat(n||0).toFixed(2);return`<span class="${c>=0?'g':'r'}">${c>=0?'+':''}${c}%</span>`;};
