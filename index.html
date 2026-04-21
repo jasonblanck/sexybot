@@ -46,8 +46,23 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .page{display:none;}
 .page.active{display:block;}
 /* ── DASHBOARD LAYOUT ── */
+/* Responsive grid.
+   ≥1400px — full 3-column command-center layout.
+   1100-1399px — left sidebar + stacked main column; the 3rd column's
+     panels flow as a 2-col sub-grid below the main column so nothing
+     ever floats next to an empty void.
+   <1100px — everything stacks into a single column. */
 .main{display:grid;grid-template-columns:260px 1fr 300px;gap:1px;background:var(--border);align-items:start;}
 .col{background:var(--bg);display:flex;flex-direction:column;gap:1px;}
+@media(max-width:1399px){
+  .main{grid-template-columns:240px 1fr;}
+  .main > .col:nth-child(3){grid-column:1/-1;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));flex-direction:unset;}
+  .main > .col:nth-child(3) > .panel{background:var(--panel);}
+}
+@media(max-width:1099px){
+  .main{grid-template-columns:1fr;}
+  .main > .col:nth-child(3){grid-template-columns:1fr;}
+}
 /* ── PANELS ──
    Panels stack on a --border-colored gap so each card reads as its own
    surface. Subtle inner ring + soft top-shadow gives depth without
