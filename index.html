@@ -172,8 +172,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .hero-eyebrow{display:flex;align-items:center;justify-content:space-between;color:var(--text2);font-size:12px;margin-bottom:10px;}
 .hero-eyebrow-avail{color:var(--text2);font-size:12px;}
 .hero-eyebrow-avail .g{font-family:var(--mono);font-weight:600;}
-.hero-number{font-family:var(--mono);font-size:40px;font-weight:500;letter-spacing:-1.5px;line-height:1.05;color:var(--text);}
-.hero-pnl-number{font-family:var(--mono);font-size:40px;font-weight:500;letter-spacing:-1.5px;line-height:1.05;}
+.hero-number{font-family:var(--mono);font-size:52px;font-weight:500;letter-spacing:-1.8px;line-height:1.02;color:var(--text);}
+.hero-pnl-number{font-family:var(--mono);font-size:52px;font-weight:500;letter-spacing:-1.8px;line-height:1.02;}
 .hero-delta{font-size:12px;margin-top:4px;color:var(--text2);}
 .hero-delta .chg-pos{color:var(--green);font-weight:600;}
 .hero-delta .chg-neg{color:var(--red);font-weight:600;}
@@ -186,7 +186,40 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .hero-range{display:flex;gap:6px;}
 .hero-mini{position:relative;height:60px;margin-top:6px;}
 [data-view="mobile"] .hero-row{grid-template-columns:1fr;}
-[data-view="mobile"] .hero-number,[data-view="mobile"] .hero-pnl-number{font-size:30px;}
+[data-view="mobile"] .hero-number,[data-view="mobile"] .hero-pnl-number{font-size:36px;letter-spacing:-1px;}
+
+/* ── MISSION CONTROL BAND ──
+   4-column metric strip above the main grid, BFO-style overview. */
+.mission-control{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);border-bottom:1px solid var(--accent);}
+.mc-cell{background:var(--panel);padding:16px 22px;display:flex;flex-direction:column;justify-content:center;min-height:76px;}
+.mc-lbl{font-family:var(--mono);font-size:9px;letter-spacing:1.8px;color:var(--text3);text-transform:uppercase;margin-bottom:6px;display:flex;align-items:center;gap:6px;}
+.mc-val{font-family:var(--mono);font-size:24px;font-weight:500;line-height:1.1;letter-spacing:-0.6px;font-variant-numeric:tabular-nums;}
+.mc-delta{font-family:var(--mono);font-size:10px;color:var(--text2);margin-top:3px;letter-spacing:0.2px;font-variant-numeric:tabular-nums;}
+[data-view="mobile"] .mission-control{grid-template-columns:1fr 1fr;}
+@media(max-width:768px){body:not([data-override="desktop"]) .mission-control{grid-template-columns:1fr 1fr;}}
+
+/* ── CONVICTION DIAL ──
+   BFO's Active Position card — circular progress ring with a numeric
+   score on the top open position. Conviction derived from unrealized
+   P&L as a proxy (positive move = high conviction it's working). */
+.conviction-card{display:flex;align-items:center;gap:18px;padding:16px;background:var(--panel-2);border:1px solid var(--border);border-radius:8px;margin-bottom:14px;}
+.conviction-ring{position:relative;width:108px;height:108px;flex-shrink:0;}
+.conviction-ring svg{width:100%;height:100%;transform:rotate(-90deg);}
+.conviction-ring .track{fill:none;stroke:var(--border2);stroke-width:7;}
+.conviction-ring .fill{fill:none;stroke-width:7;stroke-linecap:round;transition:stroke-dashoffset .6s ease,stroke .2s ease;}
+.conviction-ring .fill.cool{stroke:var(--text3);}
+.conviction-ring .fill.mid{stroke:var(--accent2);}
+.conviction-ring .fill.hot{stroke:var(--green);filter:drop-shadow(0 0 8px rgba(0,204,102,0.5));}
+.conviction-ring .fill.cold{stroke:var(--red);filter:drop-shadow(0 0 6px rgba(255,51,85,0.4));}
+.conviction-ring-val{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;}
+.conviction-label{font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text3);text-transform:uppercase;line-height:1;}
+.conviction-num{font-family:var(--mono);font-size:28px;font-weight:500;line-height:1.05;letter-spacing:-1px;margin-top:2px;font-variant-numeric:tabular-nums;}
+.conviction-denom{font-family:var(--mono);font-size:9px;color:var(--text3);margin-top:2px;letter-spacing:0.5px;}
+.conviction-meta{flex:1;min-width:0;}
+.conviction-eyebrow{font-family:var(--mono);font-size:9px;letter-spacing:1.5px;color:var(--text3);text-transform:uppercase;margin-bottom:6px;}
+.conviction-market{font-size:13px;color:var(--text);line-height:1.3;margin-bottom:8px;font-weight:500;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+.conviction-meta .conviction-detail{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--text2);}
+.conviction-pnl{font-family:var(--mono);font-size:18px;font-weight:500;margin-top:8px;font-variant-numeric:tabular-nums;letter-spacing:-0.3px;}
 
 /* ── DESKTOP LIGHT-MODE POLISH ──
    The base styles are dark-first, so the light overrides target the
@@ -462,6 +495,29 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
      PAGE: DASHBOARD
 ═══════════════════════════════════════════════════════════ -->
 <div id="page-dashboard" class="page active">
+<!-- Mission Control band — 4-col overview above the main grid -->
+<div class="mission-control">
+  <div class="mc-cell">
+    <div class="mc-lbl"><span style="color:var(--accent)">●</span> Portfolio Value</div>
+    <div class="mc-val" id="mc-total">$—</div>
+    <div class="mc-delta" id="mc-total-delta">Cash + positions</div>
+  </div>
+  <div class="mc-cell">
+    <div class="mc-lbl">Available</div>
+    <div class="mc-val g" id="mc-avail">$—</div>
+    <div class="mc-delta">USDC ready to deploy</div>
+  </div>
+  <div class="mc-cell">
+    <div class="mc-lbl">Unrealized P&amp;L</div>
+    <div class="mc-val" id="mc-unrealized">—</div>
+    <div class="mc-delta" id="mc-unrealized-delta">Open positions</div>
+  </div>
+  <div class="mc-cell">
+    <div class="mc-lbl">Realized P&amp;L · 30D</div>
+    <div class="mc-val" id="mc-realized">—</div>
+    <div class="mc-delta" id="mc-realized-delta">Resolved trades</div>
+  </div>
+</div>
 <!-- Mobile portfolio summary bar -->
 <div class="mob-port-bar">
   <div class="mpb-item"><div class="mpb-lbl">BALANCE</div><div class="mpb-val g" id="mob-cash">$—</div></div>
@@ -643,6 +699,28 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
     </div>
     <div class="panel" id="positions-panel">
       <div class="panel-title">OPEN POSITIONS <span class="pill pill-count" id="pos-count">0</span></div>
+      <div class="conviction-card" id="conviction-card" style="display:none;">
+        <div class="conviction-ring">
+          <svg viewBox="0 0 120 120">
+            <circle class="track" cx="60" cy="60" r="52"/>
+            <circle class="fill" id="conv-fill" cx="60" cy="60" r="52" stroke-dasharray="327" stroke-dashoffset="327"/>
+          </svg>
+          <div class="conviction-ring-val">
+            <div class="conviction-label">Conviction</div>
+            <div class="conviction-num" id="conv-num">—</div>
+            <div class="conviction-denom">/ 100</div>
+          </div>
+        </div>
+        <div class="conviction-meta">
+          <div class="conviction-eyebrow">Top Position · Live</div>
+          <div class="conviction-market" id="conv-market">—</div>
+          <div class="conviction-detail">
+            <span class="pill pill-count" id="conv-side">—</span>
+            <span id="conv-size">—</span>
+          </div>
+          <div class="conviction-pnl" id="conv-pnl">—</div>
+        </div>
+      </div>
       <div id="positions-list"><div style="color:var(--text3);font-size:11px;padding:8px 0">no open positions</div></div>
     </div>
     <div class="panel" style="flex:1;display:flex;flex-direction:column;border-bottom:1px solid var(--border2);">
@@ -1325,6 +1403,12 @@ async function fetchPortfolio(){
     const r=await fetch(`${BOT}/portfolio`);const d=await r.json();
     document.getElementById('pc-total').textContent=fmt$(d.portfolio_value||0);
     document.getElementById('pc-avail').textContent=fmt$(d.cash||0);
+    // Mission Control band
+    const mcTotal=document.getElementById('mc-total');if(mcTotal)mcTotal.textContent=fmt$(d.portfolio_value||0);
+    const mcAvail=document.getElementById('mc-avail');if(mcAvail)mcAvail.textContent=fmt$(d.cash||0);
+    const unreal=(d.positions||[]).reduce((s,p)=>s+(parseFloat(p.cash_pnl)||0),0);
+    const mcUn=document.getElementById('mc-unrealized');
+    if(mcUn){const u=parseFloat(unreal.toFixed(2));const uSign=u>=0?'+':'';const uCls=u>=0?'g':'r';mcUn.className='mc-val '+uCls;mcUn.textContent=uSign+fmt$(u);}
     const pnl=d.total_pnl||0;const pct=d.pct_pnl||0;
     _totalPnl=pnl;renderChart();
     const sign=pnl>=0?'+':'';const cls=pnl>=0?'g':'r';
@@ -1333,6 +1417,32 @@ async function fetchPortfolio(){
     const pIcon=document.getElementById('pc-pnl-icon');if(pIcon){pIcon.textContent=pnl>=0?'▲':'▼';pIcon.className=cls;}
     const positions=d.positions||[];
     document.getElementById('pos-count').textContent=positions.length;
+    // Conviction dial — top position ranked by absolute unrealized P&L.
+    // Score derived from cash_pnl% (100 = +25% move in our favor, 0 = -25%).
+    const convCard=document.getElementById('conviction-card');
+    if(convCard){
+      if(positions.length>0){
+        const top=[...positions].sort((a,b)=>Math.abs(parseFloat(b.cash_pnl)||0)-Math.abs(parseFloat(a.cash_pnl)||0))[0];
+        const initial=parseFloat(top.initialValue||top.avg_price*top.size||0);
+        const cpnl=parseFloat(top.cash_pnl)||0;
+        const pnlPct=initial>0?cpnl/initial*100:0;
+        const score=Math.max(0,Math.min(100,Math.round(50+pnlPct*2)));
+        const fill=document.getElementById('conv-fill');
+        if(fill){fill.setAttribute('stroke-dashoffset',String(327*(1-score/100)));fill.classList.remove('cool','mid','hot','cold');fill.classList.add(score>=70?'hot':score>=40?'mid':score>=20?'cool':'cold');}
+        document.getElementById('conv-num').textContent=score;
+        document.getElementById('conv-market').textContent=top.title||'—';
+        const convSide=document.getElementById('conv-side');
+        convSide.className='badge '+(top.outcome==='Yes'?'badge-y':'badge-n');
+        convSide.textContent=top.outcome||'YES';
+        const px=typeof top.avg_price==='number'?(top.avg_price*100).toFixed(0)+'¢':'—';
+        document.getElementById('conv-size').textContent=(typeof top.size==='number'?top.size.toFixed(2):'0')+' sh · '+px;
+        const pnlCls=cpnl>=0?'g':'r';const pnlSign=cpnl>=0?'+':'';
+        const convPnl=document.getElementById('conv-pnl');
+        convPnl.className='conviction-pnl '+pnlCls;
+        convPnl.textContent=pnlSign+fmt$(cpnl)+' '+(initial>0?`(${pnlSign}${pnlPct.toFixed(1)}%)`:'');
+        convCard.style.display='flex';
+      }else{convCard.style.display='none';}
+    }
     if(positions.length>0){
       document.getElementById('positions-list').innerHTML=positions.map(p=>{
         const pc=p.cash_pnl>=0?'g':'r';const ps=p.cash_pnl>=0?'+':'';
@@ -1880,15 +1990,21 @@ async function fetchRealizedPnl(){
     const d=await r.json();
     const row=document.getElementById('realized-pnl-row');
     const el=document.getElementById('realized-pnl-state');
-    if(!el||!row)return;
     const s30=d.last_30d||{};
-    if((s30.trades||0)===0){row.style.display='none';return;}
-    row.style.display='';
     const pnl=Number(s30.pnl||0);
     const wr=Number(s30.profitable_rate||0);
+    const trades=s30.trades||0;
     const cls=pnl>=0?'g':'r';
     const sign=pnl>=0?'+':'';
-    el.innerHTML=`<span class="${cls}">${sign}$${pnl.toFixed(2)}</span> <span style="font-size:10px;color:var(--text3)">${s30.trades||0}tr · ${wr.toFixed(0)}%wr</span>`;
+    // Mission Control mirror — always reflect the latest 30d figure.
+    const mc=document.getElementById('mc-realized');
+    const mcD=document.getElementById('mc-realized-delta');
+    if(mc){mc.className='mc-val '+cls;mc.textContent=trades>0?(sign+'$'+pnl.toFixed(2)):'$0.00';}
+    if(mcD)mcD.textContent=trades>0?(trades+' trades · '+wr.toFixed(0)+'% win rate'):'No resolved trades in 30d';
+    if(!el||!row)return;
+    if(trades===0){row.style.display='none';return;}
+    row.style.display='';
+    el.innerHTML=`<span class="${cls}">${sign}$${pnl.toFixed(2)}</span> <span style="font-size:10px;color:var(--text3)">${trades}tr · ${wr.toFixed(0)}%wr</span>`;
   }catch(e){}
 }
 /* ── PRE-TRADE catches (Claude gate) ── */
