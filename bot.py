@@ -343,6 +343,14 @@ class PolymarketBot:
         # Spend-alert task + latch (one ping per UTC day when exceeded)
         self._spend_monitor_task:   Optional[asyncio.Task] = None
         self._spend_alert_sent_ymd: str = ""
+        # Balance-error circuit breaker: counts consecutive 'not enough balance'
+        # order rejections; when this exceeds 2 the bot halts order submission
+        # for the rest of the session until a successful order or manual reset.
+        # Context: Apr 9 2026 backtest — ~459 failed orders fired in 70 min
+        # against a $0.86 balance because no counter existed to trip on
+        # repeated balance rejections.
+        self._balance_error_streak: int = 0
+        self._balance_halt_tripped: bool = False
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -980,6 +988,54 @@ class PolymarketBot:
             self._log(f"Cancelled all: {resp}")
         except Exception as e:
             self._log(f"Cancel failed: {e}", "error")
+
+    # ── Balance circuit-breaker helpers ───────────────────────────────────────
+    @staticmethod
+    def _is_balance_error(result: Optional[dict]) -> bool:
+        """Detect whether a trade result carries a 'not enough balance' style
+        rejection. Matches both the execution error strings surfaced by
+        py_clob_client and the dashboard's simulated error results."""
+        if not result:
+            return False
+        if str(result.get("status", "")).lower() != "error":
+            return False
+        blob = " ".join(
+            str(result.get(k, "")) for k in ("error", "message", "reason", "detail")
+        ).lower()
+        needles = (
+            "not enough balance",
+            "insufficient balance",
+            "insufficient funds",
+            "balance too low",
+            "exceeds balance",
+        )
+        return any(n in blob for n in needles)
+
+    def _note_order_outcome(self, result: Optional[dict]) -> None:
+        """Update the balance-error streak and trip the halt on 2 in a row."""
+        if self._is_balance_error(result):
+            self._balance_error_streak += 1
+            if self._balance_error_streak >= 2 and not self._balance_halt_tripped:
+                self._balance_halt_tripped = True
+                self._log(
+                    "🛑 BALANCE CIRCUIT-BREAKER TRIPPED — 2 consecutive 'not enough balance' "
+                    "errors. Halting all order submission for this session. Top up USDC, "
+                    "then restart sexybot to resume.",
+                    "error",
+                )
+                try:
+                    self.send_telegram(
+                        "🛑 sexybot balance circuit-breaker tripped — 2 consecutive insufficient-balance "
+                        "errors. Order submission halted; top up USDC and restart."
+                    )
+                except Exception:
+                    pass
+            return
+        status = str((result or {}).get("status", "")).lower()
+        # Clear the streak on any non-error outcome (filled / unmatched /
+        # cancelled etc. — none of those indicate a balance problem).
+        if result and "error" not in status:
+            self._balance_error_streak = 0
 
     # ── Strategies ────────────────────────────────────────────────────────────
 
@@ -1924,7 +1980,10 @@ class PolymarketBot:
         if kelly_f <= 0.01:       # no meaningful edge
             return 0.0
         size = bankroll * kelly_f * fraction
-        return round(min(size, MAX_ORDER_SIZE, bankroll * 0.20), 2)  # never risk >20% of bankroll
+        # 5% of wallet cap — payoff ratio of 0.278 in the Apr backtest meant any
+        # single loss at 20% erased four wins. Tighten to 5% until the payoff
+        # ratio improves.
+        return round(min(size, MAX_ORDER_SIZE, bankroll * 0.05), 2)
 
     def log_brier(self, market: str, token_id: str, side: str,
                   predicted_prob: float, market_price: float,
@@ -4513,6 +4572,32 @@ class PolymarketBot:
                     cycle_cash = await asyncio.to_thread(self.get_balance, True)
                     self._log(f"Cash: ${cycle_cash:.2f}")
 
+                # ── Balance circuit-breaker ───────────────────────────────────
+                # Skip the whole cycle if a prior run tripped the halt, or if
+                # the wallet is below the $1 Polymarket notional minimum.
+                # (Apr 9 backtest: $0.86 balance + $3-$5 orders looped 45×.)
+                if self._balance_halt_tripped and not PAPER_MODE:
+                    try:
+                        await asyncio.sleep(interval)
+                    except asyncio.CancelledError:
+                        break
+                    continue
+                if not PAPER_MODE and cycle_cash < 1.0:
+                    self._log(
+                        f"WALLET BELOW MIN NOTIONAL: ${cycle_cash:.2f} < $1.00 — skipping cycle",
+                        "warning",
+                    )
+                    try:
+                        await asyncio.sleep(interval)
+                    except asyncio.CancelledError:
+                        break
+                    continue
+
+                # Per-cycle dedupe: prevents re-submitting an order to the same
+                # token_id after a balance rejection (Apr 15 LoL Nongshim Red
+                # Force fired 5 identical retries in 1 min).
+                _traded_tokens_this_cycle: set = set()
+
                 # ── Phase 1: rule-based candidate collection (fast, no I/O) ──
                 import json as _j
                 _candidates: list = []
@@ -4681,9 +4766,23 @@ class PolymarketBot:
                         self.running = False
                         break
 
+                    # ── Balance circuit-breaker mid-cycle short-circuit ───────
+                    # A rejection handled a few iterations ago may have tripped
+                    # the halt. Stop submitting further orders this cycle.
+                    if self._balance_halt_tripped and not PAPER_MODE:
+                        sig_record["skip_reason"] = "balance circuit-breaker tripped"
+                        break
+
                     if signal.get("token_id") and self.has_position(signal["token_id"]):
                         self._log(f"SKIP: already have position in {signal['market'][:40]}")
                         sig_record["skip_reason"] = "already have position"
+                        continue
+
+                    # Per-cycle dedupe guard (Apr 15 backtest: repeat retries
+                    # against the same token burned ~5 rows in 60 seconds).
+                    _sig_tid = signal.get("token_id")
+                    if _sig_tid and _sig_tid in _traded_tokens_this_cycle:
+                        sig_record["skip_reason"] = "already attempted this cycle"
                         continue
 
                     # ── Kelly Criterion sizing ────────────────────────────────
@@ -4695,6 +4794,22 @@ class PolymarketBot:
 
                     # Determine entry price for Kelly (price of the side we're buying)
                     entry_price = yes_p if "YES" in signal.get("signal","") else (1 - yes_p)
+
+                    # ── Low-price underdog-YES guard ──────────────────────────
+                    # Apr backtest: the two resolved YES buys below 0.40
+                    # (Bitcoin $78k @ 0.36, Hezbollah ceasefire @ 0.17) both
+                    # lost, totalling –$2.29. With a 0.278 payoff ratio the
+                    # bot needs near-perfect accuracy at low prices, which the
+                    # data does not support.
+                    if "YES" in signal.get("signal","") and entry_price < 0.30:
+                        self._log(
+                            f"LOW-PRICE YES SKIP: price={entry_price:.3f} < 0.30 {question[:40]}"
+                        )
+                        sig_record["skip_reason"] = (
+                            f"YES underdog at {entry_price:.3f} < 0.30 (payoff-ratio guard)"
+                        )
+                        continue
+
                     # Use AI probability if available, else estimate from confidence
                     if predicted_prob is not None:
                         p_true = predicted_prob / 100.0
@@ -4733,6 +4848,23 @@ class PolymarketBot:
                     if not _TOKEN_ID_RE.fullmatch(_exec_tid):
                         self._log(f"SKIP: token_id from market data failed format check ({_exec_tid[:20]})", "error")
                         continue
+
+                    # ── Pre-flight balance check ──────────────────────────────
+                    # Cheapest possible guard against the Apr 9 error storm:
+                    # never send an order the wallet clearly cannot cover.
+                    # `amt` is a dollar figure for market/limit BUY alike
+                    # (see place_market_order and place_limit_order).
+                    if not PAPER_MODE and amt > cycle_cash:
+                        self._log(
+                            f"PRE-FLIGHT BALANCE SKIP: order ${amt:.2f} > cash ${cycle_cash:.2f} "
+                            f"{question[:40]}",
+                            "warning",
+                        )
+                        sig_record["skip_reason"] = (
+                            f"pre-flight: ${amt:.2f} > cash ${cycle_cash:.2f}"
+                        )
+                        continue
+
                     min_conf = 55 if ai_enabled else 40
                     mkt_name = signal.get("market", question)
                     if float(signal.get("confidence", 0)) >= min_conf and signal.get("token_id"):
@@ -4751,9 +4883,13 @@ class PolymarketBot:
                             "regime_at_entry": (self._regime_cache or {}).get("regime", "normal"),
                         }
                         if signal["strategy"] == "arbitrage" and "BUY" in signal["signal"]:
-                            await self._execute_order(signal["token_id"], "BUY", amt / 2, mkt_name, attribution=_attribution_base)
-                            if signal.get("no_token_id"):
-                                await self._execute_order(signal["no_token_id"], "BUY", amt / 2, mkt_name, attribution=_attribution_base)
+                            _r1 = await self._execute_order(signal["token_id"], "BUY", amt / 2, mkt_name, attribution=_attribution_base)
+                            self._note_order_outcome(_r1)
+                            _traded_tokens_this_cycle.add(signal["token_id"])
+                            if signal.get("no_token_id") and not self._balance_halt_tripped:
+                                _r2 = await self._execute_order(signal["no_token_id"], "BUY", amt / 2, mkt_name, attribution=_attribution_base)
+                                self._note_order_outcome(_r2)
+                                _traded_tokens_this_cycle.add(signal["no_token_id"])
                             cycle_cash -= amt
                             sig_record["traded"] = True
                         elif signal["strategy"] == "marketMaking":
@@ -4764,10 +4900,13 @@ class PolymarketBot:
                             ask = signal.get("ask") or 0
                             if bid and bid > 0:
                                 bid_size = round(amt / bid, 4)
-                                await self._execute_order(signal["token_id"], "BUY", amt, mkt_name, "limit", bid, bid_size, attribution=_attribution_base)
-                            if ask and ask > 0:
+                                _r1 = await self._execute_order(signal["token_id"], "BUY", amt, mkt_name, "limit", bid, bid_size, attribution=_attribution_base)
+                                self._note_order_outcome(_r1)
+                            if ask and ask > 0 and not self._balance_halt_tripped:
                                 ask_size = round(amt / ask, 4)
-                                await self._execute_order(signal["token_id"], "SELL", amt, mkt_name, "limit", ask, ask_size, attribution=_attribution_base)
+                                _r2 = await self._execute_order(signal["token_id"], "SELL", amt, mkt_name, "limit", ask, ask_size, attribution=_attribution_base)
+                                self._note_order_outcome(_r2)
+                            _traded_tokens_this_cycle.add(signal["token_id"])
                             cycle_cash -= amt
                             sig_record["traded"] = True
                         elif "BUY" in signal.get("signal", ""):
@@ -4840,6 +4979,8 @@ class PolymarketBot:
                                 signal["token_id"], "BUY", amt, mkt_name,
                                 attribution=_attribution_base,
                             )
+                            self._note_order_outcome(result)
+                            _traded_tokens_this_cycle.add(signal["token_id"])
                             cycle_cash -= amt
                             if result and result.get("status") not in ("error", None):
                                 sig_record["traded"] = True

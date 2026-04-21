@@ -24,6 +24,11 @@ MIN_EV              = 0.0
 LOW_BALANCE         = 50.0
 CRITICAL_BALANCE    = 10.0
 PMUSD_SCALAR        = 1_000_000
+# Minimum price for a YES BUY. Apr 2026 backtest: both resolved YES BUYs
+# below 0.40 (Bitcoin $78k @ 0.36, Hezbollah ceasefire @ 0.17) were losses
+# totalling –$2.29. The bot's 0.278 payoff ratio needs near-perfect
+# accuracy at low prices, which the data does not support.
+MIN_YES_BUY_PRICE   = float(os.getenv("MIN_YES_BUY_PRICE", "0.30"))
 
 MAX_DRAWDOWN_USD    = float(os.getenv("MAX_DRAWDOWN_USD", "50.0"))   # halt if peak-to-trough > $50
 DRAWDOWN_WINDOW_SEC = int(os.getenv("DRAWDOWN_WINDOW",   "600"))     # rolling 10-minute window
@@ -91,10 +96,12 @@ class ExecutionGate:
         spread_max_cents: float = SPREAD_MAX_CENTS,
         slippage_rate:    float = SLIPPAGE_RATE,
         min_ev:           float = MIN_EV,
+        min_yes_buy_price: float = MIN_YES_BUY_PRICE,
     ):
-        self.spread_max_cents = spread_max_cents
-        self.slippage_rate    = slippage_rate
-        self.min_ev           = min_ev
+        self.spread_max_cents  = spread_max_cents
+        self.slippage_rate     = slippage_rate
+        self.min_ev            = min_ev
+        self.min_yes_buy_price = min_yes_buy_price
 
     def check(
         self,
@@ -147,6 +154,17 @@ class ExecutionGate:
             execution_price = book.best_ask
             effective_price = execution_price * (1 + self.slippage_rate)
             ev_net          = true_prob - effective_price
+            # Low-price underdog BUY guard — skip anything too cheap
+            # regardless of EV. See MIN_YES_BUY_PRICE rationale above.
+            if execution_price < self.min_yes_buy_price:
+                return GateVerdict(
+                    passed=False,
+                    spread_cents=spread_cents,
+                    reject_reason=(
+                        f"BUY price {execution_price:.3f} < min "
+                        f"{self.min_yes_buy_price:.3f} (underdog guard)"
+                    ),
+                )
         else:
             execution_price = book.best_bid
             effective_price = execution_price * (1 - self.slippage_rate)
@@ -255,6 +273,7 @@ def kelly_size(
     kelly_fraction: float = 0.25,
     max_size:       float = 10.0,
     min_size:       float = 1.0,
+    max_pct_of_balance: float = 0.05,
 ) -> float:
     """
     Quarter-Kelly position sizing for a binary prediction market.
@@ -267,6 +286,10 @@ def kelly_size(
     theoretical full-Kelly bet, protecting against model overconfidence and
     undetected oracle risk ("black swan" resolution disputes).
 
+    `max_pct_of_balance` hard-caps the bet at 5% of the wallet — Apr 2026
+    backtest showed a payoff ratio of 0.278 where a single loss erased four
+    wins, so concentration risk is now the dominant threat.
+
     Returns 0.0 when there is no positive edge.
     """
     if price <= 0 or price >= 1:
@@ -276,5 +299,9 @@ def kelly_size(
         return 0.0
     full_kelly = edge / (1.0 - price)
     size = full_kelly * kelly_fraction * balance
-    return round(max(min_size, min(size, max_size)), 2)
+    ceiling = min(max_size, max(min_size, balance * max_pct_of_balance))
+    size = min(size, ceiling)
+    if size < min_size:
+        return 0.0
+    return round(size, 2)
 
