@@ -4,10 +4,29 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SEXYBOT</title>
-<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0d0d0d;--panel:#111111;--border:#222222;--border2:#2a2a2a;--accent:#ff6600;--accent2:#ffaa00;--green:#00cc66;--red:#ff3355;--blue:#3399ff;--purple:#aa55ff;--text:#e8e8e8;--text2:#999999;--text3:#555555;--mono:'DM Mono',monospace;--sans:'DM Sans',sans-serif;--hdr-bg:#000;--row-hover:#161616;--chart-grid:#1a1a1a;--chart-axis:#444;--panel-hover:#1a1a1a;--btn-secondary-bg:#1a1a1a;--btn-secondary-border:#2a2a2a;--hero-bg:#111111;--hero-shadow:none;}
-body[data-theme="light"]{--bg:#f3f5f8;--panel:#ffffff;--border:#e2e6eb;--border2:#e5e9ef;--accent:#ff6600;--accent2:#f59e0b;--green:#0d9f5f;--red:#e11d48;--blue:#2563eb;--purple:#8b5cf6;--text:#0f172a;--text2:#64748b;--text3:#94a3b8;--hdr-bg:#ffffff;--row-hover:#f8fafc;--chart-grid:#eef1f5;--chart-axis:#94a3b8;--panel-hover:#f8fafc;--btn-secondary-bg:#f1f5f9;--btn-secondary-border:#e2e8f0;--hero-bg:#ffffff;--hero-shadow:0 1px 3px rgba(15,23,42,0.06),0 1px 2px rgba(15,23,42,0.04);}
+:root{
+  /* Deep-charcoal palette — layered hierarchy so panels read distinctly
+     against the app background without resorting to heavy borders. */
+  --bg:#0b0d10;--panel:#13161a;--panel-2:#171b20;--border:#1e2227;--border2:#262b32;
+  --accent:#ff6600;--accent2:#ffaa00;
+  --green:#00cc66;--red:#ff3355;--blue:#3399ff;--purple:#aa55ff;
+  --text:#eef0f2;--text2:#9aa3ad;--text3:#5b6472;
+  --mono:'DM Mono',ui-monospace,monospace;
+  --sans:'Inter','DM Sans',system-ui,-apple-system,sans-serif;
+  --hdr-bg:#0a0c0f;--row-hover:#181c21;
+  --chart-grid:#1a1d22;--chart-axis:#4b5360;
+  --panel-hover:#1b1f25;--btn-secondary-bg:#1b1f25;--btn-secondary-border:#262b32;
+  --hero-bg:#13161a;
+  --ring:0 0 0 1px rgba(255,255,255,0.02) inset;
+  --hero-shadow:var(--ring),0 1px 2px rgba(0,0,0,0.4),0 8px 24px -12px rgba(0,0,0,0.5);
+  --pulse-green:0 0 0 4px rgba(0,204,102,0.15),0 0 24px rgba(0,204,102,0.35);
+  --pulse-red:0 0 0 4px rgba(255,51,85,0.15),0 0 24px rgba(255,51,85,0.35);
+}
+body[data-theme="light"]{--bg:#f3f5f8;--panel:#ffffff;--panel-2:#fafbfc;--border:#e2e6eb;--border2:#e5e9ef;--accent:#ff6600;--accent2:#f59e0b;--green:#0d9f5f;--red:#e11d48;--blue:#2563eb;--purple:#8b5cf6;--text:#0f172a;--text2:#64748b;--text3:#94a3b8;--hdr-bg:#ffffff;--row-hover:#f8fafc;--chart-grid:#eef1f5;--chart-axis:#94a3b8;--panel-hover:#f8fafc;--btn-secondary-bg:#f1f5f9;--btn-secondary-border:#e2e8f0;--hero-bg:#ffffff;--ring:0 0 0 1px rgba(15,23,42,0.04) inset;--hero-shadow:var(--ring),0 1px 3px rgba(15,23,42,0.06),0 1px 2px rgba(15,23,42,0.04);--pulse-green:0 0 0 4px rgba(13,159,95,0.12),0 0 20px rgba(13,159,95,0.25);--pulse-red:0 0 0 4px rgba(225,29,72,0.12),0 0 20px rgba(225,29,72,0.25);}
 *{margin:0;padding:0;box-sizing:border-box;}html,body{height:100%;}
 body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13px;line-height:1.5;transition:background .2s,color .2s;}
 /* ── HEADER / NAV ── */
@@ -27,8 +46,11 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 /* ── DASHBOARD LAYOUT ── */
 .main{display:grid;grid-template-columns:260px 1fr 280px;gap:1px;background:var(--border);min-height:calc(100vh - 44px - 33px);}
 .col{background:var(--bg);display:flex;flex-direction:column;gap:1px;}
-/* ── PANELS ── */
-.panel{background:var(--panel);padding:14px 16px;}
+/* ── PANELS ──
+   Panels stack on a --border-colored gap so each card reads as its own
+   surface. Subtle inner ring + soft top-shadow gives depth without
+   resorting to heavy borders (Vercel-style). */
+.panel{background:var(--panel);padding:16px 18px;box-shadow:var(--ring);position:relative;}
 .panel-title{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--accent);margin-bottom:12px;padding-bottom:6px;border-bottom:1px solid var(--border2);display:flex;align-items:center;justify-content:space-between;}
 .panel-title span{color:var(--text3);font-size:9px;}
 .stat-row{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #1a1a1a;}
@@ -198,6 +220,60 @@ body[data-theme="light"] .card{box-shadow:var(--hero-shadow);}
 .theme-toggle:hover{color:var(--accent);border-color:var(--accent);}
 .theme-toggle svg{width:15px;height:15px;}
 
+/* ── TRADE PULSE MICRO-INTERACTION ──
+   Applied via JS (.flash-buy / .flash-sell) to fresh trade rows and signal
+   feed items. Pulse ring fades out over 1.8s — enough to catch the eye
+   without lingering. */
+@keyframes flash-buy{0%{box-shadow:var(--pulse-green);background:rgba(0,204,102,0.08);}100%{box-shadow:none;background:transparent;}}
+@keyframes flash-sell{0%{box-shadow:var(--pulse-red);background:rgba(255,51,85,0.08);}100%{box-shadow:none;background:transparent;}}
+.flash-buy{animation:flash-buy 1.8s ease-out 1;border-radius:4px;}
+.flash-sell{animation:flash-sell 1.8s ease-out 1;border-radius:4px;}
+
+/* ── STATUS CHIP (bot Active/Paused/Error) ──
+   Reused by the header status block and mobile nav bar so every surface
+   that shows bot state renders the same chip. */
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-family:var(--mono);font-size:10px;letter-spacing:1.2px;text-transform:uppercase;border:1px solid transparent;line-height:1.5;}
+.chip-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
+.chip-active{color:var(--green);background:rgba(0,204,102,0.08);border-color:rgba(0,204,102,0.28);}
+.chip-active .chip-dot{background:var(--green);box-shadow:0 0 6px rgba(0,204,102,0.6);animation:blink 1.5s infinite;}
+.chip-paused{color:var(--accent2);background:rgba(255,170,0,0.08);border-color:rgba(255,170,0,0.28);}
+.chip-paused .chip-dot{background:var(--accent2);}
+.chip-error{color:var(--red);background:rgba(255,51,85,0.10);border-color:rgba(255,51,85,0.35);}
+.chip-error .chip-dot{background:var(--red);animation:blink 1s infinite;}
+body[data-theme="light"] .chip-active{background:#ecfdf5;border-color:#a7f3d0;}
+body[data-theme="light"] .chip-paused{background:#fef3c7;border-color:#fcd34d;}
+body[data-theme="light"] .chip-error{background:#ffe4e6;border-color:#fda4af;}
+
+/* ── LIVE TERMINAL (BOT LOG redesigned) ──
+   Turns the .blog panel into a macOS-terminal-style surface with a faux
+   window header, prompt glyph per line, and a subtle top scanline. Keeps
+   the existing .blog class semantics so fetchBot's log writes untouched. */
+.panel-term{padding:0;background:var(--panel);overflow:hidden;}
+.term-head{display:flex;align-items:center;gap:10px;padding:8px 14px;background:var(--panel-2);border-bottom:1px solid var(--border);font-family:var(--mono);font-size:10px;letter-spacing:1.5px;color:var(--text2);text-transform:uppercase;}
+.term-head .term-dots{display:flex;gap:4px;margin-right:2px;}
+.term-head .term-dots span{width:8px;height:8px;border-radius:50%;background:var(--border2);}
+.term-head .term-dots span:nth-child(1){background:#ff605c;}
+.term-head .term-dots span:nth-child(2){background:#ffbd44;}
+.term-head .term-dots span:nth-child(3){background:#00ca4e;}
+.term-head .term-title{flex:1;}
+.term-head .term-live{color:var(--green);font-size:9px;letter-spacing:1.5px;}
+.term-body{padding:10px 14px;font-family:var(--mono);font-size:10px;line-height:1.75;overflow-y:auto;flex:1;min-height:0;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;color:var(--text3);background:var(--panel);}
+.term-body > div{padding-left:14px;position:relative;}
+.term-body > div::before{content:'›';position:absolute;left:0;color:var(--text3);opacity:0.6;}
+.term-body .li{color:#4488ff;}
+.term-body .le{color:var(--red);}
+.term-body .ls{color:var(--green);}
+.term-body .lo{color:var(--accent2);}
+body[data-theme="light"] .term-body .li{color:#2563eb;}
+
+/* ── HEADER polish — refined chrome for the nav bar ── */
+.hdr{backdrop-filter:saturate(140%) blur(8px);}
+body[data-theme="light"] .hdr{backdrop-filter:saturate(140%) blur(8px);}
+
+/* Softer hover state for stat rows and feed items so the grid feels
+   alive without stealing attention from the actual data. */
+.stat-row:hover,.feed-item:hover,.tlog-item:hover,.mover-row:hover{background:var(--row-hover);}
+
 /* ── BFO-STYLE SHARED UTILITIES ────────────────────────────────────────────
    Pills, counters, source footers, and row layouts to give every panel a
    consistent header + footer treatment. No font/color changes — everything
@@ -359,8 +435,10 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <span><span style="color:var(--text3)">NDQ </span><span id="hndq">—</span></span>
     </span>
     <span id="clock">—</span>
-    <div class="dot pulse" id="sdot"></div>
-    <span id="stext">connecting</span>
+    <span class="chip chip-paused" id="status-chip" title="Bot status">
+      <span class="chip-dot" id="sdot"></span>
+      <span id="stext">connecting</span>
+    </span>
     <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle light/dark mode" aria-label="Toggle theme">
       <svg id="theme-icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
       <svg id="theme-icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
@@ -598,9 +676,13 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <div class="panel-title">TRADE HISTORY</div>
       <div class="tlog" id="tlog"><div style="color:var(--text3);font-size:11px;padding:8px 0">no trades yet</div></div>
     </div>
-    <div class="panel" style="flex:1;display:flex;flex-direction:column;border-bottom:1px solid var(--border2);">
-      <div class="panel-title">BOT LOG <span class="pill pill-live">LIVE</span></div>
-      <div class="blog" id="blog"><div class="li">waiting…</div></div>
+    <div class="panel panel-term" style="flex:1;display:flex;flex-direction:column;border-bottom:1px solid var(--border2);">
+      <div class="term-head">
+        <span class="term-dots"><span></span><span></span><span></span></span>
+        <span class="term-title">SYSTEM TERMINAL · TTY/1</span>
+        <span class="term-live">● LIVE</span>
+      </div>
+      <div class="term-body blog" id="blog"><div class="li">waiting…</div></div>
     </div>
   </div>
 </div>
@@ -970,7 +1052,7 @@ const BOT=`${location.protocol}//${location.host}`;
   };
 })();
 
-let pnlChart=null,allTrades=[],activeFilter='1D',_totalPnl=0;
+let pnlChart=null,allTrades=[],activeFilter='1D',_totalPnl=0,_lastSigTime=null,_lastTradeTime=null;
 let _allSignals=[],_actFilter='all',_logFilter='all',_allLogs=[];
 
 function safeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
@@ -1072,11 +1154,19 @@ function _applyChartTheme(){
 }
 
 /* ── FETCH BOT STATUS (dashboard) ── */
+/* Header status chip — exposes 3 states (active/paused/error) that cover
+   running, stopped, and offline/error transitions. Keeps sdot as a
+   .chip-dot inside the chip so legacy callers that read the element
+   continue to work. */
+function setBotStatus(state,label){
+  const chip=document.getElementById('status-chip');
+  if(chip){chip.classList.remove('chip-active','chip-paused','chip-error');chip.classList.add('chip-'+state);}
+  const txt=document.getElementById('stext');if(txt)txt.textContent=label;
+}
 async function fetchBot(){
   try{
     const r=await fetch(`${BOT}/status`);const d=await r.json();
-    document.getElementById('sdot').className='dot'+(d.running?' pulse':' off');
-    document.getElementById('stext').textContent=d.running?'live':'stopped';
+    setBotStatus(d.running?'active':'paused',d.running?'live':'stopped');
     document.getElementById('strat').textContent=(d.strategy||'—').toUpperCase();
     const modeStr=d.paper_mode?'PAPER':(d.dry_run?'DRY RUN':'LIVE');
     const modeCls=d.paper_mode?'p':(d.dry_run?'o':'g');
@@ -1103,8 +1193,14 @@ async function fetchBot(){
     // store for activity page
     _allSignals=sigs;
     document.getElementById('sig-count').textContent=sigs.length;
-    if(sigs.length>0){document.getElementById('sig-feed').innerHTML=sigs.slice(-25).reverse().map(s=>{const isY=s.signal&&s.signal.includes('YES');const slug=(s.market||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,60);const mkt=safeHtml(s.market||'');return`<div class="feed-item"><span class="badge ${isY?'badge-y':'badge-n'}">${isY?'YES':'NO'}</span><span class="feed-mkt"><a href="https://polymarket.com/event/${safeHtml(slug)}" target="_blank" rel="noopener noreferrer">${mkt.slice(0,56)}${mkt.length>56?'…':''}</a></span><span class="feed-conf">${safeHtml(String(s.confidence||0))}%</span></div>`;}).join('');}
-    if(trades.length>0){document.getElementById('tlog').innerHTML=trades.slice(-25).reverse().map(t=>{const isY=t.side==='YES'||t.side==='BUY';return`<div class="tlog-item"><span class="tlog-mkt">${safeHtml((t.market||'').slice(0,36))}…</span><span class="badge ${isY?'badge-y':'badge-n'}">${safeHtml(t.side||'BUY')}</span><span class="tlog-amt">${fmt$(t.amount_usdc||t.amount||0)}</span></div>`;}).join('');}
+    if(sigs.length>0){
+      document.getElementById('sig-feed').innerHTML=sigs.slice(-25).reverse().map(s=>{const isY=s.signal&&s.signal.includes('YES');const slug=(s.market||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,60);const mkt=safeHtml(s.market||'');return`<div class="feed-item"><span class="badge ${isY?'badge-y':'badge-n'}">${isY?'YES':'NO'}</span><span class="feed-mkt"><a href="https://polymarket.com/event/${safeHtml(slug)}" target="_blank" rel="noopener noreferrer">${mkt.slice(0,56)}${mkt.length>56?'…':''}</a></span><span class="feed-conf">${safeHtml(String(s.confidence||0))}%</span></div>`;}).join('');
+      const topSig=sigs[sigs.length-1];if(topSig&&topSig.time!==_lastSigTime){_lastSigTime=topSig.time;const row=document.querySelector('#sig-feed .feed-item');if(row)row.classList.add((topSig.signal||'').includes('YES')?'flash-buy':'flash-sell');}
+    }
+    if(trades.length>0){
+      document.getElementById('tlog').innerHTML=trades.slice(-25).reverse().map(t=>{const isY=t.side==='YES'||t.side==='BUY';return`<div class="tlog-item"><span class="tlog-mkt">${safeHtml((t.market||'').slice(0,36))}…</span><span class="badge ${isY?'badge-y':'badge-n'}">${safeHtml(t.side||'BUY')}</span><span class="tlog-amt">${fmt$(t.amount_usdc||t.amount||0)}</span></div>`;}).join('');
+      const topTrade=trades[trades.length-1];if(topTrade&&topTrade.time!==_lastTradeTime){_lastTradeTime=topTrade.time;const row=document.querySelector('#tlog .tlog-item');if(row)row.classList.add((topTrade.side==='BUY'||topTrade.side==='YES')?'flash-buy':'flash-sell');}
+    }
     const logs=d.log||[];
     _allLogs=logs;
     if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(line=>{let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return`<div class="${c}">${safeHtml(line)}</div>`;}).join('');}
@@ -1113,7 +1209,7 @@ async function fetchBot(){
     if(cur==='activity')renderActivity();
     if(cur==='trades')renderTrades();
     if(cur==='logs')renderLogs();
-  }catch(e){document.getElementById('sdot').className='dot off';document.getElementById('stext').textContent='offline';}
+  }catch(e){setBotStatus('error','offline');}
 }
 
 /* ── FETCH MARKETS (dashboard) ── */
@@ -1317,8 +1413,7 @@ function connectWS(){
   ws.onerror=()=>ws.close();
 }
 function applyState(d){
-  document.getElementById('sdot').className='dot'+(d.running?' pulse':' off');
-  document.getElementById('stext').textContent=d.running?'live':'stopped';
+  setBotStatus(d.running?'active':'paused',d.running?'live':'stopped');
   document.getElementById('strat').textContent=(d.strategy||'-').toUpperCase();
   const modeStr=d.paper_mode?'PAPER':(d.dry_run?'DRY RUN':'LIVE');const modeCls=d.paper_mode?'p':(d.dry_run?'o':'g');
   document.getElementById('mode').textContent=modeStr;document.getElementById('mode').className='stat-val '+modeCls;
@@ -1595,8 +1690,7 @@ async function confirmKill(){
     return;
   }
   document.getElementById('kill-status').textContent='bot stopped';
-  document.getElementById('sdot').className='dot off';
-  document.getElementById('stext').textContent='stopped';
+  setBotStatus('paused','stopped');
 }
 
 /* ══════════════════════════════════════════════════════
@@ -1625,8 +1719,7 @@ async function startBot(){
       return;
     }
     document.getElementById('kill-status').textContent='bot started';
-    document.getElementById('sdot').className='dot on';
-    document.getElementById('stext').textContent='live';
+    setBotStatus('active','live');
   }catch(e){
     document.getElementById('kill-status').textContent='start failed — bot unreachable';
   }
@@ -2118,7 +2211,16 @@ function syncMobPortBar(){
   if(bal) { var mb=document.getElementById('mob-cash'); if(mb) mb.textContent=bal.textContent; }
   if(pnl) { var mp=document.getElementById('mob-pnl'); if(mp){ mp.textContent=pnl.textContent; mp.className='mpb-val'+(pnl.textContent.includes('-')?' r':' g'); } }
   if(wr)  { var mw=document.getElementById('mob-wr');  if(mw) mw.textContent=wr.textContent; }
-  if(dot && st){ var md=document.getElementById('mob-dot'); var ms=document.getElementById('mob-status'); if(md){md.className=dot.className;} if(ms) ms.textContent=st.textContent; }
+  if(dot && st){
+    var md=document.getElementById('mob-dot'); var ms=document.getElementById('mob-status');
+    var chip=document.getElementById('status-chip');
+    if(md){
+      var live=chip&&chip.classList.contains('chip-active');
+      var off=chip&&chip.classList.contains('chip-error');
+      md.className='dot'+(live?' pulse':off?' off':'');
+    }
+    if(ms) ms.textContent=st.textContent;
+  }
 }
 // override showPage to sync mobile nav
 var _origShowPage = showPage;
