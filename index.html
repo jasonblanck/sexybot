@@ -64,6 +64,21 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
   .main{grid-template-columns:1fr;padding:10px;gap:10px;}
   .panel.span-2,.panel.span-3,.panel.span-full{grid-column:span 1;}
 }
+/* Width-based responsive rules that win regardless of data-override.
+   A phone-width viewport should never render a multi-column grid or a
+   crowded nav bar, even if the user clicked DESKTOP. */
+@media(max-width:720px){
+  .hdr{padding:0 12px;gap:8px;}
+  .hdr-logo{font-size:13px;letter-spacing:2px;}
+  .hdr-nav{display:none;}
+  #hdr-tickers{display:none;}
+  #clock{display:none;}
+  .mob-nav{display:block;}
+  .mission-control{margin:10px;}
+  .mc-cell{flex:1 1 140px;padding:12px 14px;}
+  .mc-val{font-size:22px;}
+  .mc-actions{flex:1 1 100%;}
+}
 /* ── PANELS ──
    Panels stack on a --border-colored gap so each card reads as its own
    surface. Subtle inner ring + soft top-shadow gives depth without
@@ -208,25 +223,22 @@ body[data-theme="light"] .panel{box-shadow:var(--hero-shadow);}
 
 /* ── MISSION CONTROL BAND ──
    4-column metric strip above the main grid, BFO-style overview. */
-.mission-control{display:grid;grid-template-columns:repeat(4,1fr) auto;gap:1px;margin:12px 12px 0;background:var(--border);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:var(--ring);}
+/* Flex-wrap keeps cells from overflowing on any viewport — each cell
+   gets a flex-basis of 160px, grows to fill the row, wraps to a new
+   line when the row is full. Works regardless of data-override. */
+.mission-control{display:flex;flex-wrap:wrap;gap:1px;margin:12px 12px 0;background:var(--border);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:var(--ring);}
 body[data-theme="light"] .mission-control{box-shadow:var(--hero-shadow);}
-.mc-cell{background:var(--panel);padding:14px 18px;display:flex;flex-direction:column;justify-content:center;}
+.mc-cell{flex:1 1 160px;background:var(--panel);padding:14px 18px;display:flex;flex-direction:column;justify-content:center;min-width:0;}
 .mc-lbl{font-family:var(--mono);font-size:9px;letter-spacing:1.8px;color:var(--text3);text-transform:uppercase;margin-bottom:4px;display:flex;align-items:center;gap:6px;}
-.mc-val{font-family:var(--mono);font-size:30px;font-weight:500;line-height:1;letter-spacing:-1px;font-variant-numeric:tabular-nums;}
-.mc-delta{font-family:var(--mono);font-size:10px;color:var(--text2);margin-top:4px;letter-spacing:0.2px;font-variant-numeric:tabular-nums;}
-.mc-actions{flex-direction:row;align-items:center;gap:8px;padding:12px 18px;min-width:240px;}
+.mc-val{font-family:var(--mono);font-size:28px;font-weight:500;line-height:1;letter-spacing:-1px;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;}
+.mc-delta{font-family:var(--mono);font-size:10px;color:var(--text2);margin-top:4px;letter-spacing:0.2px;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mc-actions{flex:1 1 220px;flex-direction:row;align-items:center;gap:8px;padding:12px 18px;}
 .mc-btn{flex:1;border-radius:6px;padding:10px 14px;font-size:12px;font-weight:700;cursor:pointer;text-align:center;text-decoration:none;display:block;letter-spacing:0.3px;transition:filter .15s,background .15s;white-space:nowrap;}
 .mc-btn-primary{background:#3b82f6;color:#fff;border:none;}
 .mc-btn-primary:hover{filter:brightness(1.08);}
 .mc-btn-secondary{background:var(--btn-secondary-bg);color:var(--text);border:1px solid var(--btn-secondary-border);}
 .mc-btn-secondary:hover{background:var(--panel-hover);}
 body[data-theme="light"] .mc-btn-primary{background:#2563eb;}
-[data-view="mobile"] .mission-control{grid-template-columns:1fr 1fr;}
-[data-view="mobile"] .mc-actions{grid-column:1/-1;min-width:0;}
-@media(max-width:768px){
-  body:not([data-override="desktop"]) .mission-control{grid-template-columns:1fr 1fr;}
-  body:not([data-override="desktop"]) .mc-actions{grid-column:1/-1;min-width:0;}
-}
 
 /* ── CONVICTION DIAL ──
    BFO's Active Position card — circular progress ring with a numeric
