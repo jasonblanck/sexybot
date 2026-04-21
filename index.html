@@ -46,29 +46,32 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .page{display:none;}
 .page.active{display:block;}
 /* ── DASHBOARD LAYOUT ── */
-/* Responsive grid.
-   ≥1400px — full 3-column command-center layout.
-   1100-1399px — left sidebar + stacked main column; the 3rd column's
-     panels flow as a 2-col sub-grid below the main column so nothing
-     ever floats next to an empty void.
-   <1100px — everything stacks into a single column. */
-.main{display:grid;grid-template-columns:260px 1fr 300px;gap:1px;background:var(--border);align-items:start;}
-.col{background:var(--bg);display:flex;flex-direction:column;gap:1px;}
-@media(max-width:1399px){
-  .main{grid-template-columns:240px 1fr;}
-  .main > .col:nth-child(3){grid-column:1/-1;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));flex-direction:unset;}
-  .main > .col:nth-child(3) > .panel{background:var(--panel);}
-}
-@media(max-width:1099px){
-  .main{grid-template-columns:1fr;}
-  .main > .col:nth-child(3){grid-template-columns:1fr;}
+/* Card-based auto-fit grid.
+   Every panel is a peer; legacy .col wrappers are neutralised via
+   display:contents so panels bubble up as direct grid items. Auto-fit
+   means the viewport width decides the column count, with each card
+   at least 300px. Spans (.span-2 / .span-full) emphasise the heroes. */
+.main{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;padding:12px;background:var(--bg);align-items:start;}
+.col{display:contents;}
+/* The old 1px border-separated strip look fought the new card look —
+   flatten the inner stretches so cards don't carry accidental borders. */
+.col > .panel{border-bottom:none;}
+.main .panel[style*="flex:1"]{flex:unset;}
+.panel.span-2{grid-column:span 2;}
+.panel.span-3{grid-column:span 3;}
+.panel.span-full{grid-column:1/-1;}
+@media(max-width:900px){
+  .main{grid-template-columns:1fr;padding:10px;gap:10px;}
+  .panel.span-2,.panel.span-3,.panel.span-full{grid-column:span 1;}
 }
 /* ── PANELS ──
    Panels stack on a --border-colored gap so each card reads as its own
    surface. Subtle inner ring + soft top-shadow gives depth without
    resorting to heavy borders (Vercel-style). */
-.panel{background:var(--panel);padding:14px 16px;box-shadow:var(--ring);position:relative;}
-.panel-title{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--accent);margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;}
+.panel{background:var(--panel);padding:16px 18px;border:1px solid var(--border);border-radius:10px;box-shadow:var(--ring);position:relative;transition:border-color .15s;}
+.panel:hover{border-color:var(--border2);}
+body[data-theme="light"] .panel{box-shadow:var(--hero-shadow);}
+.panel-title{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--accent);margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;}
 .panel-title span{color:var(--text3);font-size:9px;}
 .stat-row{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border);gap:12px;}
 .stat-row:last-child{border-bottom:none;}
@@ -205,8 +208,9 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 
 /* ── MISSION CONTROL BAND ──
    4-column metric strip above the main grid, BFO-style overview. */
-.mission-control{display:grid;grid-template-columns:repeat(4,1fr) auto;gap:1px;background:var(--border);border-bottom:1px solid var(--accent);}
-.mc-cell{background:var(--panel);padding:12px 18px;display:flex;flex-direction:column;justify-content:center;}
+.mission-control{display:grid;grid-template-columns:repeat(4,1fr) auto;gap:1px;margin:12px 12px 0;background:var(--border);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:var(--ring);}
+body[data-theme="light"] .mission-control{box-shadow:var(--hero-shadow);}
+.mc-cell{background:var(--panel);padding:14px 18px;display:flex;flex-direction:column;justify-content:center;}
 .mc-lbl{font-family:var(--mono);font-size:9px;letter-spacing:1.8px;color:var(--text3);text-transform:uppercase;margin-bottom:4px;display:flex;align-items:center;gap:6px;}
 .mc-val{font-family:var(--mono);font-size:30px;font-weight:500;line-height:1;letter-spacing:-1px;font-variant-numeric:tabular-nums;}
 .mc-delta{font-family:var(--mono);font-size:10px;color:var(--text2);margin-top:4px;letter-spacing:0.2px;font-variant-numeric:tabular-nums;}
@@ -692,7 +696,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
     <span id="pf-1w" style="display:none"></span>
     <span id="pf-1m" style="display:none"></span>
     <span id="pf-all" style="display:none"></span>
-    <div class="panel">
+    <div class="panel span-2">
       <div class="panel-title">P&amp;L OVER TIME
         <div style="display:flex;gap:6px">
           <button class="cf on" onclick="setFilter('1D',this)">1D</button>
@@ -709,12 +713,12 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
         </div>
       </div>
     </div>
-    <div class="panel">
+    <div class="panel span-2">
       <div class="panel-title">ACTIVE MARKETS</div>
       <table class="mkt-table"><thead><tr><th>MARKET</th><th>YES</th><th>NO</th><th>VOL 24H</th></tr></thead>
       <tbody id="mkt-body"><tr><td colspan="4" style="color:var(--text3);padding:12px 0;text-align:center">loading…</td></tr></tbody></table>
     </div>
-    <div class="panel" id="positions-panel">
+    <div class="panel span-2" id="positions-panel">
       <div class="panel-title">OPEN POSITIONS <span class="pill pill-count" id="pos-count">0</span></div>
       <div class="conviction-card" id="conviction-card" style="display:none;">
         <div class="conviction-ring">
@@ -783,7 +787,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <div class="tlog" id="tlog"><div style="color:var(--text3);font-size:11px;padding:8px 0">no trades yet</div></div>
       <div class="see-all"><a href="#trades" onclick="showPage('trades',document.querySelector('.nav-link[href=\'#trades\']'))">See all →</a></div>
     </div>
-    <div class="panel panel-term">
+    <div class="panel panel-term span-full">
       <div class="term-head">
         <span class="term-dots"><span></span><span></span><span></span></span>
         <span class="term-title">SYSTEM TERMINAL · TTY/1</span>
