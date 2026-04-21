@@ -46,7 +46,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .page{display:none;}
 .page.active{display:block;}
 /* ── DASHBOARD LAYOUT ── */
-.main{display:grid;grid-template-columns:260px 1fr 280px;gap:1px;background:var(--border);min-height:calc(100vh - 44px - 33px);}
+.main{display:grid;grid-template-columns:260px 1fr 300px;gap:1px;background:var(--border);align-items:start;}
 .col{background:var(--bg);display:flex;flex-direction:column;gap:1px;}
 /* ── PANELS ──
    Panels stack on a --border-colored gap so each card reads as its own
@@ -66,7 +66,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .chart-wrap canvas{position:absolute;top:0;left:0;width:100%!important;height:100%!important;}
 .cf{padding:2px 10px;border-radius:2px;border:1px solid var(--border2);font-family:var(--mono);font-size:10px;cursor:pointer;background:transparent;color:var(--text2);letter-spacing:1px;}
 .cf.on{background:var(--accent);border-color:var(--accent);color:#000;font-weight:500;}
-.feed{overflow-y:auto;flex:1;min-height:0;scrollbar-width:thin;scrollbar-color:#333 #111;}
+.feed{overflow-y:auto;max-height:280px;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
 .feed-item{display:grid;grid-template-columns:50px 1fr 48px;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;}
 .feed-item:last-child{border-bottom:none;}
 .badge{font-family:var(--mono);font-size:9px;font-weight:500;padding:2px 6px;border-radius:2px;text-align:center;letter-spacing:1px;}
@@ -78,7 +78,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .feed-mkt{color:var(--text);line-height:1.35;}
 .feed-mkt a{color:inherit;text-decoration:none;}.feed-mkt a:hover{color:var(--accent);}
 .feed-conf{font-family:var(--mono);color:var(--text2);text-align:right;font-size:10px;}
-.tlog{overflow-y:auto;max-height:220px;scrollbar-width:thin;scrollbar-color:#333 #111;}
+.tlog{overflow-y:auto;max-height:240px;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
 .tlog-item{display:grid;grid-template-columns:1fr 40px 60px;gap:10px;align-items:center;padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;}
 .tlog-item:last-child{border-bottom:none;}
 .tlog-mkt{color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
@@ -190,13 +190,24 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 
 /* ── MISSION CONTROL BAND ──
    4-column metric strip above the main grid, BFO-style overview. */
-.mission-control{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);border-bottom:1px solid var(--accent);}
+.mission-control{display:grid;grid-template-columns:repeat(4,1fr) auto;gap:1px;background:var(--border);border-bottom:1px solid var(--accent);}
 .mc-cell{background:var(--panel);padding:12px 18px;display:flex;flex-direction:column;justify-content:center;}
 .mc-lbl{font-family:var(--mono);font-size:9px;letter-spacing:1.8px;color:var(--text3);text-transform:uppercase;margin-bottom:4px;display:flex;align-items:center;gap:6px;}
-.mc-val{font-family:var(--mono);font-size:32px;font-weight:500;line-height:1;letter-spacing:-1px;font-variant-numeric:tabular-nums;}
+.mc-val{font-family:var(--mono);font-size:30px;font-weight:500;line-height:1;letter-spacing:-1px;font-variant-numeric:tabular-nums;}
 .mc-delta{font-family:var(--mono);font-size:10px;color:var(--text2);margin-top:4px;letter-spacing:0.2px;font-variant-numeric:tabular-nums;}
+.mc-actions{flex-direction:row;align-items:center;gap:8px;padding:12px 18px;min-width:240px;}
+.mc-btn{flex:1;border-radius:6px;padding:10px 14px;font-size:12px;font-weight:700;cursor:pointer;text-align:center;text-decoration:none;display:block;letter-spacing:0.3px;transition:filter .15s,background .15s;white-space:nowrap;}
+.mc-btn-primary{background:#3b82f6;color:#fff;border:none;}
+.mc-btn-primary:hover{filter:brightness(1.08);}
+.mc-btn-secondary{background:var(--btn-secondary-bg);color:var(--text);border:1px solid var(--btn-secondary-border);}
+.mc-btn-secondary:hover{background:var(--panel-hover);}
+body[data-theme="light"] .mc-btn-primary{background:#2563eb;}
 [data-view="mobile"] .mission-control{grid-template-columns:1fr 1fr;}
-@media(max-width:768px){body:not([data-override="desktop"]) .mission-control{grid-template-columns:1fr 1fr;}}
+[data-view="mobile"] .mc-actions{grid-column:1/-1;min-width:0;}
+@media(max-width:768px){
+  body:not([data-override="desktop"]) .mission-control{grid-template-columns:1fr 1fr;}
+  body:not([data-override="desktop"]) .mc-actions{grid-column:1/-1;min-width:0;}
+}
 
 /* ── CONVICTION DIAL ──
    BFO's Active Position card — circular progress ring with a numeric
@@ -300,7 +311,7 @@ body[data-theme="light"] .chip-error{background:#ffe4e6;border-color:#fda4af;}
 .term-head .term-dots span:nth-child(3){background:#00ca4e;}
 .term-head .term-title{flex:1;}
 .term-head .term-live{color:var(--green);font-size:9px;letter-spacing:1.5px;}
-.term-body{padding:10px 14px;font-family:var(--mono);font-size:10px;line-height:1.75;overflow-y:auto;flex:1;min-height:0;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;color:var(--text3);background:var(--panel);}
+.term-body{padding:10px 14px;font-family:var(--mono);font-size:10px;line-height:1.75;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;color:var(--text3);background:var(--panel);}
 .term-body > div{padding-left:14px;position:relative;}
 .term-body > div::before{content:'›';position:absolute;left:0;color:var(--text3);opacity:0.6;}
 .term-body .li{color:#4488ff;}
@@ -495,7 +506,8 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
      PAGE: DASHBOARD
 ═══════════════════════════════════════════════════════════ -->
 <div id="page-dashboard" class="page active">
-<!-- Mission Control band — 4-col overview above the main grid -->
+<!-- Mission Control band — overview strip above the main grid.
+     4 metric cells + inline Deposit / Withdraw actions on the right. -->
 <div class="mission-control">
   <div class="mc-cell">
     <div class="mc-lbl"><span style="color:var(--accent)">●</span> Portfolio Value</div>
@@ -516,6 +528,10 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
     <div class="mc-lbl">Realized P&amp;L · 30D</div>
     <div class="mc-val" id="mc-realized">—</div>
     <div class="mc-delta" id="mc-realized-delta">Resolved trades</div>
+  </div>
+  <div class="mc-cell mc-actions">
+    <a class="mc-btn mc-btn-primary" href="https://polymarket.com/wallet" target="_blank" rel="noopener">↓ Deposit</a>
+    <a class="mc-btn mc-btn-secondary" href="https://polymarket.com/wallet" target="_blank" rel="noopener">↑ Withdraw</a>
   </div>
 </div>
 <!-- Mobile portfolio summary bar -->
@@ -647,34 +663,20 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
     </div>
   </div>
   <div class="col">
-    <div class="hero-row">
-      <div class="hero-card">
-        <div class="hero-eyebrow">
-          <span>Portfolio</span>
-          <span class="hero-eyebrow-avail">Available <span class="g" id="pc-avail" style="font-family:var(--mono);font-weight:600">—</span></span>
-        </div>
-        <div class="hero-number" id="pc-total">$—</div>
-        <div class="hero-delta" id="pc-pnl-day">—</div>
-        <div class="hero-actions">
-          <a href="https://polymarket.com/wallet" target="_blank" class="hero-btn hero-btn-primary">↓ Deposit</a>
-          <a href="https://polymarket.com/wallet" target="_blank" class="hero-btn hero-btn-secondary">↑ Withdraw</a>
-        </div>
-      </div>
-      <div class="hero-card">
-        <div class="hero-eyebrow">
-          <span style="display:flex;align-items:center;gap:5px"><span id="pc-pnl-icon" class="g">▲</span> Profit/Loss</span>
-          <span class="hero-range">
-            <button class="cf on" onclick="setPnlFilter('1D',this)" id="pf-1d">1D</button>
-            <button class="cf" onclick="setPnlFilter('1W',this)" id="pf-1w">1W</button>
-            <button class="cf" onclick="setPnlFilter('1M',this)" id="pf-1m">1M</button>
-            <button class="cf" onclick="setPnlFilter('ALL',this)" id="pf-all">ALL</button>
-          </span>
-        </div>
-        <div class="hero-pnl-number" id="pc-pnl">$—</div>
-        <div class="hero-delta" id="pc-pnl-label">All time</div>
-        <div class="hero-mini"><canvas id="mini-pnl-chart"></canvas></div>
-      </div>
-    </div>
+    <!-- Hidden placeholders — retained so existing fetchPortfolio writes don't throw
+         after the duplicate hero row was removed. Their values live in the
+         Mission Control band above instead. -->
+    <span id="pc-total" style="display:none"></span>
+    <span id="pc-avail" style="display:none"></span>
+    <span id="pc-pnl" style="display:none"></span>
+    <span id="pc-pnl-day" style="display:none"></span>
+    <span id="pc-pnl-label" style="display:none"></span>
+    <span id="pc-pnl-icon" style="display:none"></span>
+    <canvas id="mini-pnl-chart" style="display:none"></canvas>
+    <span id="pf-1d" style="display:none"></span>
+    <span id="pf-1w" style="display:none"></span>
+    <span id="pf-1m" style="display:none"></span>
+    <span id="pf-all" style="display:none"></span>
     <div class="panel">
       <div class="panel-title">P&amp;L OVER TIME
         <div style="display:flex;gap:6px">
@@ -723,7 +725,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       </div>
       <div id="positions-list"><div style="color:var(--text3);font-size:11px;padding:8px 0">no open positions</div></div>
     </div>
-    <div class="panel" style="flex:1;display:flex;flex-direction:column;border-bottom:1px solid var(--border2);">
+    <div class="panel">
       <div class="panel-title">LIVE SIGNALS
         <span style="display:inline-flex;align-items:center;gap:6px">
           <span class="pill pill-count" id="sig-count">0</span>
@@ -766,13 +768,13 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <div class="tlog" id="tlog"><div style="color:var(--text3);font-size:11px;padding:8px 0">no trades yet</div></div>
       <div class="see-all"><a href="#trades" onclick="showPage('trades',document.querySelector('.nav-link[href=\'#trades\']'))">See all →</a></div>
     </div>
-    <div class="panel panel-term" style="flex:1;display:flex;flex-direction:column;border-bottom:1px solid var(--border2);">
+    <div class="panel panel-term">
       <div class="term-head">
         <span class="term-dots"><span></span><span></span><span></span></span>
         <span class="term-title">SYSTEM TERMINAL · TTY/1</span>
         <span class="term-live">● LIVE</span>
       </div>
-      <div class="term-body blog" id="blog"><div class="li">waiting…</div></div>
+      <div class="term-body blog" id="blog" style="max-height:320px"><div class="li">waiting…</div></div>
     </div>
   </div>
 </div>
