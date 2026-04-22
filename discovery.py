@@ -215,6 +215,19 @@ class MarketFilter:
         self._markets = [m for m in self._markets if cat_lower in m.category.lower()]
         return self
 
+    def exclude_categories(self, cats: list[str]) -> "MarketFilter":
+        """Drop markets whose category contains any of the given substrings.
+        Case-insensitive. Used to skip structurally unfavorable segments
+        (e.g. short-horizon crypto price targets) identified by backtests."""
+        lowered = [c.lower() for c in cats if c]
+        if not lowered:
+            return self
+        self._markets = [
+            m for m in self._markets
+            if not any(c in (m.category or "").lower() for c in lowered)
+        ]
+        return self
+
     def keyword(self, kw: str) -> "MarketFilter":
         kw_lower = kw.lower()
         self._markets = [
