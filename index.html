@@ -46,89 +46,94 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .page{display:none;}
 .page.active{display:block;}
 /* ── DASHBOARD LAYOUT ── */
-/* Fixed 4-column grid with explicit spans per panel. Spans are tuned
-   so each "row" of cards sums to exactly 4 (e.g. positions-2 + chart-2,
-   markets-2 + signals-2, movers-2 + vmx-1 + tlog-1, four quarters, etc).
-   grid-auto-flow:dense lets single-width panels backfill any gaps
-   left over when an odd-sized card doesn't fit the remaining space. */
-.main{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));grid-auto-flow:dense;gap:12px;padding:12px;background:var(--bg);}
+/* Deterministic layout via grid-template-areas.
+   Every panel is assigned a named slot; the grid lays them out exactly
+   where they're placed regardless of document order, column counts, or
+   natural heights. Row heights follow the tallest cell in the row
+   (default `stretch`), so cards in the same row line up clean edges. */
+.main{
+  display:grid;
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  grid-template-areas:
+    "positions positions chart    chart"
+    "markets   markets   signals  signals"
+    "movers    movers    vmx      trades"
+    "stats     fred      crypto   weather"
+    "backtest  backtest  review   calibration"
+    "pretrade  pretrade  spend    spend"
+    "terminal  terminal  terminal terminal";
+  gap:12px;padding:12px;background:var(--bg);
+}
 .col{display:contents;}
 .col > .panel{border-bottom:none;}
 .main .panel[style*="flex:1"]{flex:unset;}
 
-/* Every panel gets an explicit span. Defaults to 1 (quarter width). */
-.main > .col > .panel{grid-column:span 1;}
-/* Row 1 (hero): positions + chart. Make the chart panel a flex column
-   so chart-wrap (flex:1) expands to fill the stretched card height. */
-#positions-panel{grid-column:span 2;}
-.main > .col > .panel:has(.chart-wrap){grid-column:span 2;display:flex;flex-direction:column;min-height:0;}
-/* Row 2: markets + signals */
-.main > .col > .panel:has(#mkt-body){grid-column:span 2;}
-.main > .col > .panel:has(#sig-feed){grid-column:span 2;}
-/* Row 3: movers-2 + vmx-1 + trade history-1 */
-.main > .col > .panel:has(#fmp-movers){grid-column:span 2;}
-/* Row 4: four quarters (stats + fred + crypto + weather) — span 1 default */
-/* Row 5: backtest-2 + reviews-1 + calibration-1 */
-#backtest-panel{grid-column:span 2;}
-/* Row 6: pretrade-2 + spend-2 */
-#pretrade-panel{grid-column:span 2;}
-#spend-panel{grid-column:span 2;}
-/* Footer: terminal spans everything */
-.panel.panel-term{grid-column:1/-1;}
+/* Assign each panel to its named slot via :has() on unique content ids. */
+#positions-panel{grid-area:positions;display:flex;flex-direction:column;min-height:0;}
+.main > .col > .panel:has(.chart-wrap){grid-area:chart;display:flex;flex-direction:column;min-height:0;}
+.main > .col > .panel:has(#mkt-body){grid-area:markets;display:flex;flex-direction:column;min-height:0;}
+.main > .col > .panel:has(#sig-feed){grid-area:signals;display:flex;flex-direction:column;min-height:0;}
+.main > .col > .panel:has(#fmp-movers){grid-area:movers;display:flex;flex-direction:column;min-height:0;}
+#vmx-panel{grid-area:vmx;}
+.main > .col > .panel:has(#tlog){grid-area:trades;display:flex;flex-direction:column;min-height:0;}
+.main > .col > .panel:has(#port-val){grid-area:stats;}
+.main > .col > .panel:has(#fred-data){grid-area:fred;}
+.main > .col > .panel:has(#cbtc){grid-area:crypto;}
+.main > .col > .panel:has(#wtemp){grid-area:weather;}
+#backtest-panel{grid-area:backtest;display:flex;flex-direction:column;min-height:0;}
+#reviews-panel{grid-area:review;display:flex;flex-direction:column;min-height:0;}
+#calibration-panel{grid-area:calibration;display:flex;flex-direction:column;min-height:0;}
+#pretrade-panel{grid-area:pretrade;display:flex;flex-direction:column;min-height:0;}
+#spend-panel{grid-area:spend;}
+.panel.panel-term{grid-area:terminal;}
 
-/* Visual order. Primary trading content first, AI panels last. */
-#positions-panel{order:1;}
-.main > .col > .panel:has(.chart-wrap){order:2;}
-.main > .col > .panel:has(#mkt-body){order:3;}
-#vmx-panel{order:4;}
-.main > .col > .panel:has(#sig-feed){order:5;}
-.main > .col > .panel:has(#fmp-movers){order:6;}
-.main > .col > .panel:has(#tlog){order:7;}
-.main > .col > .panel:has(#port-val){order:8;}
-.main > .col > .panel:has(#fred-data){order:9;}
-.main > .col > .panel:has(#cbtc){order:10;}
-.main > .col > .panel:has(#wtemp){order:11;}
-#backtest-panel{order:20;}
-#reviews-panel{order:21;}
-#calibration-panel{order:22;}
-#pretrade-panel{order:23;}
-#spend-panel{order:24;}
-.panel.panel-term{order:99;}
-
-/* Cap every list panel so one long list can't stretch its grid row
-   and leave voids next to short cards. Each cap + internal scroll is
-   tuned so the card sits at a similar height to its row peers. */
-#positions-panel{max-height:500px;display:flex;flex-direction:column;}
+/* Scrollable bodies inside list panels so they don't overflow the row. */
 #positions-panel > #positions-list{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
-.main > .col > .panel:has(#mkt-body){max-height:500px;display:flex;flex-direction:column;}
 .main > .col > .panel:has(#mkt-body) > table{display:block;overflow-y:auto;flex:1;min-height:0;scrollbar-width:thin;}
-.main > .col > .panel:has(#sig-feed){max-height:380px;display:flex;flex-direction:column;}
-.main > .col > .panel:has(#fmp-movers){max-height:440px;display:flex;flex-direction:column;}
 .main > .col > .panel:has(#fmp-movers) > #fmp-movers{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;}
-.main > .col > .panel:has(#tlog){max-height:380px;display:flex;flex-direction:column;}
-#backtest-panel,#reviews-panel,#calibration-panel,#pretrade-panel{max-height:440px;display:flex;flex-direction:column;}
 #backtest-body,#review-body,#calibration-body{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
 
-/* Responsive breakdowns. 4-col desktop → 2-col tablet → 1-col phone. */
+/* Tablet: collapse to 2 columns, reorder areas one row at a time. */
 @media(max-width:1200px){
-  .main{grid-template-columns:repeat(2,minmax(0,1fr));}
-  .main > .col > .panel,
-  .main > .col > .panel:has(.chart-wrap),
-  .main > .col > .panel:has(#mkt-body),
-  #positions-panel,
-  .main > .col > .panel:has(#sig-feed),
-  .main > .col > .panel:has(#fmp-movers){grid-column:span 2;}
-  .panel.panel-term{grid-column:1/-1;}
+  .main{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    grid-template-areas:
+      "positions chart"
+      "markets   signals"
+      "movers    vmx"
+      "trades    stats"
+      "fred      crypto"
+      "weather   backtest"
+      "review    calibration"
+      "pretrade  spend"
+      "terminal  terminal";
+  }
 }
+
+/* Phone: stack everything into a single column. */
 @media(max-width:720px){
-  .main{grid-template-columns:1fr;padding:10px;gap:10px;}
-  .main > .col > .panel,
-  .main > .col > .panel:has(.chart-wrap),
-  .main > .col > .panel:has(#mkt-body),
-  #positions-panel,
-  .main > .col > .panel:has(#sig-feed),
-  .main > .col > .panel:has(#fmp-movers),
-  .panel.panel-term{grid-column:1/-1;}
+  .main{
+    grid-template-columns:1fr;
+    padding:10px;gap:10px;
+    grid-template-areas:
+      "positions"
+      "chart"
+      "markets"
+      "signals"
+      "movers"
+      "vmx"
+      "trades"
+      "stats"
+      "fred"
+      "crypto"
+      "weather"
+      "backtest"
+      "review"
+      "calibration"
+      "pretrade"
+      "spend"
+      "terminal";
+  }
 }
 /* Width-based responsive rules that win regardless of data-override.
    A phone-width viewport should never render a multi-column grid or a
