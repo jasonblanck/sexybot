@@ -49,6 +49,20 @@ cp index.html /var/www/html/index.html 2>/dev/null || true
 # Sync login page (retro Bloomberg × Matrix auth gate)
 cp login.html /var/www/html/login.html 2>/dev/null || true
 
+# Sync nginx.conf (repo → live) if it changed. Without this, nginx.conf edits
+# would require a manual SSH + cp to /etc/nginx/sites-enabled/default to take
+# effect. If the new config fails `nginx -t`, revert to the prior one so a bad
+# commit cannot take the dashboard offline.
+if [ -f nginx.conf ] && ! cmp -s nginx.conf /etc/nginx/sites-enabled/default; then
+    cp /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/default.bak
+    cp nginx.conf /etc/nginx/sites-enabled/default
+    if ! nginx -t >/dev/null 2>&1; then
+        echo "$(date -u '+%F %T'): NEW nginx.conf REJECTED by 'nginx -t' — reverted to prior config" \
+            >> /var/log/sexybot-deploy.log
+        cp /etc/nginx/sites-enabled/default.bak /etc/nginx/sites-enabled/default
+    fi
+fi
+
 # Reload nginx only if its config still validates
 nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
 

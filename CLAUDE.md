@@ -107,7 +107,7 @@ The VPS pulls `main` from GitHub every minute via cron and restarts sexybot + ng
 /var/log/sexybot-deploy.log
 ```
 
-Flow: merge PR → `main` updates → within ≤60s the cron tick pulls, resets, copies `index.html` to nginx root, reloads nginx, restarts sexybot, logs the deploy. Failures are captured in `/var/log/sexybot-deploy.log`. To reinstall if it ever gets removed, see `scripts/deploy-pull.sh` header for the install commands.
+Flow: merge PR → `main` updates → within ≤60s the cron tick pulls, resets, copies `index.html` + `login.html` to nginx root, syncs `nginx.conf` to `/etc/nginx/sites-enabled/default` (auto-reverts if `nginx -t` rejects the new config), reloads nginx, restarts sexybot, logs the deploy. Failures are captured in `/var/log/sexybot-deploy.log`. To reinstall if it ever gets removed, see `scripts/deploy-pull.sh` header for the install commands.
 
 ## New Mac / New Machine Setup
 
