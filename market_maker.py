@@ -204,13 +204,15 @@ class MarketMaker:
             return 0
 
         # ── Inventory guard ───────────────────────────────────────────────────
-        yes_val = state.yes_inventory * mid
-        no_val  = state.no_inventory  * (1 - mid)
-        imbalance_usdc = abs(yes_val - no_val)
+        # YES and NO tokens are complementary (YES+NO pays $1 at any resolution),
+        # so equal yes/no inventory is a perfect hedge — only the unhedged delta
+        # carries directional risk. Price that delta at the side we're long.
+        net_delta = state.yes_inventory - state.no_inventory
+        imbalance_usdc = abs(net_delta) * (mid if net_delta >= 0 else (1 - mid))
         if imbalance_usdc > MAX_INVENTORY_USDC:
             log.info(
-                "MM INVENTORY LIMIT | %s  yes_val=%.2f no_val=%.2f — pausing quotes",
-                mkt.question[:40], yes_val, no_val,
+                "MM INVENTORY LIMIT | %s  net_delta=%+.1f imbalance=$%.2f — pausing quotes",
+                mkt.question[:40], net_delta, imbalance_usdc,
             )
             return await self._cancel_quotes(mkt, state)
 

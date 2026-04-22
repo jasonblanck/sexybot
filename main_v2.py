@@ -117,7 +117,8 @@ def _get_recent_trades_sync(token_id: str) -> list[dict]:
         resp.raise_for_status()
         data = resp.json()
         return data if isinstance(data, list) else data.get("data", [])
-    except Exception:
+    except Exception as exc:
+        log.warning("CLOB trade API error for %s: %s", token_id[:14], exc)
         return []
 
 
@@ -347,6 +348,10 @@ async def strategy_loop(
         for token_id, pos in list(open_positions.items()):
             book = book_manager.get_book(token_id)
             if book is None or book.is_stale or book.best_bid is None:
+                continue
+            if pos.entry_price <= 0:
+                log.warning("skip exit check: %s has invalid entry_price=%s",
+                            token_id[:14], pos.entry_price)
                 continue
             gain = (book.best_bid - pos.entry_price) / pos.entry_price
             if gain >= PROFIT_TARGET:
