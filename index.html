@@ -78,17 +78,17 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .main > .col > .panel:has(#mkt-body){grid-area:markets;display:flex;flex-direction:column;height:420px;}
 .main > .col > .panel:has(#sig-feed){grid-area:signals;display:flex;flex-direction:column;height:420px;}
 .main > .col > .panel:has(#fmp-movers){grid-area:movers;display:flex;flex-direction:column;height:420px;}
-#vmx-panel{grid-area:vmx;}
+#vmx-panel{grid-area:vmx;display:flex;flex-direction:column;height:420px;}
 .main > .col > .panel:has(#tlog){grid-area:trades;display:flex;flex-direction:column;height:420px;}
-.main > .col > .panel:has(#port-val){grid-area:stats;}
-.main > .col > .panel:has(#fred-data){grid-area:fred;}
-.main > .col > .panel:has(#cbtc){grid-area:crypto;}
-.main > .col > .panel:has(#wtemp){grid-area:weather;}
+.main > .col > .panel:has(#port-val){grid-area:stats;display:flex;flex-direction:column;height:420px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
+.main > .col > .panel:has(#fred-data){grid-area:fred;display:flex;flex-direction:column;height:420px;}
+.main > .col > .panel:has(#cbtc){grid-area:crypto;display:flex;flex-direction:column;height:420px;}
+.main > .col > .panel:has(#wtemp){grid-area:weather;display:flex;flex-direction:column;height:420px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
 #backtest-panel{grid-area:backtest;display:flex;flex-direction:column;height:420px;}
 #reviews-panel{grid-area:review;display:flex;flex-direction:column;height:420px;}
 #calibration-panel{grid-area:calibration;display:flex;flex-direction:column;height:420px;}
 #pretrade-panel{grid-area:pretrade;display:flex;flex-direction:column;height:420px;}
-#spend-panel{grid-area:spend;}
+#spend-panel{grid-area:spend;display:flex;flex-direction:column;height:420px;}
 .panel.panel-term{grid-area:terminal;}
 
 /* Chart sizes to its card, not the other way around. */
@@ -1631,19 +1631,21 @@ async function fetchPaperPortfolio(){
 }
 
 /* ── FMP ── */
+let _fmpCache={};
 async function fetchFMP(){
   try{
-    const r=await fetch(`${BOT}/fmp`);const d=await r.json();
+    const r=await fetch(`${BOT}/fmp`);const d=await r.json();_fmpCache=d;
     const s=d._sentiment||{};const sc=s.spy_change_pct||0;const scls=sc>=0?'g':'r';
     document.getElementById('fmp-sentiment').innerHTML=`<span class="${scls}">SPY ${sc>=0?'+':''}${sc.toFixed(2)}% · ${s.up_count||0}/${s.total||0} up</span>`;
     const names={SPY:'S&P 500 ETF',AAPL:'Apple Inc.',MSFT:'Microsoft Corp.',NVDA:'NVIDIA Corp.',TSLA:'Tesla, Inc.',META:'Meta Platforms',AMZN:'Amazon.com'};
-    const tickers=['SPY','AAPL','MSFT','NVDA','TSLA','META','AMZN'];
+    const tickers=['SPY','AAPL','MSFT','NVDA','TSLA','META','AMZN','GOOG'];
     const rows=tickers.filter(t=>d[t]).map(t=>{
       const q=d[t];const c=q.change_pct||0;const cls=c>=0?'g':'r';const sign=c>=0?'+':'';
       const price=q.price!=null?'$'+Number(q.price).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}):'—';
       return`<div class="mover-row"><div class="mover-avatar">${t.charAt(0)}</div><div><div class="mover-name">${names[t]||t}</div><div class="mover-ticker">${t}</div></div><div><div class="mover-price">${price}</div><div class="mover-chg ${cls}">${sign}${c.toFixed(2)}%</div></div></div>`;
     });
     document.getElementById('fmp-movers').innerHTML=rows.join('')||'<div style="color:var(--text3);font-size:11px;padding:4px 0">no data</div>';
+    syncVmx();
   }catch(e){}
 }
 
