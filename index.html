@@ -46,35 +46,37 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .page{display:none;}
 .page.active{display:block;}
 /* ── DASHBOARD LAYOUT ── */
-/* Card-based auto-fit grid.
-   Every panel is a peer; legacy .col wrappers are neutralised via
-   display:contents so panels bubble up as direct grid items. Auto-fit
-   means the viewport width decides the column count, with each card
-   at least 300px. Spans (.span-2 / .span-full) emphasise the heroes. */
-.main{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;padding:12px;background:var(--bg);align-items:start;}
+/* Fixed 4-column grid with explicit spans per panel, BFO-style.
+   Legacy .col wrappers neutralised via display:contents so panels
+   bubble directly into .main as grid items. Each panel is assigned
+   both its column span (how wide it reads) and its flex order (how
+   early it appears) via :has() selectors — no HTML tagging needed. */
+.main{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;padding:12px;background:var(--bg);align-items:start;}
 .col{display:contents;}
-/* The old 1px border-separated strip look fought the new card look —
-   flatten the inner stretches so cards don't carry accidental borders. */
 .col > .panel{border-bottom:none;}
 .main .panel[style*="flex:1"]{flex:unset;}
-.panel.span-2{grid-column:span 2;}
-.panel.span-3{grid-column:span 3;}
-.panel.span-full{grid-column:1/-1;}
 
-/* Explicit visual order — document order puts the AI / stats panels
-   first, burying the primary trading content below the fold. Reorder
-   via CSS `order` so the hero cards surface first. */
+/* Every panel gets an explicit span. Defaults to 1 (quarter width). */
+.main > .col > .panel{grid-column:span 1;}
+.main > .col > .panel:has(.chart-wrap){grid-column:span 3;}       /* P&L chart — big hero */
+.main > .col > .panel:has(#mkt-body){grid-column:span 2;}          /* Active Markets */
+#positions-panel{grid-column:span 2;}                              /* Open Positions + Conviction */
+.main > .col > .panel:has(#sig-feed){grid-column:span 2;}          /* Live Signals */
+.main > .col > .panel:has(#fmp-movers){grid-column:span 2;}        /* Market Movers */
+.panel.panel-term{grid-column:1/-1;}                               /* Terminal — always full */
+
+/* Visual order. Primary trading content first, AI panels last. */
 #positions-panel{order:1;}
-.main > .col > .panel:has(.chart-wrap){order:2;}        /* P&L over time */
-.main > .col > .panel:has(#mkt-body){order:3;}          /* Active markets */
+.main > .col > .panel:has(.chart-wrap){order:2;}
+.main > .col > .panel:has(#mkt-body){order:3;}
 #vmx-panel{order:4;}
-.main > .col > .panel:has(#sig-feed){order:5;}          /* Live signals */
-.main > .col > .panel:has(#fmp-movers){order:6;}        /* Market movers */
-.main > .col > .panel:has(#tlog){order:7;}              /* Trade history */
-.main > .col > .panel:has(#port-val){order:8;}          /* Bot stats */
-.main > .col > .panel:has(#fred-data){order:9;}         /* Fed / Macro */
-.main > .col > .panel:has(#cbtc){order:10;}             /* Crypto */
-.main > .col > .panel:has(#wtemp){order:11;}            /* Weather */
+.main > .col > .panel:has(#sig-feed){order:5;}
+.main > .col > .panel:has(#fmp-movers){order:6;}
+.main > .col > .panel:has(#tlog){order:7;}
+.main > .col > .panel:has(#port-val){order:8;}
+.main > .col > .panel:has(#fred-data){order:9;}
+.main > .col > .panel:has(#cbtc){order:10;}
+.main > .col > .panel:has(#wtemp){order:11;}
 #backtest-panel{order:20;}
 #reviews-panel{order:21;}
 #calibration-panel{order:22;}
@@ -82,14 +84,40 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 #spend-panel{order:24;}
 .panel.panel-term{order:99;}
 
-/* Text-heavy cards were stretching grid rows to accommodate their
-   long body copy. Cap them so the rest of the grid stays balanced. */
+/* Cap every list panel so one long list can't stretch its grid row
+   and leave voids next to short cards. Each cap + internal scroll is
+   tuned so the card sits at a similar height to its row peers. */
+#positions-panel{max-height:500px;display:flex;flex-direction:column;}
+#positions-panel > #positions-list{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
+.main > .col > .panel:has(#mkt-body){max-height:500px;display:flex;flex-direction:column;}
+.main > .col > .panel:has(#mkt-body) > table{display:block;overflow-y:auto;flex:1;min-height:0;scrollbar-width:thin;}
+.main > .col > .panel:has(#sig-feed){max-height:380px;display:flex;flex-direction:column;}
+.main > .col > .panel:has(#fmp-movers){max-height:440px;display:flex;flex-direction:column;}
+.main > .col > .panel:has(#fmp-movers) > #fmp-movers{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;}
+.main > .col > .panel:has(#tlog){max-height:380px;display:flex;flex-direction:column;}
 #backtest-panel,#reviews-panel,#calibration-panel,#pretrade-panel{max-height:440px;display:flex;flex-direction:column;}
 #backtest-body,#review-body,#calibration-body{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
 
-@media(max-width:900px){
+/* Responsive breakdowns. 4-col desktop → 2-col tablet → 1-col phone. */
+@media(max-width:1200px){
+  .main{grid-template-columns:repeat(2,minmax(0,1fr));}
+  .main > .col > .panel,
+  .main > .col > .panel:has(.chart-wrap),
+  .main > .col > .panel:has(#mkt-body),
+  #positions-panel,
+  .main > .col > .panel:has(#sig-feed),
+  .main > .col > .panel:has(#fmp-movers){grid-column:span 2;}
+  .panel.panel-term{grid-column:1/-1;}
+}
+@media(max-width:720px){
   .main{grid-template-columns:1fr;padding:10px;gap:10px;}
-  .panel.span-2,.panel.span-3,.panel.span-full{grid-column:span 1;}
+  .main > .col > .panel,
+  .main > .col > .panel:has(.chart-wrap),
+  .main > .col > .panel:has(#mkt-body),
+  #positions-panel,
+  .main > .col > .panel:has(#sig-feed),
+  .main > .col > .panel:has(#fmp-movers),
+  .panel.panel-term{grid-column:1/-1;}
 }
 /* Width-based responsive rules that win regardless of data-override.
    A phone-width viewport should never render a multi-column grid or a
@@ -741,7 +769,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
     <span id="pf-1w" style="display:none"></span>
     <span id="pf-1m" style="display:none"></span>
     <span id="pf-all" style="display:none"></span>
-    <div class="panel span-2">
+    <div class="panel">
       <div class="panel-title">P&amp;L OVER TIME
         <div style="display:flex;gap:6px">
           <button class="cf on" onclick="setFilter('1D',this)">1D</button>
@@ -758,12 +786,12 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
         </div>
       </div>
     </div>
-    <div class="panel span-2">
+    <div class="panel">
       <div class="panel-title">ACTIVE MARKETS</div>
       <table class="mkt-table"><thead><tr><th>MARKET</th><th>YES</th><th>NO</th><th>VOL 24H</th></tr></thead>
       <tbody id="mkt-body"><tr><td colspan="4" style="color:var(--text3);padding:12px 0;text-align:center">loading…</td></tr></tbody></table>
     </div>
-    <div class="panel span-2" id="positions-panel">
+    <div class="panel" id="positions-panel">
       <div class="panel-title">OPEN POSITIONS <span class="pill pill-count" id="pos-count">0</span></div>
       <div class="conviction-card" id="conviction-card" style="display:none;">
         <div class="conviction-ring">
@@ -832,7 +860,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <div class="tlog" id="tlog"><div style="color:var(--text3);font-size:11px;padding:8px 0">no trades yet</div></div>
       <div class="see-all"><a href="#trades" onclick="showPage('trades',document.querySelector('.nav-link[href=\'#trades\']'))">See all →</a></div>
     </div>
-    <div class="panel panel-term span-full">
+    <div class="panel panel-term">
       <div class="term-head">
         <span class="term-dots"><span></span><span></span><span></span></span>
         <span class="term-title">SYSTEM TERMINAL · TTY/1</span>
