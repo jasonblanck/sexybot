@@ -334,6 +334,10 @@ class PolymarketBot:
         self._brier_resolver_task: Optional[asyncio.Task] = None
         # Weekly scheduled backtest task handle
         self._weekly_backtest_task: Optional[asyncio.Task] = None
+        # On-demand backtest task + status (polled by the dashboard so the
+        # HTTP handler can return immediately instead of blocking ~150-230s).
+        self._backtest_task:   Optional[asyncio.Task] = None
+        self._backtest_status: dict = {"status": "idle", "started_at": None}
         # Daily SQLite VACUUM + prune task
         self._db_maintenance_task:  Optional[asyncio.Task] = None
         # Daily Telegram digest task
@@ -3410,7 +3414,10 @@ class PolymarketBot:
             t0 = time.time()
             kwargs = {
                 "model": CLAUDE_MODEL,
-                "max_tokens": 8000,
+                # 8000 was hitting the cumulative limit across code_execution
+                # turns — Claude ran analysis but never got to submit the tool
+                # call, surfacing as "[BACKTEST] no submit_backtest_report".
+                "max_tokens": 16000,
                 "system": system,
                 "messages": [{"role": "user", "content": ctx}],
                 "tools": [
@@ -3455,7 +3462,12 @@ class PolymarketBot:
 
             decision = _extract_tool_input(msg, _TOOL_BACKTEST["name"])
             if decision is None:
-                log.warning("[BACKTEST] no submit_backtest_report in response")
+                sr    = getattr(msg, "stop_reason", None)
+                usage = getattr(msg, "usage", None)
+                log.warning(
+                    "[BACKTEST] no submit_backtest_report in response "
+                    "(stop_reason=%s, usage=%s)", sr, usage,
+                )
                 return None
 
             summary   = str(decision.get("summary", ""))[:3000]
@@ -6231,12 +6243,39 @@ def get_latest_backtest():
 
 @app.post("/backtest/run", dependencies=[Depends(require_api_key)])
 async def trigger_backtest():
-    """Run a backtest on demand. Blocks until Claude finishes analyzing
-    (typically 20-90s with code_execution). Returns the report."""
-    result = await bot.run_backtest_analysis()
-    if result is None:
-        return JSONResponse({"ok": False, "message": "backtest skipped (no trades or error)"})
-    return JSONResponse({"ok": True, **result})
+    """Kick off a backtest in the background. Returns immediately so the
+    dashboard doesn't hold an HTTP connection while Claude runs (~150-230s
+    with code_execution). Clients poll /backtest/status for progress and
+    re-fetch /backtest when status flips to idle."""
+    if bot._backtest_task is not None and not bot._backtest_task.done():
+        return JSONResponse(
+            {"ok": False, "status": "running", "message": "backtest already in progress"},
+            status_code=409,
+        )
+
+    async def _wrap():
+        bot._backtest_status = {"status": "running", "started_at": time.time()}
+        try:
+            await bot.run_backtest_analysis()
+            bot._backtest_status = {"status": "idle", "started_at": None}
+        except Exception as exc:
+            log.exception("backtest background task failed")
+            bot._backtest_status = {"status": "idle", "started_at": None, "last_error": str(exc)}
+
+    bot._backtest_task = asyncio.create_task(_wrap())
+    return JSONResponse({"ok": True, "status": "started"})
+
+
+@app.get("/backtest/status")
+def backtest_status():
+    """Current on-demand backtest progress — {status: idle|running, ...}.
+    Dashboard polls this while a user-triggered run is in flight so the
+    button reflects real server state rather than a stale fetch promise."""
+    s = dict(bot._backtest_status)
+    started = s.get("started_at")
+    if started:
+        s["elapsed_s"] = round(time.time() - started, 1)
+    return JSONResponse(s)
 
 
 @app.get("/deep/recent")

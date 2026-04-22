@@ -2110,6 +2110,32 @@ async function fetchBacktest(){
       (recHtml?`<div style="font-size:10px;color:var(--text3);margin-top:6px">Recommendations:</div><ul style="margin:2px 0 0 14px;padding:0">${recHtml}</ul>`:'');
   }catch(e){}
 }
+let _backtestPollHandle=null;
+function _findBacktestBtn(){
+  return document.querySelector('button[onclick^="runBacktest"]');
+}
+function _pollBacktestStatus(btn){
+  if(_backtestPollHandle){clearInterval(_backtestPollHandle);_backtestPollHandle=null;}
+  const target=btn||_findBacktestBtn();
+  const tick=async()=>{
+    try{
+      const r=await fetch(`${BOT}/backtest/status`);
+      if(!r.ok)return;
+      const s=await r.json();
+      if(s.status==='running'){
+        if(target){target.disabled=true;target.textContent=`RUNNING ${Math.round(s.elapsed_s||0)}s`;}
+        return;
+      }
+      // idle — stop polling, reset button, refresh report
+      clearInterval(_backtestPollHandle);_backtestPollHandle=null;
+      if(target){target.disabled=false;target.textContent='RUN';}
+      fetchBacktest();
+      if(s.last_error)alert('Backtest error: '+s.last_error);
+    }catch(_){/* transient; keep polling */}
+  };
+  tick();
+  _backtestPollHandle=setInterval(tick,5000);
+}
 async function runBacktest(btn){
   const key=sessionStorage.getItem('sb_key')||prompt('Enter API key to run backtest:','')||'';
   if(!key)return;
@@ -2117,10 +2143,10 @@ async function runBacktest(btn){
   if(btn){btn.disabled=true;btn.textContent='RUNNING…';}
   try{
     const r=await fetch(`${BOT}/backtest/run`,{method:'POST',headers:{'X-API-Key':key}});
-    const d=await r.json();
-    if(r.ok&&d.ok){
-      if(btn){btn.disabled=false;btn.textContent='RUN';}
-      fetchBacktest();
+    const d=await r.json().catch(()=>({}));
+    // 200 = started; 409 = already running (poll either way)
+    if((r.ok&&d.ok)||r.status===409){
+      _pollBacktestStatus(btn);
     }else{
       if(btn){btn.disabled=false;btn.textContent='RUN';}
       alert('Backtest: '+(d.message||d.detail||'failed'));
@@ -2379,7 +2405,7 @@ async function applyReview(reviewId,idx,btn){
   }
 }
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();fetchClaudeMax();fetchCalibration();fetchSpend();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();_pollBacktestStatus();fetchClaudeMax();fetchCalibration();fetchSpend();
 setInterval(fetchBot,15000);
 setInterval(fetchPortfolio,30000);
 setInterval(fetchMarkets,60000);
