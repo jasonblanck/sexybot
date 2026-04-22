@@ -60,6 +60,33 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .panel.span-2{grid-column:span 2;}
 .panel.span-3{grid-column:span 3;}
 .panel.span-full{grid-column:1/-1;}
+
+/* Explicit visual order — document order puts the AI / stats panels
+   first, burying the primary trading content below the fold. Reorder
+   via CSS `order` so the hero cards surface first. */
+#positions-panel{order:1;}
+.main > .col > .panel:has(.chart-wrap){order:2;}        /* P&L over time */
+.main > .col > .panel:has(#mkt-body){order:3;}          /* Active markets */
+#vmx-panel{order:4;}
+.main > .col > .panel:has(#sig-feed){order:5;}          /* Live signals */
+.main > .col > .panel:has(#fmp-movers){order:6;}        /* Market movers */
+.main > .col > .panel:has(#tlog){order:7;}              /* Trade history */
+.main > .col > .panel:has(#port-val){order:8;}          /* Bot stats */
+.main > .col > .panel:has(#fred-data){order:9;}         /* Fed / Macro */
+.main > .col > .panel:has(#cbtc){order:10;}             /* Crypto */
+.main > .col > .panel:has(#wtemp){order:11;}            /* Weather */
+#backtest-panel{order:20;}
+#reviews-panel{order:21;}
+#calibration-panel{order:22;}
+#pretrade-panel{order:23;}
+#spend-panel{order:24;}
+.panel.panel-term{order:99;}
+
+/* Text-heavy cards were stretching grid rows to accommodate their
+   long body copy. Cap them so the rest of the grid stays balanced. */
+#backtest-panel,#reviews-panel,#calibration-panel,#pretrade-panel{max-height:440px;display:flex;flex-direction:column;}
+#backtest-body,#review-body,#calibration-body{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
+
 @media(max-width:900px){
   .main{grid-template-columns:1fr;padding:10px;gap:10px;}
   .panel.span-2,.panel.span-3,.panel.span-full{grid-column:span 1;}
