@@ -51,16 +51,17 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
    markets-2 + signals-2, movers-2 + vmx-1 + tlog-1, four quarters, etc).
    grid-auto-flow:dense lets single-width panels backfill any gaps
    left over when an odd-sized card doesn't fit the remaining space. */
-.main{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));grid-auto-flow:dense;gap:12px;padding:12px;background:var(--bg);align-items:start;}
+.main{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));grid-auto-flow:dense;gap:12px;padding:12px;background:var(--bg);}
 .col{display:contents;}
 .col > .panel{border-bottom:none;}
 .main .panel[style*="flex:1"]{flex:unset;}
 
 /* Every panel gets an explicit span. Defaults to 1 (quarter width). */
 .main > .col > .panel{grid-column:span 1;}
-/* Row 1 (hero): positions + chart */
+/* Row 1 (hero): positions + chart. Make the chart panel a flex column
+   so chart-wrap (flex:1) expands to fill the stretched card height. */
 #positions-panel{grid-column:span 2;}
-.main > .col > .panel:has(.chart-wrap){grid-column:span 2;}
+.main > .col > .panel:has(.chart-wrap){grid-column:span 2;display:flex;flex-direction:column;min-height:0;}
 /* Row 2: markets + signals */
 .main > .col > .panel:has(#mkt-body){grid-column:span 2;}
 .main > .col > .panel:has(#sig-feed){grid-column:span 2;}
@@ -166,7 +167,7 @@ body[data-theme="light"] .panel{box-shadow:var(--hero-shadow);}
 .g{color:var(--green);}.r{color:var(--red);}.b{color:var(--blue);}.o{color:var(--accent);}.y{color:var(--accent2);}.p{color:var(--purple);}
 .big-num{font-family:var(--mono);font-size:32px;font-weight:500;letter-spacing:-1px;line-height:1;margin:4px 0;}
 .sub-num{font-size:11px;color:var(--text2);font-family:var(--mono);}
-.chart-wrap{position:relative;width:100%;height:180px;}
+.chart-wrap{position:relative;width:100%;height:100%;min-height:320px;flex:1;}
 .chart-wrap canvas{position:absolute;top:0;left:0;width:100%!important;height:100%!important;}
 .cf{padding:2px 10px;border-radius:2px;border:1px solid var(--border2);font-family:var(--mono);font-size:10px;cursor:pointer;background:transparent;color:var(--text2);letter-spacing:1px;}
 .cf.on{background:var(--accent);border-color:var(--accent);color:#000;font-weight:500;}
