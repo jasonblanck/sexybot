@@ -126,12 +126,18 @@ class ExecutionGate:
             )
 
         if balance is not None and order_size is not None:
+            # 5% cushion so fees / minor slippage can't flip a "just barely
+            # fits" order into a "not enough balance" error from the CLOB.
+            # Recommendation from the 2026-04-22 backtest: the April 9 storm
+            # fired ~460 orders against a $0.86 wallet; every one errored.
+            required  = order_size * 1.05
             spendable = balance.balance - CRITICAL_BALANCE   # never dip below $10 reserve
-            if order_size > spendable:
+            if required > spendable:
                 return GateVerdict(
                     passed=False,
                     reject_reason=(
-                        f"order ${order_size:.2f} would breach ${CRITICAL_BALANCE:.0f} reserve "
+                        f"order ${order_size:.2f}×1.05=${required:.2f} would breach "
+                        f"${CRITICAL_BALANCE:.0f} reserve "
                         f"(balance=${balance.balance:.2f} spendable=${spendable:.2f})"
                     ),
                 )
@@ -260,6 +266,83 @@ class DrawdownGuard:
         self._triggered = False
         self._history.clear()
         log.warning("DrawdownGuard manually reset — strategy will resume on next restart")
+
+
+BALANCE_ERROR_LIMIT       = int(os.getenv("BALANCE_ERROR_LIMIT", "5"))
+BALANCE_ERROR_WINDOW_SEC  = int(os.getenv("BALANCE_ERROR_WINDOW", "600"))   # 10 min
+BALANCE_ERROR_PAUSE_SEC   = int(os.getenv("BALANCE_ERROR_PAUSE",  "900"))   # 15 min
+
+
+class BalanceErrorCircuitBreaker:
+    """
+    Pause all strategy order placement after N balance-related errors in a
+    rolling window. Protects against runaway retry storms like the 2026-04-09
+    event where 460 orders were fired in 82 min against a $0.86 wallet.
+
+    Not a kill-switch — just a cooldown. After `pause_sec` without fresh
+    errors, the breaker automatically re-arms (history is cleared lazily
+    on the next `record_error()` or `is_tripped()` call).
+
+    Usage
+    -----
+    breaker = BalanceErrorCircuitBreaker()
+    # In the main loop, before any order-placement pass:
+    if breaker.is_tripped():
+        continue        # skip this cycle
+
+    # After each order attempt:
+    if "not enough balance" in (result.error or "").lower():
+        breaker.record_error()
+    """
+
+    BALANCE_ERROR_PATTERNS = (
+        "not enough balance",
+        "insufficient balance",
+        "insufficient funds",
+        "balance too low",
+    )
+
+    def __init__(
+        self,
+        limit:     int = BALANCE_ERROR_LIMIT,
+        window:    int = BALANCE_ERROR_WINDOW_SEC,
+        pause_sec: int = BALANCE_ERROR_PAUSE_SEC,
+    ):
+        self.limit      = limit
+        self.window     = window
+        self.pause_sec  = pause_sec
+        self._errors:   list[float] = []
+        self._tripped_at: Optional[float] = None
+
+    @classmethod
+    def is_balance_error(cls, msg: Optional[str]) -> bool:
+        if not msg:
+            return False
+        m = msg.lower()
+        return any(p in m for p in cls.BALANCE_ERROR_PATTERNS)
+
+    def record_error(self) -> None:
+        now = time.time()
+        self._errors.append(now)
+        cutoff = now - self.window
+        self._errors = [t for t in self._errors if t >= cutoff]
+        if len(self._errors) >= self.limit and self._tripped_at is None:
+            self._tripped_at = now
+            log.critical(
+                "⛔ BALANCE CIRCUIT BREAKER TRIPPED | %d balance errors in %ds — "
+                "pausing order placement for %ds",
+                len(self._errors), self.window, self.pause_sec,
+            )
+
+    def is_tripped(self) -> bool:
+        if self._tripped_at is None:
+            return False
+        if time.time() - self._tripped_at >= self.pause_sec:
+            log.warning("BALANCE CIRCUIT BREAKER | cooldown elapsed, re-arming")
+            self._tripped_at = None
+            self._errors.clear()
+            return False
+        return True
 
 
 def kelly_size(

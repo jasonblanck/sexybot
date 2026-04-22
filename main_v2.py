@@ -24,7 +24,14 @@ from executor import ClobExecutor
 from market_maker import MarketMaker
 from orderbook_ws import BookManager, BookSnapshot
 from redeemer import PositionRedeemer
-from risk import BalanceInfo, DrawdownGuard, DrawdownHalt, ExecutionGate, kelly_size
+from risk import (
+    BalanceErrorCircuitBreaker,
+    BalanceInfo,
+    DrawdownGuard,
+    DrawdownHalt,
+    ExecutionGate,
+    kelly_size,
+)
 from signing import OrderSide
 
 log = logging.getLogger(__name__)
@@ -55,6 +62,13 @@ MARKET_REFRESH_CYCLES = 20   # re-discover markets every N scan cycles
 PROFIT_TARGET         = float(os.getenv("PROFIT_TARGET", "0.08"))   # 8% gain → close
 STOP_LOSS             = float(os.getenv("STOP_LOSS",     "0.05"))   # 5% loss → close
 KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.25"))  # Quarter Kelly
+# Comma-separated list of category substrings to skip at discovery. Defaults
+# to 'crypto' per the 2026-04-22 backtest recommendation (short-horizon crypto
+# price markets; 0% resolved win rate and structurally efficient). Override
+# with empty string to re-enable.
+EXCLUDE_CATEGORIES    = [
+    c.strip() for c in os.getenv("EXCLUDE_CATEGORIES", "crypto").split(",") if c.strip()
+]
 
 # Strategy selection
 # STRATEGY=momentum  (default) — directional momentum + OBI signals
@@ -265,9 +279,10 @@ async def strategy_loop(
     last_traded:    dict[str, float],       # persisted across restarts by caller
     cycle_count:    list[int],              # [0] mutable int, persisted across restarts
     open_positions: dict[str, "Position"],  # token_id → Position; persisted across restarts
-    redeemer:       Optional[PositionRedeemer] = None,
-    market_maker:   Optional[MarketMaker]       = None,
-    drawdown_guard: Optional[DrawdownGuard]     = None,
+    redeemer:       Optional[PositionRedeemer]        = None,
+    market_maker:   Optional[MarketMaker]             = None,
+    drawdown_guard: Optional[DrawdownGuard]           = None,
+    balance_breaker: Optional[BalanceErrorCircuitBreaker] = None,
 ) -> None:
     # Give WebSocket connections time to receive initial snapshots for all tokens
     log.info("Waiting 10s for WebSocket order books to populate…")
@@ -294,6 +309,7 @@ async def strategy_loop(
                     MarketFilter(fresh_raw)
                     .max_spread_cents(3.0)
                     .price_range(0.08, 0.92)
+                    .exclude_categories(EXCLUDE_CATEGORIES)
                     .top(20, key="volume_24h")
                     .results()
                 )
@@ -453,6 +469,13 @@ async def strategy_loop(
                 )
                 continue
 
+            # Balance-error circuit breaker: after N failed orders on
+            # "insufficient balance" errors, stop trying to place anything
+            # for a cooldown. Prevents retry-storm behavior like 2026-04-09.
+            if balance_breaker is not None and balance_breaker.is_tripped():
+                log.warning("CIRCUIT BREAKER ACTIVE — skipping order placement this cycle")
+                break
+
             try:
                 result = await asyncio.to_thread(
                     executor.place_limit_order,
@@ -464,10 +487,22 @@ async def strategy_loop(
                 )
             except Exception as exc:
                 log.error("Order error for %s: %s", mkt.question[:40], exc)
+                # Apply cooldown on exception too so the same market isn't
+                # hammered next cycle with the same failing call.
+                last_traded[trade_token_id] = time.time()
                 continue
 
+            # Cooldown on EVERY attempt (success or failure) — without this,
+            # a failing order can be retried every cycle. Pre-fix this is the
+            # mechanism that let April 9 fire 460 orders in 82 min.
+            last_traded[trade_token_id] = time.time()
+
+            # Feed balance errors to the circuit breaker
+            if balance_breaker is not None and not result.success:
+                if BalanceErrorCircuitBreaker.is_balance_error(result.error):
+                    balance_breaker.record_error()
+
             if result:
-                last_traded[trade_token_id] = time.time()
                 # Deduct spend from cached balance so the next order this cycle
                 # sees the reduced figure and cannot breach the $10 reserve.
                 if cycle_balance is not None and result.fill_price and result.token_qty:
@@ -508,10 +543,14 @@ async def main() -> None:
         MarketFilter(raw)
         .max_spread_cents(3.0)
         .price_range(0.08, 0.92)
+        .exclude_categories(EXCLUDE_CATEGORIES)
         .top(20, key="volume_24h")
         .results()
     )
-    log.info("Watching %d markets", len(markets))
+    log.info(
+        "Watching %d markets (excluding categories: %s)",
+        len(markets), EXCLUDE_CATEGORIES or "none",
+    )
 
     if not markets:
         log.error("No tradeable markets found — exiting")
@@ -564,15 +603,17 @@ async def main() -> None:
         open_positions: dict[str, Position] = {}
         cycle_count:    list[int]           = [0]            # mutable box
         markets_box:    list[list[PolyMarket]] = [markets]   # mutable box — survives restarts
-        drawdown_guard  = DrawdownGuard()                    # account-level kill-switch
+        drawdown_guard  = DrawdownGuard()                     # account-level kill-switch
+        balance_breaker = BalanceErrorCircuitBreaker()        # retry-storm guard
         while True:
             try:
                 await strategy_loop(
                     executor, book_manager, markets_box,
                     last_traded, cycle_count, open_positions,
-                    redeemer       = redeemer,
-                    market_maker   = market_maker,
-                    drawdown_guard = drawdown_guard,
+                    redeemer        = redeemer,
+                    market_maker    = market_maker,
+                    drawdown_guard  = drawdown_guard,
+                    balance_breaker = balance_breaker,
                 )
             except DrawdownHalt as exc:
                 # Cancel all outstanding orders before halting.
