@@ -63,35 +63,55 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
     "pretrade  pretrade  spend    spend"
     "terminal  terminal  terminal terminal";
   gap:12px;padding:12px;background:var(--bg);
+  align-items:start;
 }
 .col{display:contents;}
 .col > .panel{border-bottom:none;}
 .main .panel[style*="flex:1"]{flex:unset;}
 
-/* Assign each panel to its named slot via :has() on unique content ids. */
-#positions-panel{grid-area:positions;display:flex;flex-direction:column;min-height:0;}
-.main > .col > .panel:has(.chart-wrap){grid-area:chart;display:flex;flex-direction:column;min-height:0;}
-.main > .col > .panel:has(#mkt-body){grid-area:markets;display:flex;flex-direction:column;min-height:0;}
-.main > .col > .panel:has(#sig-feed){grid-area:signals;display:flex;flex-direction:column;min-height:0;}
-.main > .col > .panel:has(#fmp-movers){grid-area:movers;display:flex;flex-direction:column;min-height:0;}
+/* Assign each panel to its named slot via :has() on unique content ids.
+   List panels share a uniform 420px height so rows are always aligned;
+   their bodies scroll internally. Non-list panels size to their content
+   (align-items:start keeps them at their natural height). */
+#positions-panel{grid-area:positions;display:flex;flex-direction:column;height:420px;}
+.main > .col > .panel:has(.chart-wrap){grid-area:chart;display:flex;flex-direction:column;height:420px;}
+.main > .col > .panel:has(#mkt-body){grid-area:markets;display:flex;flex-direction:column;height:420px;}
+.main > .col > .panel:has(#sig-feed){grid-area:signals;display:flex;flex-direction:column;height:420px;}
+.main > .col > .panel:has(#fmp-movers){grid-area:movers;display:flex;flex-direction:column;height:420px;}
 #vmx-panel{grid-area:vmx;}
-.main > .col > .panel:has(#tlog){grid-area:trades;display:flex;flex-direction:column;min-height:0;}
+.main > .col > .panel:has(#tlog){grid-area:trades;display:flex;flex-direction:column;height:420px;}
 .main > .col > .panel:has(#port-val){grid-area:stats;}
 .main > .col > .panel:has(#fred-data){grid-area:fred;}
 .main > .col > .panel:has(#cbtc){grid-area:crypto;}
 .main > .col > .panel:has(#wtemp){grid-area:weather;}
-#backtest-panel{grid-area:backtest;display:flex;flex-direction:column;min-height:0;}
-#reviews-panel{grid-area:review;display:flex;flex-direction:column;min-height:0;}
-#calibration-panel{grid-area:calibration;display:flex;flex-direction:column;min-height:0;}
-#pretrade-panel{grid-area:pretrade;display:flex;flex-direction:column;min-height:0;}
+#backtest-panel{grid-area:backtest;display:flex;flex-direction:column;height:420px;}
+#reviews-panel{grid-area:review;display:flex;flex-direction:column;height:420px;}
+#calibration-panel{grid-area:calibration;display:flex;flex-direction:column;height:420px;}
+#pretrade-panel{grid-area:pretrade;display:flex;flex-direction:column;height:420px;}
 #spend-panel{grid-area:spend;}
 .panel.panel-term{grid-area:terminal;}
+
+/* Chart sizes to its card, not the other way around. */
+.chart-wrap{position:relative;width:100%;flex:1;min-height:0;}
 
 /* Scrollable bodies inside list panels so they don't overflow the row. */
 #positions-panel > #positions-list{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
 .main > .col > .panel:has(#mkt-body) > table{display:block;overflow-y:auto;flex:1;min-height:0;scrollbar-width:thin;}
 .main > .col > .panel:has(#fmp-movers) > #fmp-movers{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;}
+.main > .col > .panel:has(#sig-feed) > #sig-feed{flex:1;min-height:0;overflow-y:auto;}
+.main > .col > .panel:has(#tlog) > #tlog{flex:1;min-height:0;overflow-y:auto;max-height:none;}
 #backtest-body,#review-body,#calibration-body{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
+
+/* Empty-state placeholders get vertically centered so empty cards
+   don't show a short line of text marooned at the top with a void
+   underneath it. Targets the single-child "waiting…" / "no data"
+   placeholders used by Live Signals, Market Movers, Trade History. */
+#sig-feed > div:only-child,
+#fmp-movers > div:only-child,
+#tlog > div:only-child{
+  flex:1;display:flex;align-items:center;justify-content:center;
+  min-height:180px;color:var(--text3);font-size:11px;letter-spacing:0.5px;
+}
 
 /* Tablet: collapse to 2 columns, reorder areas one row at a time. */
 @media(max-width:1200px){
@@ -172,7 +192,8 @@ body[data-theme="light"] .panel{box-shadow:var(--hero-shadow);}
 .g{color:var(--green);}.r{color:var(--red);}.b{color:var(--blue);}.o{color:var(--accent);}.y{color:var(--accent2);}.p{color:var(--purple);}
 .big-num{font-family:var(--mono);font-size:32px;font-weight:500;letter-spacing:-1px;line-height:1;margin:4px 0;}
 .sub-num{font-size:11px;color:var(--text2);font-family:var(--mono);}
-.chart-wrap{position:relative;width:100%;height:100%;min-height:320px;flex:1;}
+/* Kept for mobile / fallback use when not in the flex-column chart panel. */
+.chart-wrap-legacy{position:relative;width:100%;height:200px;}
 .chart-wrap canvas{position:absolute;top:0;left:0;width:100%!important;height:100%!important;}
 .cf{padding:2px 10px;border-radius:2px;border:1px solid var(--border2);font-family:var(--mono);font-size:10px;cursor:pointer;background:transparent;color:var(--text2);letter-spacing:1px;}
 .cf.on{background:var(--accent);border-color:var(--accent);color:#000;font-weight:500;}
@@ -856,6 +877,12 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
         <div class="vmx-cell"><div class="vmx-sym">BTC</div><div class="vmx-val" id="vmx-btc">—</div></div>
         <div class="vmx-cell"><div class="vmx-sym">ETH</div><div class="vmx-val" id="vmx-eth">—</div></div>
         <div class="vmx-cell"><div class="vmx-sym">SOL</div><div class="vmx-val" id="vmx-sol">—</div></div>
+        <div class="vmx-cell"><div class="vmx-sym">NVDA</div><div class="vmx-val" id="vmx-nvda">—</div></div>
+        <div class="vmx-cell"><div class="vmx-sym">MSFT</div><div class="vmx-val" id="vmx-msft">—</div></div>
+        <div class="vmx-cell"><div class="vmx-sym">META</div><div class="vmx-val" id="vmx-meta">—</div></div>
+        <div class="vmx-cell"><div class="vmx-sym">GOOG</div><div class="vmx-val" id="vmx-goog">—</div></div>
+        <div class="vmx-cell"><div class="vmx-sym">AAPL</div><div class="vmx-val" id="vmx-aapl">—</div></div>
+        <div class="vmx-cell"><div class="vmx-sym">TSLA</div><div class="vmx-val" id="vmx-tsla">—</div></div>
       </div>
       <div class="vmx-scale">
         <span>CALM</span><span class="vmx-scale-bar"></span><span>HOT</span>
@@ -1767,6 +1794,14 @@ function syncVmx(){
   [['vmx-btc','cbtcc'],['vmx-eth','cethc'],['vmx-sol','csolc']].forEach(([dst,src])=>{
     const pct=_parseChgPct((document.getElementById(src)||{}).innerHTML);
     if(pct!=null){const mag=Math.abs(pct);_vmxSet(dst,(pct>=0?'+':'')+pct.toFixed(1)+'%',mag<2?1:mag<5?2:3);}
+  });
+  // Trending stocks — pulled from the FMP cache populated by fetchFMP().
+  const fmp=(typeof _fmpCache!=='undefined'&&_fmpCache)||{};
+  [['vmx-nvda','NVDA'],['vmx-msft','MSFT'],['vmx-meta','META'],['vmx-goog','GOOG'],['vmx-aapl','AAPL'],['vmx-tsla','TSLA']].forEach(([dst,tkr])=>{
+    const q=fmp[tkr];if(!q||q.change_pct==null)return;
+    const pct=parseFloat(q.change_pct);if(isNaN(pct))return;
+    const mag=Math.abs(pct);
+    _vmxSet(dst,(pct>=0?'+':'')+pct.toFixed(1)+'%',mag<2?1:mag<5?2:3);
   });
   // Update "N HOT" counter — neutral pill when 0, amber pill when any cell is hot.
   const hot=document.querySelectorAll('#vmx-grid .vmx-cell.hot').length;
