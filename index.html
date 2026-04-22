@@ -809,10 +809,10 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
     <div class="panel">
       <div class="panel-title">P&amp;L OVER TIME
         <div style="display:flex;gap:6px">
-          <button class="cf on" onclick="setFilter('1D',this)">1D</button>
+          <button class="cf" onclick="setFilter('1D',this)">1D</button>
           <button class="cf" onclick="setFilter('1W',this)">1W</button>
           <button class="cf" onclick="setFilter('1M',this)">1M</button>
-          <button class="cf" onclick="setFilter('ALL',this)">ALL</button>
+          <button class="cf on" onclick="setFilter('ALL',this)">ALL</button>
         </div>
       </div>
       <div class="chart-wrap">
@@ -1279,7 +1279,7 @@ const BOT=`${location.protocol}//${location.host}`;
   };
 })();
 
-let pnlChart=null,allTrades=[],activeFilter='1D',_totalPnl=0,_lastSigTime=null,_lastTradeTime=null;
+let pnlChart=null,allTrades=[],activeFilter='ALL',_totalPnl=0,_lastSigTime=null,_lastTradeTime=null;
 let _allSignals=[],_actFilter='all',_logFilter='all',_allLogs=[];
 
 function safeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
