@@ -46,24 +46,34 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .page{display:none;}
 .page.active{display:block;}
 /* ── DASHBOARD LAYOUT ── */
-/* Fixed 4-column grid with explicit spans per panel, BFO-style.
-   Legacy .col wrappers neutralised via display:contents so panels
-   bubble directly into .main as grid items. Each panel is assigned
-   both its column span (how wide it reads) and its flex order (how
-   early it appears) via :has() selectors — no HTML tagging needed. */
-.main{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;padding:12px;background:var(--bg);align-items:start;}
+/* Fixed 4-column grid with explicit spans per panel. Spans are tuned
+   so each "row" of cards sums to exactly 4 (e.g. positions-2 + chart-2,
+   markets-2 + signals-2, movers-2 + vmx-1 + tlog-1, four quarters, etc).
+   grid-auto-flow:dense lets single-width panels backfill any gaps
+   left over when an odd-sized card doesn't fit the remaining space. */
+.main{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));grid-auto-flow:dense;gap:12px;padding:12px;background:var(--bg);align-items:start;}
 .col{display:contents;}
 .col > .panel{border-bottom:none;}
 .main .panel[style*="flex:1"]{flex:unset;}
 
 /* Every panel gets an explicit span. Defaults to 1 (quarter width). */
 .main > .col > .panel{grid-column:span 1;}
-.main > .col > .panel:has(.chart-wrap){grid-column:span 3;}       /* P&L chart — big hero */
-.main > .col > .panel:has(#mkt-body){grid-column:span 2;}          /* Active Markets */
-#positions-panel{grid-column:span 2;}                              /* Open Positions + Conviction */
-.main > .col > .panel:has(#sig-feed){grid-column:span 2;}          /* Live Signals */
-.main > .col > .panel:has(#fmp-movers){grid-column:span 2;}        /* Market Movers */
-.panel.panel-term{grid-column:1/-1;}                               /* Terminal — always full */
+/* Row 1 (hero): positions + chart */
+#positions-panel{grid-column:span 2;}
+.main > .col > .panel:has(.chart-wrap){grid-column:span 2;}
+/* Row 2: markets + signals */
+.main > .col > .panel:has(#mkt-body){grid-column:span 2;}
+.main > .col > .panel:has(#sig-feed){grid-column:span 2;}
+/* Row 3: movers-2 + vmx-1 + trade history-1 */
+.main > .col > .panel:has(#fmp-movers){grid-column:span 2;}
+/* Row 4: four quarters (stats + fred + crypto + weather) — span 1 default */
+/* Row 5: backtest-2 + reviews-1 + calibration-1 */
+#backtest-panel{grid-column:span 2;}
+/* Row 6: pretrade-2 + spend-2 */
+#pretrade-panel{grid-column:span 2;}
+#spend-panel{grid-column:span 2;}
+/* Footer: terminal spans everything */
+.panel.panel-term{grid-column:1/-1;}
 
 /* Visual order. Primary trading content first, AI panels last. */
 #positions-panel{order:1;}
