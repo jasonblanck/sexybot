@@ -11,9 +11,9 @@ import asyncio
 import json
 import logging
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Deque, Optional, Tuple
 
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -27,6 +27,8 @@ PING_INTERVAL    = 20.0
 PING_TIMEOUT     = 10.0
 OBI_DEPTH        = 5
 STALE_THRESHOLD  = 30.0
+MID_HISTORY_LEN  = 60      # last 60 mid observations for volatility estimation
+MIN_VAMP_VOL     = 0.5     # min outcome-token volume on each side before VAMP is trusted
 
 
 @dataclass
@@ -37,11 +39,14 @@ class Level:
 
 @dataclass
 class BookSnapshot:
-    token_id:  str
-    bids:      list[Level] = field(default_factory=list)
-    asks:      list[Level] = field(default_factory=list)
-    timestamp: float       = field(default_factory=time.time)
-    sequence:  int         = 0
+    token_id:    str
+    bids:        list[Level] = field(default_factory=list)
+    asks:        list[Level] = field(default_factory=list)
+    timestamp:   float       = field(default_factory=time.time)
+    sequence:    int         = 0
+    # (ts, mid) observations used for volatility / regime estimation.
+    # Populated by OrderBook.snapshot(); default empty for hand-built snapshots in tests.
+    mid_history: list[Tuple[float, float]] = field(default_factory=list)
 
     @property
     def best_bid(self) -> Optional[float]:
@@ -62,21 +67,20 @@ class BookSnapshot:
         """
         Volume-Adjusted Mid Price — depth-weighted average across both sides.
 
-        Uses the VWAP of the top-5 bid levels and the top-5 ask levels, then
-        averages them. More accurate than simple mid when one side is thicker:
-        e.g. if bids are concentrated near the ask, VAMP > mid, correctly
-        signalling a higher fair value.
-
-        Falls back to simple mid if either side is empty.
+        Returns None (not mid) when either side lacks meaningful volume.
+        This prevents a stale/phantom book — one with zero-size top levels
+        or only one side populated — from silently producing a mid-price
+        signal that callers would treat as reliable. Call sites that still
+        want a best-effort fallback use the `book.vamp or book.mid` idiom.
         """
         bid_lvs = self.bids[:5]
         ask_lvs = self.asks[:5]
         if not bid_lvs or not ask_lvs:
-            return self.mid
+            return None
         bid_total = sum(lv.size for lv in bid_lvs)
         ask_total = sum(lv.size for lv in ask_lvs)
-        if bid_total == 0 or ask_total == 0:
-            return self.mid
+        if bid_total < MIN_VAMP_VOL or ask_total < MIN_VAMP_VOL:
+            return None
         bid_vwap = sum(lv.price * lv.size for lv in bid_lvs) / bid_total
         ask_vwap = sum(lv.price * lv.size for lv in ask_lvs) / ask_total
         return round((bid_vwap + ask_vwap) / 2, 6)
@@ -106,6 +110,46 @@ class BookSnapshot:
     def ask_depth(self, levels: int = 5) -> float:
         return sum(lv.price * lv.size for lv in self.asks[:levels])
 
+    @property
+    def book_depth_usdc(self) -> Optional[float]:
+        """Combined USDC notional on top-5 levels both sides. None if a side is empty."""
+        if not self.bids or not self.asks:
+            return None
+        return round(self.bid_depth(5) + self.ask_depth(5), 4)
+
+    @property
+    def mid_volatility(self) -> Optional[float]:
+        """
+        Rolling stddev of recent mid observations (fraction units, e.g. 0.012 = 1.2c).
+        Returns None until we have enough history (≥8 points).
+        Used to shrink Kelly / widen exit bands in choppy markets.
+        """
+        if len(self.mid_history) < 8:
+            return None
+        mids = [m for _, m in self.mid_history]
+        mean = sum(mids) / len(mids)
+        var  = sum((m - mean) ** 2 for m in mids) / len(mids)
+        return round(var ** 0.5, 6)
+
+    def recent_obi_trend(self, window_sec: float = 30.0) -> Optional[float]:
+        """
+        Approximate recent OBI direction as a simple signed momentum:
+        (newest_mid - oldest_mid_in_window) / oldest_mid.
+        Positive → bid-side pressure; negative → ask-side pressure.
+        Returns None if history too short.
+        """
+        if len(self.mid_history) < 4:
+            return None
+        now = time.time()
+        windowed = [(t, m) for t, m in self.mid_history if now - t <= window_sec]
+        if len(windowed) < 4:
+            return None
+        oldest = windowed[0][1]
+        newest = windowed[-1][1]
+        if oldest <= 0:
+            return None
+        return round((newest - oldest) / oldest, 6)
+
 
 class OrderBook:
     def __init__(self, token_id: str):
@@ -114,11 +158,21 @@ class OrderBook:
         self._asks:    dict[float, float] = {}
         self._seq:     int   = 0
         self._updated: float = 0.0
+        # Bounded mid-price history for volatility estimation.
+        self._mid_history: Deque[Tuple[float, float]] = deque(maxlen=MID_HISTORY_LEN)
+
+    def _record_mid(self) -> None:
+        """Append current (ts, mid) if both sides are populated with real volume."""
+        bb = next((p for p, s in sorted(self._bids.items(), reverse=True) if s > 0), None)
+        ba = next((p for p, s in sorted(self._asks.items())               if s > 0), None)
+        if bb is not None and ba is not None:
+            self._mid_history.append((time.time(), (bb + ba) / 2))
 
     def _apply_snapshot(self, bids: list[dict], asks: list[dict]) -> None:
         self._bids = {float(b["price"]): float(b["size"]) for b in bids}
         self._asks = {float(a["price"]): float(a["size"]) for a in asks}
         self._updated = time.time()
+        self._record_mid()
 
     def _apply_delta(self, changes: list[dict]) -> None:
         for ch in changes:
@@ -130,16 +184,18 @@ class OrderBook:
             else:
                 book[price] = size
         self._updated = time.time()
+        self._record_mid()
 
     def snapshot(self) -> BookSnapshot:
         bids = [Level(p, s) for p, s in sorted(self._bids.items(), reverse=True) if s > 0]
         asks = [Level(p, s) for p, s in sorted(self._asks.items())               if s > 0]
         return BookSnapshot(
-            token_id  = self.token_id,
-            bids      = bids,
-            asks      = asks,
-            timestamp = self._updated,
-            sequence  = self._seq,
+            token_id    = self.token_id,
+            bids        = bids,
+            asks        = asks,
+            timestamp   = self._updated,
+            sequence    = self._seq,
+            mid_history = list(self._mid_history),
         )
 
 

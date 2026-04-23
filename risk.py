@@ -345,6 +345,49 @@ class BalanceErrorCircuitBreaker:
         return True
 
 
+@dataclass
+class MarketRegime:
+    """
+    Lightweight regime descriptor used to scale Kelly fraction and exit bands.
+
+    All fields are optional — missing fields are treated as "benign" (no scaling).
+    """
+    book_depth_usdc:          Optional[float] = None   # top-5 both sides, USDC
+    mid_volatility:           Optional[float] = None   # stddev of recent mids
+    spread_cents:             Optional[float] = None
+    time_to_resolution_hours: Optional[float] = None
+
+    @property
+    def multiplier(self) -> float:
+        """
+        Scale factor in [0.25, 1.0] applied to kelly_fraction.
+
+        Shrink in adverse conditions:
+          • Thin books  (depth < $500)           → 0.50x
+          • Thinnish    (depth $500–$1500)       → 0.75x
+          • High vol    (mid stddev > 2c)        → 0.50x
+          • Medium vol  (mid stddev > 1c)        → 0.75x
+          • Wide spread (> 1.0c)                 → 0.75x
+          • Near resolution (< 6h)               → 0.50x  — oracle/black-swan risk
+        """
+        mult = 1.0
+        if self.book_depth_usdc is not None:
+            if self.book_depth_usdc < 500:
+                mult *= 0.50
+            elif self.book_depth_usdc < 1500:
+                mult *= 0.75
+        if self.mid_volatility is not None:
+            if self.mid_volatility > 0.02:
+                mult *= 0.50
+            elif self.mid_volatility > 0.01:
+                mult *= 0.75
+        if self.spread_cents is not None and self.spread_cents > 1.0:
+            mult *= 0.75
+        if self.time_to_resolution_hours is not None and self.time_to_resolution_hours < 6:
+            mult *= 0.50
+        return round(max(0.25, min(1.0, mult)), 3)
+
+
 def kelly_size(
     true_prob:  float,
     price:      float,
@@ -354,20 +397,22 @@ def kelly_size(
     max_size:       float = 10.0,
     min_size:       float = 1.0,
     max_pct_of_balance: float = 0.05,
+    signal_strength:    float = 1.0,
+    regime:             Optional[MarketRegime] = None,
 ) -> float:
     """
     Quarter-Kelly position sizing for a binary prediction market.
 
     Formula (buying YES at `price`):
         f* = (true_prob - price) / (1 - price)
-        bet = f* × kelly_fraction × balance
+        effective_fraction = kelly_fraction × signal_strength × regime.multiplier
+        bet = f* × effective_fraction × balance
 
-    The Quarter Kelly (kelly_fraction=0.25) caps exposure at 25% of the
-    theoretical full-Kelly bet, protecting against model overconfidence and
-    undetected oracle risk ("black swan" resolution disputes).
+    `signal_strength` ∈ [0,1] scales the bet by model conviction — pure-OBI
+    signals use ~0.3, spike-only ~0.6, spike+OBI-aligned ~1.0.
 
-    `max_pct_of_balance` hard-caps the bet at a fraction of the wallet to
-    keep single-loss impact bounded when the payoff ratio is poor.
+    `regime` shrinks the bet in thin / volatile / short-horizon markets where
+    execution quality and resolution risk are both worse.
 
     Returns 0.0 when there is no positive edge.
     """
@@ -376,11 +421,56 @@ def kelly_size(
     edge = true_prob - price
     if edge <= 0:
         return 0.0
+
+    regime_mult = regime.multiplier if regime is not None else 1.0
+    effective_fraction = kelly_fraction * max(0.0, min(1.0, signal_strength)) * regime_mult
+
     full_kelly = edge / (1.0 - price)
-    size = full_kelly * kelly_fraction * balance
+    size = full_kelly * effective_fraction * balance
     ceiling = min(max_size, max(min_size, balance * max_pct_of_balance))
     size = min(size, ceiling)
     if size < min_size:
         return 0.0
     return round(size, 2)
+
+
+def dynamic_exit_levels(
+    entry_price: float,
+    *,
+    base_profit: float = 0.08,
+    base_stop:   float = 0.05,
+    regime:      Optional[MarketRegime] = None,
+) -> tuple[float, float]:
+    """
+    Return (profit_target, stop_loss) as positive fractions of entry_price.
+
+    Scaling rules:
+      • Near tails (|entry_price − 0.5| > 0.35, i.e. below 0.15 or above 0.85)
+        small absolute price moves produce large *relative* swings, so both
+        target and stop are widened to avoid exiting on noise.
+      • In high-volatility regimes (mid stddev > 1c) both bands are widened
+        proportionally so normal chop doesn't trigger exits.
+      • Values are clamped to sensible bounds — profit ≤ 50%, stop ≤ 25%.
+    """
+    tail_distance = min(entry_price, 1.0 - entry_price)
+
+    if tail_distance < 0.15:
+        profit = base_profit * 2.0
+        stop   = base_stop   * 1.5
+    elif tail_distance < 0.30:
+        profit = base_profit * 1.25
+        stop   = base_stop   * 1.10
+    else:
+        profit = base_profit
+        stop   = base_stop
+
+    if regime is not None and regime.mid_volatility is not None:
+        vol_scale = 1.0 + min(2.0, regime.mid_volatility / 0.01)   # cap at 3×
+        profit *= vol_scale
+        stop   *= vol_scale
+
+    return (
+        round(max(0.02, min(0.50, profit)), 4),
+        round(max(0.02, min(0.25, stop)),   4),
+    )
 

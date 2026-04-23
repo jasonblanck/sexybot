@@ -361,6 +361,20 @@ class ClobExecutor:
             fill_price=price, token_qty=token_qty,
         )
 
+    def get_order(self, order_id: str) -> Optional[dict]:
+        """
+        Return the current state of an order (price, status, size, size_matched),
+        or None if lookup fails or we're in dry-run. Used by the MarketMaker to
+        detect fills without waiting for WebSocket trade events.
+        """
+        if self._dry_run or order_id in (None, "", "DRY_RUN"):
+            return None
+        try:
+            return self._client.get_order(order_id)
+        except Exception as exc:
+            log.debug("get_order(%s) failed: %s", order_id, exc)
+            return None
+
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a single open order by ID."""
         if self._dry_run:
