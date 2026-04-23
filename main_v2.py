@@ -20,6 +20,7 @@ from typing import Optional
 import requests
 from pydantic import BaseModel, field_validator
 
+from calibrator import Calibrator, RegimeReader, RegimeState, record_prediction
 from discovery import MarketFilter, PolyMarket, fetch_markets
 from executor import ClobExecutor
 from market_maker import MarketMaker
@@ -97,6 +98,17 @@ MM_ORDER_SIZE  = float(os.getenv("MM_ORDER_SIZE",  "5.0"))    # USDC per side pe
 # Drawdown kill-switch — inherited from risk.py env vars but logged here for clarity
 # MAX_DRAWDOWN_USD (default $50): halt if balance drops this much from recent peak
 # DRAWDOWN_WINDOW  (default 600s): rolling window for peak measurement
+
+# Brier-score calibration and regime wiring
+# CALIBRATOR_ENABLED    — apply learned bias correction to true_prob (default on)
+# CALIBRATION_DB_PATH   — overridable in calibrator.py; default = ./trades.db
+# REGIME_RESPECT        — if true, main_v2 respects bot.py's regime_log decisions:
+#                          normal   → no change
+#                          cautious → Kelly × 0.5, skip OBI-only tier
+#                          hostile  → skip momentum entirely this cycle
+CALIBRATOR_ENABLED    = os.getenv("CALIBRATOR_ENABLED", "true").lower() == "true"
+CALIBRATION_SOURCE    = os.getenv("CALIBRATION_SOURCE", "momentum_v2")
+REGIME_RESPECT        = os.getenv("REGIME_RESPECT", "true").lower() == "true"
 
 
 # ── Signal schema ──────────────────────────────────────────────────────────────
@@ -266,8 +278,9 @@ def _detect_volume_spike(trades: list[dict]) -> VolumeSpike:
 
 
 async def estimate_true_probability(
-    market: PolyMarket,
-    book:   BookSnapshot,
+    market:     PolyMarket,
+    book:       BookSnapshot,
+    calibrator: Optional[Calibrator] = None,
 ) -> Optional[Signal]:
     """
     Tiered momentum + OBI signal model.
@@ -340,21 +353,35 @@ async def estimate_true_probability(
     conf_boost = (confidence / 100.0) * 0.12
 
     if dominant_side == "YES":
-        true_prob = min(yes_price + conf_boost, 0.97)
-        side      = OrderSide.BUY
-        edge      = true_prob - (book.best_ask or yes_price)
+        raw_true_prob = min(yes_price + conf_boost, 0.97)
+        side          = OrderSide.BUY
     else:
-        true_prob = max(yes_price - conf_boost, 0.03)
-        side      = OrderSide.SELL
-        edge      = (book.best_bid or yes_price) - true_prob
+        raw_true_prob = max(yes_price - conf_boost, 0.03)
+        side          = OrderSide.SELL
+
+    # Apply calibration (if enabled and we have enough resolved-prediction
+    # history to have learned the model's bias). The calibrator shrinks
+    # overconfident tails toward 0.5; under-confident middle predictions
+    # are nudged outward. No-op when the DB / calibration data is missing.
+    true_prob = calibrator.adjust(raw_true_prob) if calibrator is not None else raw_true_prob
+
+    if side == OrderSide.BUY:
+        edge = true_prob - (book.best_ask or yes_price)
+    else:
+        edge = (book.best_bid or yes_price) - true_prob
 
     if edge < MIN_EDGE:
         return None
 
+    calibration_note = (
+        f" cal={raw_true_prob:.3f}→{true_prob:.3f}"
+        if calibrator is not None and abs(raw_true_prob - true_prob) > 1e-4
+        else ""
+    )
     log.info(
-        "SIGNAL | %s  side=%s  prob=%.3f  vamp=%.3f  edge=%.3f  obi=%+.3f  src=%s  str=%.2f",
+        "SIGNAL | %s  side=%s  prob=%.3f  vamp=%.3f  edge=%.3f  obi=%+.3f  src=%s  str=%.2f%s",
         market.question[:55], dominant_side, true_prob, yes_price,
-        edge, obi, source, strength,
+        edge, obi, source, strength, calibration_note,
     )
     return Signal(true_prob=true_prob, side=side, strength=strength, source=source)
 
@@ -368,10 +395,12 @@ async def strategy_loop(
     last_traded:    dict[str, float],       # persisted across restarts by caller
     cycle_count:    list[int],              # [0] mutable int, persisted across restarts
     open_positions: dict[str, "Position"],  # token_id → Position; persisted across restarts
-    redeemer:       Optional[PositionRedeemer]        = None,
-    market_maker:   Optional[MarketMaker]             = None,
-    drawdown_guard: Optional[DrawdownGuard]           = None,
+    redeemer:       Optional[PositionRedeemer]            = None,
+    market_maker:   Optional[MarketMaker]                 = None,
+    drawdown_guard: Optional[DrawdownGuard]               = None,
     balance_breaker: Optional[BalanceErrorCircuitBreaker] = None,
+    calibrator:     Optional[Calibrator]                  = None,
+    regime_reader:  Optional[RegimeReader]                = None,
 ) -> None:
     # Give WebSocket connections time to receive initial snapshots for all tokens
     log.info("Waiting 10s for WebSocket order books to populate…")
@@ -436,6 +465,35 @@ async def strategy_loop(
                     log.info("REDEEMER: %d on-chain transaction(s) sent", claimed)
             except Exception as exc:
                 log.warning("REDEEMER error (non-fatal): %s", exc)
+
+        # ── Regime gate ─────────────────────────────────────────────────────────
+        # bot.py's Claude regime detector writes to regime_log. We read the latest
+        # entry here and use it to throttle or halt risk-taking.  No-op when the
+        # detector is disabled or the DB is missing — behaviour then matches the
+        # pre-integration baseline.
+        regime_state: Optional[RegimeState] = (
+            regime_reader.current() if (regime_reader is not None and REGIME_RESPECT) else None
+        )
+        regime_kelly_scale = 1.0
+        skip_obi_only     = False
+        if regime_state is not None:
+            if regime_state.is_hostile:
+                log.warning(
+                    "REGIME HOSTILE (age=%.0fs) — skipping momentum trades this cycle: %s",
+                    regime_state.age_sec, (regime_state.reasoning or "")[:120],
+                )
+                regime_kelly_scale = 0.0    # disables momentum entries; exits still run
+            elif regime_state.is_cautious:
+                regime_kelly_scale = 0.5
+                skip_obi_only     = True
+                log.info(
+                    "REGIME CAUTIOUS — Kelly × 0.5, OBI-only signals skipped: %s",
+                    (regime_state.reasoning or "")[:120],
+                )
+            # If bot.py supplied an explicit kelly_mult, honour it (it may be
+            # tighter than our rule-based scaling).
+            if regime_state.kelly_mult is not None:
+                regime_kelly_scale = min(regime_kelly_scale, float(regime_state.kelly_mult))
 
         # ── Market Making: two-sided quoting + circuit breaker ──────────────────
         if market_maker is not None:
@@ -515,8 +573,16 @@ async def strategy_loop(
                 continue
             live.append((mkt, yes_book))
 
+        # Hostile regime — run exits above, but don't open new positions.
+        if regime_kelly_scale == 0.0:
+            await asyncio.sleep(SCAN_INTERVAL)
+            continue
+
         # Run all signal estimates concurrently (each fires one HTTP request)
-        signal_tasks = [estimate_true_probability(mkt, book) for mkt, book in live]
+        signal_tasks = [
+            estimate_true_probability(mkt, book, calibrator=calibrator)
+            for mkt, book in live
+        ]
         signal_results = await asyncio.gather(*signal_tasks, return_exceptions=True)
 
         for (mkt, _yes_book), result in zip(live, signal_results):
@@ -529,6 +595,12 @@ async def strategy_loop(
             signal: Signal = result   # type: ignore[assignment]
             true_prob = signal.true_prob
             side      = signal.side
+
+            # In cautious regime, drop the weakest (pure-OBI) tier entirely.
+            if skip_obi_only and signal.source == "obi":
+                log.debug("CAUTIOUS REGIME skipping OBI-only signal on %s",
+                          mkt.question[:40])
+                continue
 
             # On Polymarket you can only BUY tokens you don't yet own.
             # A bearish (NO) signal means BUY NO tokens, not SELL YES tokens.
@@ -563,7 +635,10 @@ async def strategy_loop(
             kelly_dollars = kelly_size(
                 trade_prob, trade_price,
                 cycle_balance.balance if cycle_balance else MAX_ORDER_SIZE,
-                kelly_fraction  = KELLY_FRACTION,
+                # Regime scale is applied on top of the static KELLY_FRACTION so
+                # a macro-cautious call from the detector further throttles sizing
+                # even when book-level regime multiplier would allow more.
+                kelly_fraction  = KELLY_FRACTION * regime_kelly_scale,
                 max_size        = MAX_ORDER_SIZE,
                 signal_strength = signal.strength,
                 regime          = regime,
@@ -645,6 +720,24 @@ async def strategy_loop(
                         "EXIT BANDS | %s  entry=%.4f profit=+%.1f%% stop=-%.1f%%",
                         mkt.question[:45], result.fill_price, pt * 100, sl * 100,
                     )
+                    # Persist the prediction to brier_scores so the Calibrator
+                    # has fresh training data for future cycles. Best-effort —
+                    # a DB error here never blocks trading.
+                    try:
+                        await asyncio.to_thread(
+                            record_prediction,
+                            source         = CALIBRATION_SOURCE,
+                            market         = mkt.question,
+                            token_id       = trade_token_id,
+                            side           = "BUY",
+                            predicted_prob = trade_prob,
+                            market_price   = result.fill_price,
+                            kelly_fraction = KELLY_FRACTION * regime_kelly_scale,
+                            kelly_size     = kelly_dollars,
+                            ai_reasoning   = f"src={signal.source} strength={signal.strength:.2f}",
+                        )
+                    except Exception as exc:
+                        log.debug("record_prediction failed: %s", exc)
                 log.info(
                     "EXECUTED | %s  id=%s  status=%s  entry=%.4f  qty=%.4f",
                     mkt.question[:55], result.order_id, result.status,
@@ -666,6 +759,11 @@ async def main() -> None:
         "Exits | base_profit=%.1f%% base_stop=%.1f%% max_hold=%dm",
         MIN_EDGE, OBI_SOLO_MIN, MIN_BOOK_DEPTH_USDC,
         PROFIT_TARGET * 100, STOP_LOSS * 100, MAX_HOLD_SEC // 60,
+    )
+    log.info(
+        "Learning loop | calibrator=%s source=%s regime_respect=%s",
+        "on" if CALIBRATOR_ENABLED else "off",
+        CALIBRATION_SOURCE, REGIME_RESPECT,
     )
 
     # 1. Discover markets
@@ -730,6 +828,12 @@ async def main() -> None:
     # 4. Run WebSocket + strategy concurrently
     # strategy_loop is isolated — an exception there won't cancel book_manager.
     # last_traded and cycle_count live here so they survive strategy_loop restarts.
+    # Calibrator + regime reader are lazy-safe: they silently no-op when
+    # trades.db is missing, which is the expected state on a fresh install
+    # or a local dev machine.
+    calibrator    = Calibrator(source=CALIBRATION_SOURCE) if CALIBRATOR_ENABLED else None
+    regime_reader = RegimeReader() if REGIME_RESPECT else None
+
     async def _strategy_with_restart() -> None:
         last_traded:    dict[str, float]    = {}
         open_positions: dict[str, Position] = {}
@@ -746,6 +850,8 @@ async def main() -> None:
                     market_maker    = market_maker,
                     drawdown_guard  = drawdown_guard,
                     balance_breaker = balance_breaker,
+                    calibrator      = calibrator,
+                    regime_reader   = regime_reader,
                 )
             except DrawdownHalt as exc:
                 # Cancel all outstanding orders before halting.
