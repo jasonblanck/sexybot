@@ -3,6 +3,10 @@ Polymarket Trading Bot — fixed for py_clob_client v0.34+
 """
 import asyncio, json, logging, os, time, sqlite3, re as _re_mod
 from datetime import datetime, date
+# Brier-score self-calibration helper. Reads historical predicted_prob vs
+# actual_outcome from brier_scores and shrinks future predictions toward
+# the realized base rate. Silent no-op until there are ≥30 resolved rows.
+from calibrator import Calibrator
 from typing import Optional
 from dotenv import load_dotenv
 import urllib.request as _ureq
@@ -327,6 +331,17 @@ class PolymarketBot:
             "assessed_at": None,
         }
         self._regime_cache_time: float = 0.0
+        # Brier-score calibrator — self-corrects predicted_prob bias learned
+        # from resolved history. source='default' reads ALL rows in brier_scores
+        # (including pre-migration rows with NULL source) so the bot starts
+        # benefiting from historical data on day one without a source backfill.
+        # Controlled by CALIBRATOR_ENABLED (default on); can be flipped off
+        # without a restart by setting self._calibrator = None at runtime.
+        self._calibrator: Optional[Calibrator] = (
+            Calibrator(source=os.getenv("CALIBRATION_SOURCE", "default"))
+            if os.getenv("CALIBRATOR_ENABLED", "true").lower() == "true"
+            else None
+        )
         # Nightly review task handle — guarantees a single live reviewer loop
         self._nightly_review_task: Optional[asyncio.Task] = None
         self._last_review_at: float = 0.0
@@ -4813,6 +4828,20 @@ class PolymarketBot:
                         # Conservative estimate: blend market price with confidence signal
                         conf_boost = float(signal.get("confidence", 50)) / 100.0 * 0.10
                         p_true = min(entry_price + conf_boost, 0.99)
+
+                    # ── Brier-score calibration ───────────────────────────────
+                    # Shrink predictions toward the realized base rate in
+                    # proportion to the historical bias measured from our own
+                    # resolved brier_scores. No-op until ≥30 resolved rows.
+                    # Only affects sizing, not the signal/direction.
+                    if self._calibrator is not None:
+                        p_raw   = p_true
+                        p_true  = self._calibrator.adjust(p_true)
+                        if abs(p_raw - p_true) > 1e-4:
+                            sig_record["calibration"] = {
+                                "raw":      round(p_raw,  4),
+                                "adjusted": round(p_true, 4),
+                            }
 
                     # ── Minimum edge gate (volatility-adjusted) ──────────────
                     raw_edge = p_true - entry_price

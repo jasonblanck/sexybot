@@ -59,18 +59,25 @@ REQUOTE_TICK         = 0.01    # min mid movement that triggers a cancel-replace
 MIN_SPREAD_TO_QUOTE  = 0.005   # don't quote if market spread is already < 0.5 c
 MAX_MID_FOR_MM       = 0.80    # don't quote above 80 % (too close to resolution)
 MIN_MID_FOR_MM       = 0.20    # don't quote below 20 %
+# Adverse-selection guard: if OBI moves hard against a standing leg, informed
+# flow is likely about to hit it — cancel before we become the exit liquidity.
+ADVERSE_OBI_THRESHOLD = 0.55   # |OBI| above which a standing opposite-side leg is pulled
 
 
 @dataclass
 class MMState:
     """Per-market state for the market maker."""
-    yes_order_id:  Optional[str] = None   # active BUY YES order id
-    no_order_id:   Optional[str] = None   # active BUY NO  order id
-    quote_mid:     Optional[float] = None # mid when quotes were last placed
-    yes_inventory: float = 0.0            # YES tokens accumulated from fills
-    no_inventory:  float = 0.0            # NO  tokens accumulated from fills
-    mid_history:   list  = field(default_factory=list)  # [(ts, mid), …]
-    paused_until:  float = 0.0            # epoch time — stay quiet until this
+    yes_order_id:     Optional[str]   = None   # active BUY YES order id
+    no_order_id:      Optional[str]   = None   # active BUY NO  order id
+    quote_mid:        Optional[float] = None   # mid when quotes were last placed
+    yes_inventory:    float = 0.0              # YES tokens confirmed filled
+    no_inventory:     float = 0.0              # NO  tokens confirmed filled
+    # Cumulative filled qty seen for the *currently-active* order id — used
+    # to compute fresh fills across poll cycles without double-counting.
+    yes_seen_filled:  float = 0.0
+    no_seen_filled:   float = 0.0
+    mid_history:      list  = field(default_factory=list)  # [(ts, mid), …]
+    paused_until:     float = 0.0              # epoch time — stay quiet until this
 
 
 class MarketMaker:
@@ -146,8 +153,9 @@ class MarketMaker:
 
     def record_fill(self, token_id: str, side: str, qty: float) -> None:
         """
-        Call this when a fill is confirmed so the inventory tracking stays
-        accurate.  side: 'yes' | 'no'
+        Manually record a confirmed fill. Normally fills are detected via
+        `_poll_fills()` in each cycle; this method is a public hook for
+        external fill events (e.g. a user-initiated trade).  side: 'yes' | 'no'
         """
         for yes_tid, state in self._states.items():
             if yes_tid == token_id or token_id.endswith(yes_tid[-8:]):
@@ -156,6 +164,44 @@ class MarketMaker:
                 else:
                     state.no_inventory  += qty
                 break
+
+    async def _poll_fills(self, state: MMState) -> None:
+        """
+        Poll the CLOB for the current state of each live leg and update
+        inventory tracking.  Called once per market per cycle, before
+        deciding whether to requote.  Silent on lookup errors — the next
+        cycle will retry.  Requires executor.get_order() (skipped in dry-run).
+        """
+        for side, order_attr, inv_attr, seen_attr in (
+            ("yes", "yes_order_id", "yes_inventory", "yes_seen_filled"),
+            ("no",  "no_order_id",  "no_inventory",  "no_seen_filled"),
+        ):
+            oid = getattr(state, order_attr)
+            if not oid or oid == "DRY_RUN":
+                continue
+            info = await asyncio.to_thread(self._ex.get_order, oid)
+            if not isinstance(info, dict):
+                continue
+            # Polymarket returns size_matched as a string decimal in outcome tokens.
+            try:
+                matched = float(info.get("size_matched", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            seen = getattr(state, seen_attr)
+            fresh = matched - seen
+            if fresh > 1e-6:
+                setattr(state, inv_attr, getattr(state, inv_attr) + fresh)
+                setattr(state, seen_attr, matched)
+                log.info(
+                    "MM FILL | side=%s token=%s… fresh=%.4f total inv(yes=%.4f no=%.4f)",
+                    side.upper(), oid[:12], fresh,
+                    state.yes_inventory, state.no_inventory,
+                )
+            # If the order is fully filled / terminal, drop the id so we requote next cycle.
+            status = (info.get("status") or "").lower()
+            if status in ("matched", "filled", "canceled", "cancelled", "expired"):
+                setattr(state, order_attr, None)
+                setattr(state, seen_attr, 0.0)
 
     # ── Internal ───────────────────────────────────────────────────────────────
 
@@ -171,6 +217,11 @@ class MarketMaker:
         # VAMP gives a depth-weighted fair value; fall back to simple mid
         mid = book.vamp or book.mid
         state = self._states.setdefault(mkt.yes_token_id, MMState())
+
+        # ── Poll fills so inventory (and therefore skewing) stays accurate.
+        # Must happen BEFORE we decide whether to cancel/replace so a freshly
+        # filled leg drops its id and we compute the new skewed quote.
+        await self._poll_fills(state)
 
         # Track mid history for circuit breaker
         now = time.time()
@@ -191,6 +242,34 @@ class MarketMaker:
             log.debug("MM PAUSED | %s  resumes in %.0fs",
                       mkt.question[:40], state.paused_until - now)
             return 0
+
+        # ── Adverse-selection cancel ──────────────────────────────────────────
+        # If order-book imbalance has drifted strongly against a standing leg,
+        # informed flow is about to hit it — pull the quote before becoming
+        # the exit liquidity for someone who knows more than we do.
+        actions_cancelled = 0
+        if state.yes_order_id and book.obi <= -ADVERSE_OBI_THRESHOLD:
+            log.info(
+                "MM ADVERSE (YES) | %s  obi=%+.3f — pulling bid",
+                mkt.question[:40], book.obi,
+            )
+            if state.yes_order_id != "DRY_RUN":
+                ok = await asyncio.to_thread(self._ex.cancel_order, state.yes_order_id)
+                if ok:
+                    actions_cancelled += 1
+            state.yes_order_id    = None
+            state.yes_seen_filled = 0.0
+        if state.no_order_id and book.obi >= ADVERSE_OBI_THRESHOLD:
+            log.info(
+                "MM ADVERSE (NO)  | %s  obi=%+.3f — pulling ask",
+                mkt.question[:40], book.obi,
+            )
+            if state.no_order_id != "DRY_RUN":
+                ok = await asyncio.to_thread(self._ex.cancel_order, state.no_order_id)
+                if ok:
+                    actions_cancelled += 1
+            state.no_order_id    = None
+            state.no_seen_filled = 0.0
 
         # ── Mid range guard ───────────────────────────────────────────────────
         if not (MIN_MID_FOR_MM <= mid <= MAX_MID_FOR_MM):
@@ -223,10 +302,10 @@ class MarketMaker:
         need_requote = (not has_quotes) or mid_drifted
 
         if not need_requote:
-            return 0
+            return actions_cancelled
 
         # ── Cancel stale quotes ───────────────────────────────────────────────
-        cancelled = await self._cancel_quotes(mkt, state)
+        cancelled = await self._cancel_quotes(mkt, state) + actions_cancelled
 
         # ── Compute skewed quotes ─────────────────────────────────────────────
         bid_price, no_bid_price = self._compute_quotes(mid, state)
