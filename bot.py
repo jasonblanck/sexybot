@@ -2815,6 +2815,12 @@ class PolymarketBot:
             }
             if CLAUDE_ADAPTIVE_THINK and ("sonnet" in CLAUDE_MODEL or "opus" in CLAUDE_MODEL):
                 api_kwargs["thinking"] = {"type": "adaptive"}
+                # Extended thinking is incompatible with a forced tool_choice:
+                # the API rejects the combination with HTTP 400 "Thinking may not
+                # be enabled when tool_choice forces tool use". Drop to auto —
+                # Sonnet reliably emits the tool call, and the text-parse
+                # fallback at the bottom of this function handles the rare miss.
+                api_kwargs["tool_choice"] = {"type": "auto"}
             try:
                 msg = await asyncio.to_thread(client.messages.create, **api_kwargs)
             except Exception as api_err:
@@ -3726,6 +3732,9 @@ class PolymarketBot:
             }
             if CLAUDE_ADAPTIVE_THINK and ("sonnet" in CLAUDE_MODEL or "opus" in CLAUDE_MODEL):
                 review_kwargs["thinking"] = {"type": "adaptive"}
+                # See analyze_with_claude for rationale: thinking + forced
+                # tool_choice is an API-level incompatibility, switch to auto.
+                review_kwargs["tool_choice"] = {"type": "auto"}
             try:
                 msg = await asyncio.to_thread(client.messages.create, **review_kwargs)
             except Exception as api_err:
