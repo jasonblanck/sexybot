@@ -228,6 +228,23 @@ class MarketFilter:
         ]
         return self
 
+    def exclude_keywords(self, keywords: list[str]) -> "MarketFilter":
+        """Drop markets whose question/slug contains any of the given substrings.
+        Polymarket's `category` field is unreliable — many political markets
+        come back as "other" — so a keyword filter on the question text is
+        the only way to actually skip a topic."""
+        lowered = [k.lower() for k in keywords if k]
+        if not lowered:
+            return self
+        self._markets = [
+            m for m in self._markets
+            if not any(
+                k in (m.question or "").lower() or k in (m.slug or "").lower()
+                for k in lowered
+            )
+        ]
+        return self
+
     def keyword(self, kw: str) -> "MarketFilter":
         kw_lower = kw.lower()
         self._markets = [

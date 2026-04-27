@@ -64,6 +64,11 @@ OBI_CONFIRM_MIN  = 0.20   # OBI must agree with signal direction
 OBI_SOLO_MIN     = float(os.getenv("OBI_SOLO_MIN", "0.55"))
 MIN_EDGE         = 0.03   # minimum probability edge to place a trade
 MIN_BOOK_DEPTH_USDC = float(os.getenv("MIN_BOOK_DEPTH_USDC", "200"))  # skip threadbare books
+# Hard ceiling on the *side we're buying*. At fills ≥ MAX_ENTRY_PRICE the
+# remaining ask side of the book is typically empty or dust, so FOK BUYs
+# reject ("no_match") and pile up as status="error" trades. There is also
+# almost no upside to buying at 0.99 — best case ~1c, worst case −99c.
+MAX_ENTRY_PRICE  = float(os.getenv("MAX_ENTRY_PRICE", "0.97"))
 
 # Position management
 TRADE_COOLDOWN_SEC    = 300   # seconds before re-buying the same token
@@ -86,6 +91,17 @@ TIME_STOP_MIN_GAIN    = float(os.getenv("TIME_STOP_MIN_GAIN", "-0.01"))
 # with empty string to re-enable.
 EXCLUDE_CATEGORIES    = [
     c.strip() for c in os.getenv("EXCLUDE_CATEGORIES", "crypto").split(",") if c.strip()
+]
+# Comma-separated substrings to skip on the market QUESTION (not category),
+# because Polymarket's category field puts most political markets under
+# "other". Empirically the bot's worst losses (Iran diplomatic-meeting
+# −87%, uranium −78%) all came from this bucket.
+EXCLUDE_KEYWORDS      = [
+    k.strip() for k in os.getenv(
+        "EXCLUDE_KEYWORDS",
+        "iran,uranium,ukraine,russia,taiwan,diplomatic,nuclear,sanctions,"
+        "trump,newsom,desantis,election,impeach,supreme court,fed chair"
+    ).split(",") if k.strip()
 ]
 
 # Strategy selection
@@ -349,6 +365,20 @@ async def estimate_true_probability(
         log.debug("OBI opposes NO trade (obi=%+.3f) — skip %s", obi, market.question[:40])
         return None
 
+    # 4b. Price ceiling. For BUY YES the fill price ≈ best_ask; for BUY NO the
+    # fill price on the NO side ≈ 1 - best_bid. Either way, refuse to enter
+    # near 1.0 — fills there reject as "no_match" (empty ask side) and even
+    # when they fill the upside is sub-cent.
+    side_fill_price = (
+        (book.best_ask if book.best_ask is not None else yes_price)
+        if dominant_side == "YES"
+        else (1.0 - book.best_bid if book.best_bid is not None else 1.0 - yes_price)
+    )
+    if side_fill_price >= MAX_ENTRY_PRICE:
+        log.debug("PRICE CEILING | %s  side=%s  fill=%.4f >= %.2f — skip",
+                  market.question[:40], dominant_side, side_fill_price, MAX_ENTRY_PRICE)
+        return None
+
     # 5. Estimate true probability + edge check
     conf_boost = (confidence / 100.0) * 0.12
 
@@ -428,6 +458,7 @@ async def strategy_loop(
                     .max_spread_cents(3.0)
                     .price_range(0.08, 0.92)
                     .exclude_categories(EXCLUDE_CATEGORIES)
+                    .exclude_keywords(EXCLUDE_KEYWORDS)
                     .top(20, key="volume_24h")
                     .results()
                 )
@@ -774,12 +805,13 @@ async def main() -> None:
         .max_spread_cents(3.0)
         .price_range(0.08, 0.92)
         .exclude_categories(EXCLUDE_CATEGORIES)
+        .exclude_keywords(EXCLUDE_KEYWORDS)
         .top(20, key="volume_24h")
         .results()
     )
     log.info(
-        "Watching %d markets (excluding categories: %s)",
-        len(markets), EXCLUDE_CATEGORIES or "none",
+        "Watching %d markets (excluding categories: %s; keywords: %s)",
+        len(markets), EXCLUDE_CATEGORIES or "none", EXCLUDE_KEYWORDS or "none",
     )
 
     if not markets:

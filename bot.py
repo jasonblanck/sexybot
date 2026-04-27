@@ -2801,6 +2801,13 @@ class PolymarketBot:
             # max_tokens=2000: adaptive thinking can emit hundreds of thinking
             # tokens before the final JSON. 500 was enough for the old
             # non-thinking flow; with thinking enabled we need real headroom.
+            # Two cache breakpoints — one on the (last) tool, one on the
+            # system block. Production metrics showed cache_creation=0
+            # despite the system marker alone, suggesting the prefix wasn't
+            # qualifying. Anthropic supports up to 4 breakpoints; adding the
+            # tool-level marker gives a separate cacheable chunk for the
+            # tool schema and makes the system-block cache more robust.
+            _analyze_tool_cached = {**_TOOL_ANALYZE, "cache_control": {"type": "ephemeral"}}
             api_kwargs = {
                 "model": CLAUDE_MODEL,
                 "max_tokens": 2000,
@@ -2810,7 +2817,7 @@ class PolymarketBot:
                     "cache_control": {"type": "ephemeral"},
                 }],
                 "messages": [{"role": "user", "content": user_prompt}],
-                "tools":       [_TOOL_ANALYZE],
+                "tools":       [_analyze_tool_cached],
                 "tool_choice": {"type": "tool", "name": _TOOL_ANALYZE["name"]},
             }
             if CLAUDE_ADAPTIVE_THINK and ("sonnet" in CLAUDE_MODEL or "opus" in CLAUDE_MODEL):
@@ -3725,7 +3732,11 @@ class PolymarketBot:
             review_kwargs = {
                 "model": CLAUDE_MODEL,
                 "max_tokens": 3000,
-                "system": system,
+                "system": [{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }],
                 "messages": [{"role": "user", "content": ctx}],
                 "tools": [_TOOL_REVIEW],
                 "tool_choice": {"type": "tool", "name": _TOOL_REVIEW["name"]},
