@@ -127,6 +127,13 @@ AI_MIN_CONFIDENCE      = float(os.getenv("AI_MIN_CONFIDENCE", "35.0"))
 # days. Dial down if CLOB rate-limit complaints appear in the logs.
 BRIER_RESOLVE_LIMIT      = int(os.getenv("BRIER_RESOLVE_LIMIT", "200"))
 BRIER_RESOLVE_INTERVAL_S = int(os.getenv("BRIER_RESOLVE_INTERVAL_S", "3600"))
+# Hard ceiling on the BUY-side fill price. The signal-time gate is in
+# main_v2.py, but bot.py's place_market_order is a separate code path —
+# market orders fired from here also need the gate or fast-moving books
+# slip BUYs into near-1.0 territory where FOK rejects with no_match
+# (those are the status="error" rows we kept seeing on near-resolved
+# sports markets).
+MAX_ENTRY_PRICE          = float(os.getenv("MAX_ENTRY_PRICE", "0.97"))
 # Startup safety: cancel any orders left open on Polymarket from a previous
 # bot incarnation. Without this, a crash/restart leaves orphan orders that
 # can fill silently while the bot has no memory of placing them — exactly
@@ -900,6 +907,18 @@ class PolymarketBot:
                       "ai_risk","regime_at_entry"):
                 if k in attribution and attribution[k] is not None:
                     result[k] = attribution[k]
+        # Price-ceiling gate. The midpoint is a slight underestimate of the
+        # actual BUY fill (which lifts the ask), but with MAX_ENTRY_PRICE=0.97
+        # and typical 1-2c spreads this catches the near-1.0 trades that
+        # were producing status="error" rows from FOK no_match rejections.
+        # SELL is exempt — closing a winning position at a high bid is fine.
+        if not DRY_RUN and str(side).upper() == "BUY" and price >= MAX_ENTRY_PRICE:
+            result["status"] = "skip_price_ceiling"
+            self._log(
+                f"PRICE CEILING [bot]: BUY {market[:50]!r} midpoint={price:.4f} "
+                f">= {MAX_ENTRY_PRICE:.2f} — refused"
+            )
+            return result
         if DRY_RUN:
             result["status"] = "simulated"
             self._log(f"[DRY RUN] {side} ${amount_usdc:.2f} @ {price:.4f} — token {token_id[:16]}…")

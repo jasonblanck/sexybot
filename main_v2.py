@@ -380,8 +380,8 @@ async def estimate_true_probability(
         else (1.0 - book.best_bid if book.best_bid is not None else 1.0 - yes_price)
     )
     if side_fill_price >= MAX_ENTRY_PRICE:
-        log.debug("PRICE CEILING | %s  side=%s  fill=%.4f >= %.2f — skip",
-                  market.question[:40], dominant_side, side_fill_price, MAX_ENTRY_PRICE)
+        log.info("PRICE CEILING [signal] | %s  side=%s  fill=%.4f >= %.2f — skip",
+                 market.question[:40], dominant_side, side_fill_price, MAX_ENTRY_PRICE)
         return None
 
     # 5. Estimate true probability + edge check

@@ -13,6 +13,7 @@ Balance: fetched once per scan cycle by the caller; passed into
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -47,6 +48,13 @@ CLOB_HOST = "https://clob.polymarket.com"
 # CTF Exchange V2 address — key used to look up allowance in API response
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 NEG_RISK_CTF = "0xC5d563A36AE78145C45a50134d48A1215220f80a"  # used in _parse_balance allowance lookup
+
+# Hard ceiling on the BUY-side fill price. Mirrors the signal-time gate in
+# main_v2.py — but re-checked here because the order book can slip between
+# signal evaluation and order placement, letting trades through that the
+# upstream gate already rejected. SELLs are not gated; closing a winning
+# position at high price is exactly what we want.
+MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0.97"))
 
 
 def _make_client(private_key: str, funder_address: Optional[str] = None) -> ClobClient:
@@ -227,6 +235,20 @@ class ClobExecutor:
             return OrderResult(success=False, error="no execution price available (empty book side)")
 
         price = max(0.001, min(0.999, round(price, 4)))
+
+        # Price-ceiling re-check. Catches the slippage case where the book
+        # moved up between signal evaluation and now — the signal-time gate
+        # in main_v2.py is also active, but a fast-moving market can still
+        # leak a fill above MAX_ENTRY_PRICE without this second check.
+        if side == OrderSide.BUY and price >= MAX_ENTRY_PRICE:
+            log.info(
+                "PRICE CEILING [executor] | token=%s… price=%.4f >= %.2f — skip",
+                token_id_str[:12], price, MAX_ENTRY_PRICE,
+            )
+            return OrderResult(
+                success=False,
+                error=f"price ceiling: {price:.4f} >= {MAX_ENTRY_PRICE:.2f}",
+            )
 
         # 5. Compute token size (must happen before dry-run so it's available for both paths)
         # py_clob_client OrderArgs.size = outcome tokens (not USDC).
