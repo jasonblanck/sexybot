@@ -120,6 +120,13 @@ PRETRADE_TIMEOUT_S     = float(os.getenv("PRETRADE_TIMEOUT_S", "4.0"))
 #                      into trades anyway and saves ~50% of AI calls)
 SCAN_INTERVAL_S        = float(os.getenv("SCAN_INTERVAL_S",   "60.0"))
 AI_MIN_CONFIDENCE      = float(os.getenv("AI_MIN_CONFIDENCE", "35.0"))
+# Brier-score resolver throughput. The original 50/6h was a 200/day ceiling
+# that fell behind whenever resolved-market volume spiked (we observed an
+# 11.5k pending backlog on 2026-04-27, starving the calibrator of training
+# data). At 200/1h the ceiling is 4800/day — drains a 11k backlog in ~2.3
+# days. Dial down if CLOB rate-limit complaints appear in the logs.
+BRIER_RESOLVE_LIMIT      = int(os.getenv("BRIER_RESOLVE_LIMIT", "200"))
+BRIER_RESOLVE_INTERVAL_S = int(os.getenv("BRIER_RESOLVE_INTERVAL_S", "3600"))
 # Startup safety: cancel any orders left open on Polymarket from a previous
 # bot incarnation. Without this, a crash/restart leaves orphan orders that
 # can fill silently while the bot has no memory of placing them — exactly
@@ -2279,11 +2286,13 @@ class PolymarketBot:
             return 0
 
     async def _brier_resolver_loop(self):
-        """Background task — every 6h scans up to 50 unresolved predictions
-        and settles the ones whose markets have closed. First pass fires
-        ~10 minutes after startup so we don't hammer the CLOB during boot.
-        Also runs the trade-outcome resolver on the same cadence so the
-        nightly review gets real realized-P&L context."""
+        """Background task — periodically scans unresolved predictions and
+        settles the ones whose markets have closed. Throughput is governed
+        by BRIER_RESOLVE_LIMIT and BRIER_RESOLVE_INTERVAL_S env vars (default
+        200 every hour ≈ 4800/day). First pass fires ~10 minutes after
+        startup so we don't hammer the CLOB during boot. Also runs the
+        trade-outcome resolver on the same cadence so the nightly review
+        gets real realized-P&L context."""
         if not ANTHROPIC_API_KEY:
             # The Brier loop is independent of Claude; keep running regardless.
             pass
@@ -2294,14 +2303,14 @@ class PolymarketBot:
             return
         while self.running:
             try:
-                await self.resolve_brier_predictions(limit=50)
+                await self.resolve_brier_predictions(limit=BRIER_RESOLVE_LIMIT)
                 await self.resolve_trade_outcomes(limit=100)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 log.debug(f"brier resolver loop error: {e}")
             try:
-                await asyncio.sleep(6 * 3600)
+                await asyncio.sleep(BRIER_RESOLVE_INTERVAL_S)
             except asyncio.CancelledError:
                 break
 
@@ -5336,7 +5345,7 @@ async def lifespan(app_: FastAPI):
         # unresolved predictions by checking token midpoints. Feeds real
         # calibration data into the nightly review. Independent of Claude.
         bot._brier_resolver_task = asyncio.create_task(bot._brier_resolver_loop())
-        log.info("[BRIER] Calibration resolver scheduled (every 6h)")
+        log.info(f"[BRIER] Calibration resolver scheduled (every {BRIER_RESOLVE_INTERVAL_S}s, limit {BRIER_RESOLVE_LIMIT}/pass)")
         # Weekly scheduled backtester — fires Sundays 01:00 UTC to compound
         # insights from resolved trades. Operator can still click RUN.
         if BACKTEST_WEEKLY_ENABLED and ANTHROPIC_API_KEY:

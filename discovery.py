@@ -7,6 +7,7 @@ Collateral: PMUSD only | Sig Type: EOA (0) | Chain: Polygon (137)
 from __future__ import annotations
 
 import json
+import re
 import time
 import logging
 from dataclasses import dataclass, field
@@ -229,19 +230,24 @@ class MarketFilter:
         return self
 
     def exclude_keywords(self, keywords: list[str]) -> "MarketFilter":
-        """Drop markets whose question/slug contains any of the given substrings.
-        Polymarket's `category` field is unreliable — many political markets
-        come back as "other" — so a keyword filter on the question text is
-        the only way to actually skip a topic."""
-        lowered = [k.lower() for k in keywords if k]
-        if not lowered:
+        """Drop markets whose question/slug contains any of the given keywords
+        as whole words (case-insensitive). Polymarket's `category` field is
+        unreliable — many political markets come back as "other" — so a
+        keyword filter on the question text is the only way to actually skip
+        a topic. Word-boundary matching is critical: a plain substring match
+        on "iran" would also catch "tyrannical", "Beirut", "Aquarian", etc.
+        and silently filter legitimate markets."""
+        valid = [k for k in keywords if k]
+        if not valid:
             return self
+        pattern = re.compile(
+            r"\b(?:" + "|".join(re.escape(k) for k in valid) + r")\b",
+            flags=re.IGNORECASE,
+        )
         self._markets = [
             m for m in self._markets
-            if not any(
-                k in (m.question or "").lower() or k in (m.slug or "").lower()
-                for k in lowered
-            )
+            if not pattern.search(m.question or "")
+            and not pattern.search(m.slug or "")
         ]
         return self
 

@@ -62,7 +62,12 @@ OBI_CONFIRM_MIN  = 0.20   # OBI must agree with signal direction
 # require a MUCH larger imbalance before trading on it alone. This blocks
 # the quiet-market false positives the 0.35 threshold used to allow.
 OBI_SOLO_MIN     = float(os.getenv("OBI_SOLO_MIN", "0.55"))
-MIN_EDGE         = 0.03   # minimum probability edge to place a trade
+# Minimum |estimated_prob − fill_price| edge to take a trade. Lower → more
+# trades but more noise; higher → cleaner signals but fewer fires. 0.03 (3%)
+# is conservative; the calibrator-corrected probabilities should be more
+# trustworthy than this raw bar suggests, so 0.025 may be reasonable once
+# calibration is active.
+MIN_EDGE         = float(os.getenv("MIN_EDGE", "0.03"))
 MIN_BOOK_DEPTH_USDC = float(os.getenv("MIN_BOOK_DEPTH_USDC", "200"))  # skip threadbare books
 # Hard ceiling on the *side we're buying*. At fills ≥ MAX_ENTRY_PRICE the
 # remaining ask side of the book is typically empty or dust, so FOK BUYs
