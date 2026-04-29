@@ -2870,9 +2870,15 @@ class PolymarketBot:
             # lets it spend more reasoning on hard cases while staying fast
             # on easy ones.
             #
-            # max_tokens=2000: adaptive thinking can emit hundreds of thinking
-            # tokens before the final JSON. 500 was enough for the old
-            # non-thinking flow; with thinking enabled we need real headroom.
+            # max_tokens=1200: production metrics showed avg ~1160 output
+            # tokens/call at the previous 2000 cap, with adaptive thinking
+            # generating most of the output. Output is the dominant cost
+            # driver (~$58/day at $15/Mtok) so a tighter cap forces the
+            # model to think more concisely. 1200 leaves room for normal
+            # thinking + 500-token JSON tool call without truncation;
+            # complex political markets that legitimately need more
+            # reasoning will hit stop_reason=max_tokens and the text-parse
+            # fallback covers the rare miss. Operator-tunable via env.
             # Two cache breakpoints — one on the (last) tool, one on the
             # system block. Production metrics showed cache_creation=0
             # despite the system marker alone, suggesting the prefix wasn't
@@ -2882,7 +2888,7 @@ class PolymarketBot:
             _analyze_tool_cached = {**_TOOL_ANALYZE, "cache_control": {"type": "ephemeral"}}
             api_kwargs = {
                 "model": CLAUDE_MODEL,
-                "max_tokens": 2000,
+                "max_tokens": int(os.getenv("ANALYZE_MAX_TOKENS", "1200")),
                 "system": [{
                     "type": "text",
                     "text": system_prompt,
