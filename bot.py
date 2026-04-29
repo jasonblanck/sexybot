@@ -2353,14 +2353,54 @@ class PolymarketBot:
         out.sort(key=lambda r: r["n"], reverse=True)
         return out
 
+    def _gamma_market_outcome(self, token_id: str) -> Optional[int]:
+        """Query Polymarket Gamma API for definitive market resolution.
+        Returns 1 if `token_id` is the winning side, 0 if losing, None
+        if still trading or lookup fails. Used as the fallback when CLOB
+        midpoint is unavailable (resolved markets stop trading and
+        get_midpoint returns None — that was the main blocker that left
+        13k+ Brier predictions unresolved). Cached lookups via the
+        markets endpoint by clob_token_ids."""
+        try:
+            url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
+            with _ureq.urlopen(url, timeout=8) as r:
+                data = json.loads(r.read().decode())
+            if not isinstance(data, list) or not data:
+                return None
+            m = data[0]
+            if not (m.get("closed") or m.get("resolved")):
+                return None
+            prices = m.get("outcomePrices") or m.get("outcome_prices")
+            if isinstance(prices, str):
+                prices = json.loads(prices)
+            ids = m.get("clobTokenIds") or m.get("clob_token_ids")
+            if isinstance(ids, str):
+                ids = json.loads(ids)
+            if not prices or not ids or len(prices) < 2 or len(ids) < 2:
+                return None
+            # Identify which slot our token is in and read its resolved price.
+            try:
+                slot = 0 if str(ids[0]) == str(token_id) else (1 if str(ids[1]) == str(token_id) else None)
+                if slot is None:
+                    return None
+                our_p = float(prices[slot])
+            except (TypeError, ValueError, IndexError):
+                return None
+            if our_p >= 0.95:
+                return 1
+            if our_p <= 0.05:
+                return 0
+            return None
+        except Exception as exc:
+            log.debug(f"_gamma_market_outcome failed (token={token_id[:16]}…): {exc}")
+            return None
+
     async def resolve_brier_predictions(self, limit: int = 50) -> int:
         """Scan unresolved Brier predictions and settle the ones whose
-        markets have resolved. Uses the CLOB midpoint of the prediction's
-        token — a resolved market has its winning token at ~$1 and the
-        losing token at ~$0. Stored token_id always matches the predicted
-        side (logged at prediction time), so mid >= 0.99 means our side
-        won and mid <= 0.01 means our side lost. Returns number of rows
-        settled this call."""
+        markets have resolved. First tries the CLOB midpoint (fast, cheap)
+        with widened 0.95/0.05 thresholds; falls back to Polymarket's
+        Gamma API for closed/delisted markets where the midpoint is no
+        longer available. Returns number of rows settled this call."""
         try:
             rows = self.db.execute(
                 "SELECT id, token_id, predicted_prob FROM brier_scores "
@@ -2371,19 +2411,32 @@ class PolymarketBot:
             if not rows:
                 return 0
             settled = 0
+            via_clob = 0
+            via_gamma = 0
             for row_id, token_id, predicted_prob in rows:
+                actual_outcome: Optional[int] = None
+                # 1. CLOB midpoint (fast, free)
                 try:
                     mid = await asyncio.to_thread(self.get_midpoint, token_id)
                 except Exception:
-                    continue
-                if mid is None:
-                    continue
-                if mid >= 0.99:
-                    actual_outcome = 1       # our side won
-                elif mid <= 0.01:
-                    actual_outcome = 0       # our side lost
+                    mid = None
+                if mid is not None:
+                    if mid >= 0.95:
+                        actual_outcome = 1
+                    elif mid <= 0.05:
+                        actual_outcome = 0
+                # 2. Gamma API fallback (covers closed/delisted markets where
+                #    the CLOB no longer has a quote — the main backlog driver)
+                if actual_outcome is None:
+                    actual_outcome = await asyncio.to_thread(
+                        self._gamma_market_outcome, token_id
+                    )
+                    if actual_outcome is not None:
+                        via_gamma += 1
                 else:
-                    continue                 # still trading — not yet resolved
+                    via_clob += 1
+                if actual_outcome is None:
+                    continue                 # still trading
                 try:
                     p = float(predicted_prob or 0.0)
                 except (TypeError, ValueError):
@@ -2396,7 +2449,7 @@ class PolymarketBot:
                     )
                 settled += 1
             if settled:
-                self._log(f"[BRIER] Resolved {settled} prediction(s) this pass")
+                self._log(f"[BRIER] Resolved {settled} prediction(s) this pass (clob={via_clob}, gamma={via_gamma})")
             return settled
         except Exception as e:
             log.warning(f"resolve_brier_predictions error: {e}")
@@ -2502,25 +2555,24 @@ class PolymarketBot:
                 return 0
             settled = 0
             for trade_id, token_id, entry_price, shares, side in rows:
+                # SELL-only exits aren't settled here — see docstring.
+                if str(side).upper() not in ("BUY", "YES", "NO"):
+                    continue
+                won: Optional[int] = None
+                # 1. CLOB midpoint (widened 0.95/0.05 thresholds)
                 try:
                     mid = await asyncio.to_thread(self.get_midpoint, token_id)
                 except Exception:
-                    continue
-                if mid is None:
-                    continue
-                # side is "BUY"/"SELL"/"YES"/"NO" — the token_id stored is the
-                # token we actually acquired. A resolved market drives the
-                # token we hold to ~$1 (won) or ~$0 (lost). SELL trades exit
-                # a position, so they're effectively P&L on the residual — we
-                # only settle BUY trades here. SELL-only exits get omitted
-                # from realized P&L but still appear in the trades ledger.
-                if str(side).upper() not in ("BUY", "YES", "NO"):
-                    continue
-                if mid >= 0.99:
-                    won = 1
-                elif mid <= 0.01:
-                    won = 0
-                else:
+                    mid = None
+                if mid is not None:
+                    if mid >= 0.95:
+                        won = 1
+                    elif mid <= 0.05:
+                        won = 0
+                # 2. Gamma fallback for closed/delisted markets
+                if won is None:
+                    won = await asyncio.to_thread(self._gamma_market_outcome, token_id)
+                if won is None:
                     continue   # still trading
                 try:
                     entry = float(entry_price or 0.0)
