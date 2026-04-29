@@ -21,7 +21,7 @@ try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import (
         ApiCreds, OrderArgs, OrderType,
-        MarketOrderArgs,
+        MarketOrderArgs, PartialCreateOrderOptions,
     )
 except ImportError as e:
     raise SystemExit(f"Missing dependency: {e}\nRun: pip install py-clob-client")
@@ -924,12 +924,38 @@ class PolymarketBot:
             self._log(f"[DRY RUN] {side} ${amount_usdc:.2f} @ {price:.4f} — token {token_id[:16]}…")
         else:
             try:
+                # Detect neg-risk for this token. Polymarket has two CTF
+                # Exchange contracts (standard at 0x4bFb… and neg-risk at
+                # 0xC5d5… for multi-outcome markets); orders signed for the
+                # wrong one come back as 400 order_version_mismatch.
+                # SDK 0.34.6 has auto-detection inside create_market_order
+                # but production showed it wasn't propagating reliably with
+                # signature_type=2 (POLY_GNOSIS_SAFE) — every neg-risk
+                # market (World Cup winner, Bayern Champions League, NBA
+                # Finals, election futures, etc.) errored. Resolving and
+                # passing explicitly via PartialCreateOrderOptions bypasses
+                # the auto-path and signs against the correct contract.
+                try:
+                    neg_risk_flag = bool(self.client.get_neg_risk(token_id))
+                except Exception as nr_exc:
+                    log.warning(f"get_neg_risk failed (token={token_id[:16]}…): {nr_exc}; defaulting False")
+                    neg_risk_flag = False
+                result["neg_risk"] = neg_risk_flag
                 order_args = MarketOrderArgs(token_id=token_id, amount=amount_usdc, side=side)
-                signed = self.client.create_market_order(order_args)
+                if neg_risk_flag:
+                    signed = self.client.create_market_order(
+                        order_args,
+                        options=PartialCreateOrderOptions(neg_risk=True),
+                    )
+                else:
+                    signed = self.client.create_market_order(order_args)
                 resp = self.client.post_order(signed, OrderType.FOK)
                 result["status"] = resp.get("status", "unknown")
                 result["order_id"] = resp.get("orderID")
-                self._log(f"ORDER: {side} ${amount_usdc:.2f} → {result['order_id']} {result['status']}")
+                self._log(
+                    f"ORDER: {side} ${amount_usdc:.2f} neg_risk={neg_risk_flag} "
+                    f"→ {result['order_id']} {result['status']}"
+                )
             except Exception as e:
                 result["status"] = "error"
                 self._log(f"Order failed (token={token_id[:16]}… side={side} amt={amount_usdc}): {e}", "error")
@@ -973,12 +999,30 @@ class PolymarketBot:
             self._log(f"[DRY RUN] LIMIT {side} {size}@{price:.4f} — token {token_id[:16]}…")
         else:
             try:
+                # Same neg-risk handling as place_market_order — see that
+                # function for the full rationale. Required for multi-
+                # outcome markets to avoid order_version_mismatch.
+                try:
+                    neg_risk_flag = bool(self.client.get_neg_risk(token_id))
+                except Exception as nr_exc:
+                    log.warning(f"get_neg_risk failed (token={token_id[:16]}…): {nr_exc}; defaulting False")
+                    neg_risk_flag = False
+                result["neg_risk"] = neg_risk_flag
                 order_args = OrderArgs(token_id=token_id, price=price, size=size, side=side)
-                signed = self.client.create_order(order_args)
+                if neg_risk_flag:
+                    signed = self.client.create_order(
+                        order_args,
+                        options=PartialCreateOrderOptions(neg_risk=True),
+                    )
+                else:
+                    signed = self.client.create_order(order_args)
                 resp = self.client.post_order(signed, OrderType.GTC)
                 result["status"] = resp.get("status", "unknown")
                 result["order_id"] = resp.get("orderID")
-                self._log(f"LIMIT: {side} {size}@{price:.4f} → {result['order_id']} {result['status']}")
+                self._log(
+                    f"LIMIT: {side} {size}@{price:.4f} neg_risk={neg_risk_flag} "
+                    f"→ {result['order_id']} {result['status']}"
+                )
             except Exception as e:
                 result["status"] = "error"
                 self._log(f"Limit order failed (token={token_id[:16]}… side={side} price={price} size={size}): {e}", "error")

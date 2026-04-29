@@ -23,6 +23,7 @@ from py_clob_client.clob_types import (
     BalanceAllowanceParams,
     OrderArgs,
     OrderType,
+    PartialCreateOrderOptions,
 )
 from py_clob_client.constants import POLYGON
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -274,16 +275,30 @@ class ClobExecutor:
                 success=True, order_id="DRY_RUN", status="dry_run",
                 fill_price=price, token_qty=token_size,
             )
+        # Detect neg-risk (multi-outcome markets use a different CTF
+        # Exchange contract; orders signed for the wrong one come back
+        # as 400 order_version_mismatch). SDK auto-detection wasn't
+        # propagating reliably under signature_type=2 — pass explicitly.
         try:
-            signed = self._client.create_order(
-                OrderArgs(
-                    token_id   = token_id_str,
-                    price      = price,
-                    size       = token_size,
-                    side       = clob_side,
-                    expiration = expiration,
-                )
+            neg_risk_flag = bool(self._client.get_neg_risk(token_id_str))
+        except Exception as nr_exc:
+            log.warning("get_neg_risk failed (token=%s…): %s; defaulting False", token_id_str[:14], nr_exc)
+            neg_risk_flag = False
+
+        try:
+            args = OrderArgs(
+                token_id   = token_id_str,
+                price      = price,
+                size       = token_size,
+                side       = clob_side,
+                expiration = expiration,
             )
+            if neg_risk_flag:
+                signed = self._client.create_order(
+                    args, options=PartialCreateOrderOptions(neg_risk=True),
+                )
+            else:
+                signed = self._client.create_order(args)
         except Exception as exc:
             log.error("create_order failed: %s", exc)
             return OrderResult(success=False, error=str(exc))
@@ -352,16 +367,28 @@ class ClobExecutor:
                 fill_price=price, token_qty=token_qty,
             )
 
+        # Same neg-risk detection as place_limit_order — closing a position
+        # on a neg-risk market also requires the right exchange contract.
         try:
-            signed = self._client.create_order(
-                OrderArgs(
-                    token_id   = token_id_str,
-                    price      = price,
-                    size       = round(token_qty, 4),
-                    side       = SELL,
-                    expiration = expiration,
-                )
+            neg_risk_flag = bool(self._client.get_neg_risk(token_id_str))
+        except Exception as nr_exc:
+            log.warning("close_position get_neg_risk failed (token=%s…): %s; defaulting False", token_id_str[:14], nr_exc)
+            neg_risk_flag = False
+
+        try:
+            args = OrderArgs(
+                token_id   = token_id_str,
+                price      = price,
+                size       = round(token_qty, 4),
+                side       = SELL,
+                expiration = expiration,
             )
+            if neg_risk_flag:
+                signed = self._client.create_order(
+                    args, options=PartialCreateOrderOptions(neg_risk=True),
+                )
+            else:
+                signed = self._client.create_order(args)
         except Exception as exc:
             log.error("close_position create_order failed: %s", exc)
             return OrderResult(success=False, error=str(exc))
