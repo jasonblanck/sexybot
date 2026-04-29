@@ -134,6 +134,12 @@ BRIER_RESOLVE_INTERVAL_S = int(os.getenv("BRIER_RESOLVE_INTERVAL_S", "3600"))
 # (those are the status="error" rows we kept seeing on near-resolved
 # sports markets).
 MAX_ENTRY_PRICE          = float(os.getenv("MAX_ENTRY_PRICE", "0.97"))
+# Cooldown applied to a token after a failed (status="error") order. Prevents
+# the strategy loop from immediately retrying the same structurally-broken
+# market on the next scan cycle. Default 30 min — long enough that a
+# transient "no_match" book has time to heal, short enough that a market
+# can re-enter the universe within the trading day.
+ERROR_COOLDOWN_SEC       = float(os.getenv("ERROR_COOLDOWN_SEC", "1800"))
 # Startup safety: cancel any orders left open on Polymarket from a previous
 # bot incarnation. Without this, a crash/restart leaves orphan orders that
 # can fill silently while the bot has no memory of placing them — exactly
@@ -361,6 +367,13 @@ class PolymarketBot:
         self._last_review_at: float = 0.0
         # Brier resolver task handle
         self._brier_resolver_task: Optional[asyncio.Task] = None
+        # Per-token error cooldown. After place_market_order / place_limit_order
+        # errors, the same token is blocked for ERROR_COOLDOWN_SEC. Without
+        # this, a market with a structurally thin book gets re-tried every
+        # scan cycle and burns $5-20/day in failed-trade churn (observed
+        # 2026-04-29: same Clavicular pregnancy market errored 4 times in
+        # 2 hours). Map: token_id -> unix timestamp at which cooldown ends.
+        self._error_cooldown: dict[str, float] = {}
         # Weekly scheduled backtest task handle
         self._weekly_backtest_task: Optional[asyncio.Task] = None
         # On-demand backtest task + status (polled by the dashboard so the
@@ -907,6 +920,18 @@ class PolymarketBot:
                       "ai_risk","regime_at_entry"):
                 if k in attribution and attribution[k] is not None:
                     result[k] = attribution[k]
+        # Error cooldown gate. If this token errored recently, refuse to
+        # re-attempt — structurally thin books take time to heal and the
+        # strategy loop will otherwise pile up identical FOK rejects.
+        cd_until = self._error_cooldown.get(token_id, 0.0)
+        if not DRY_RUN and cd_until > time.time():
+            remaining = int(cd_until - time.time())
+            result["status"] = "skip_error_cooldown"
+            self._log(
+                f"ERROR COOLDOWN [bot]: {market[:50]!r} token in cooldown "
+                f"({remaining}s remaining) — refused"
+            )
+            return result
         # Price-ceiling gate. The midpoint is a slight underestimate of the
         # actual BUY fill (which lifts the ask), but with MAX_ENTRY_PRICE=0.97
         # and typical 1-2c spreads this catches the near-1.0 trades that
@@ -956,9 +981,20 @@ class PolymarketBot:
                     f"ORDER: {side} ${amount_usdc:.2f} neg_risk={neg_risk_flag} "
                     f"→ {result['order_id']} {result['status']}"
                 )
+                # If Polymarket returned a non-success status, apply cooldown
+                # too — "no_match", "unmatched", "delayed" with no fill, etc.
+                # all suggest a structurally bad market for our scan cadence.
+                bad_resp_statuses = ("error", "unmatched", "no_match", "rejected")
+                if str(result["status"]).lower() in bad_resp_statuses:
+                    self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
             except Exception as e:
                 result["status"] = "error"
-                self._log(f"Order failed (token={token_id[:16]}… side={side} amt={amount_usdc}): {e}", "error")
+                self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
+                self._log(
+                    f"Order failed (token={token_id[:16]}… side={side} amt={amount_usdc}): "
+                    f"{e} — cooldown {int(ERROR_COOLDOWN_SEC)}s",
+                    "error",
+                )
         self.trades.append(result)
         if len(self.trades) > 1000:
             self.trades = self.trades[-1000:]
@@ -994,6 +1030,15 @@ class PolymarketBot:
                       "ai_risk","regime_at_entry"):
                 if k in attribution and attribution[k] is not None:
                     result[k] = attribution[k]
+        # Error cooldown gate (mirror of place_market_order).
+        cd_until = self._error_cooldown.get(token_id, 0.0)
+        if not DRY_RUN and cd_until > time.time():
+            remaining = int(cd_until - time.time())
+            result["status"] = "skip_error_cooldown"
+            self._log(
+                f"ERROR COOLDOWN [bot LIMIT]: token in cooldown ({remaining}s remaining) — refused"
+            )
+            return result
         if DRY_RUN:
             result["status"] = "simulated"
             self._log(f"[DRY RUN] LIMIT {side} {size}@{price:.4f} — token {token_id[:16]}…")
@@ -1023,9 +1068,18 @@ class PolymarketBot:
                     f"LIMIT: {side} {size}@{price:.4f} neg_risk={neg_risk_flag} "
                     f"→ {result['order_id']} {result['status']}"
                 )
+                # See place_market_order for the cooldown rationale.
+                bad_resp_statuses = ("error", "unmatched", "no_match", "rejected")
+                if str(result["status"]).lower() in bad_resp_statuses:
+                    self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
             except Exception as e:
                 result["status"] = "error"
-                self._log(f"Limit order failed (token={token_id[:16]}… side={side} price={price} size={size}): {e}", "error")
+                self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
+                self._log(
+                    f"Limit order failed (token={token_id[:16]}… side={side} "
+                    f"price={price} size={size}): {e} — cooldown {int(ERROR_COOLDOWN_SEC)}s",
+                    "error",
+                )
         self.trades.append(result)
         if len(self.trades) > 1000:
             self.trades = self.trades[-1000:]

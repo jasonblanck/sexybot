@@ -105,7 +105,8 @@ EXCLUDE_KEYWORDS      = [
     k.strip() for k in os.getenv(
         "EXCLUDE_KEYWORDS",
         "iran,uranium,ukraine,russia,taiwan,diplomatic,nuclear,sanctions,"
-        "trump,newsom,desantis,election,impeach,supreme court,fed chair"
+        "trump,newsom,desantis,election,impeach,supreme court,fed chair,"
+        "hormuz,houthi,tehran,kremlin,gaza,israel,hamas,hezbollah"
     ).split(",") if k.strip()
 ]
 
