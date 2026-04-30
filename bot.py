@@ -243,6 +243,13 @@ NO_TRADE_ALERT_HOURS = float(os.getenv("NO_TRADE_ALERT_HOURS", "6"))
 # trade. Set THRESHOLD=0 to disable. Tune as needed.
 PRETRADE_ABORT_THRESHOLD     = int(os.getenv("PRETRADE_ABORT_THRESHOLD", "2"))
 PRETRADE_ABORT_COOLDOWN_SEC  = float(os.getenv("PRETRADE_ABORT_COOLDOWN_SEC", "1800"))
+# Minimum notional (USDC) of a single trade for it to count toward the
+# momentum-spike calculation. Settling-trade dust at price extremes (e.g. 100
+# shares @ 0.001 = $0.10) shouldn't trigger spike detection — that was the
+# 2026-04-30 failure mode where the same near-decided markets re-signaled
+# every cycle on settlement noise. Real flow has trades >= $1 notional.
+# Set 0 to disable (count every trade regardless of size).
+MIN_TRADE_NOTIONAL = float(os.getenv("MIN_TRADE_NOTIONAL", "1.0"))
 if CLAUDE_MAX_DISABLED:
     # Force every AI feature off — keeps downstream code paths safe
     # without having to check CLAUDE_MAX_DISABLED everywhere.
@@ -1563,6 +1570,22 @@ class PolymarketBot:
                     pass
             return now - WINDOW  # safe fallback
 
+        # Drop dust trades before any spike / direction calculation. A market
+        # pinned at 0.97 with sellers settling for 0.001 generates lots of
+        # nominal "trades" with sub-cent notional — they shouldn't count as
+        # momentum. Filtering at the top of the function so size/count/USDC
+        # weighting all see the same filtered set.
+        def _meaningful(t):
+            try:
+                size  = float(t.get("size") or t.get("amount") or 0)
+                price = float(t.get("price") or 0.5)
+            except (ValueError, TypeError):
+                return False
+            if not (0 < price < 1):
+                price = 0.5  # defensive — a missing/0 price shouldn't drop us
+            return size * price >= MIN_TRADE_NOTIONAL
+        if MIN_TRADE_NOTIONAL > 0:
+            trades = [t for t in trades if _meaningful(t)]
         recent  = [t for t in trades if now - _parse_ts(t) < WINDOW]
         older   = [t for t in trades if WINDOW <= now - _parse_ts(t) < WINDOW * 3]
 
@@ -6116,6 +6139,71 @@ async def _unhandled_exception_handler(request, exc):
 @app.get("/status")
 def get_status():
     return JSONResponse(bot.get_state())
+
+
+@app.get("/metrics")
+def get_metrics():
+    """Prometheus text-format metrics for external monitoring (Prometheus +
+    Grafana, VictoriaMetrics, etc.). Auth handled by the session middleware
+    above — Prometheus must send `x-api-key` to bypass cookie auth. No
+    external prometheus-client dependency; we format the exposition text
+    directly from the existing /status data, which is already in memory."""
+    state = bot.get_state()
+    sc = state.get("skip_counts", {})
+    out = []
+
+    def gauge(name, help_text, value):
+        out.append(f"# HELP {name} {help_text}")
+        out.append(f"# TYPE {name} gauge")
+        out.append(f"{name} {value}")
+
+    def counter(name, help_text, value):
+        out.append(f"# HELP {name} {help_text}")
+        out.append(f"# TYPE {name} counter")
+        out.append(f"{name} {value}")
+
+    def _safe_label(s: str) -> str:
+        # Prometheus label values are utf-8 but we conservatively restrict to
+        # alphanumeric + underscore to avoid quoting/escaping landmines.
+        return "".join(c if c.isalnum() else "_" for c in (s or "none"))
+
+    gauge("sexybot_running", "1 if strategy loop is running, else 0",
+          1 if state.get("running") else 0)
+    gauge("sexybot_balance_usdc", "Cash balance in USDC", state.get("balance", 0))
+    gauge("sexybot_portfolio_value_usdc", "Total portfolio value in USDC",
+          state.get("portfolio_value", 0))
+    gauge("sexybot_positions_value_usdc", "Open positions value in USDC",
+          state.get("positions_value", 0))
+    gauge("sexybot_balance_halted", "1 if balance circuit-breaker is tripped",
+          1 if sc.get("balance_halted") else 0)
+    gauge("sexybot_active_cooldowns", "Tokens currently in error cooldown",
+          sc.get("active_cooldowns", 0))
+    counter("sexybot_cycles_completed_total",
+            "Strategy-loop cycles completed since process start",
+            sc.get("cycles_completed", 0))
+
+    # Skip counters by reason — the most-useful trend metric.
+    cumulative = sc.get("cumulative", {})
+    if cumulative:
+        out.append("# HELP sexybot_skip_total Skip events by reason since process start")
+        out.append("# TYPE sexybot_skip_total counter")
+        for reason, count in cumulative.items():
+            out.append(f'sexybot_skip_total{{reason="{_safe_label(reason)}"}} {count}')
+
+    # Trade buffer composition (gauge — buffer is bounded, not strictly
+    # increasing, hence not a counter).
+    from collections import Counter as _Counter
+    trade_status = _Counter()
+    for t in state.get("trades", []):
+        trade_status[_safe_label(str(t.get("status", "")).lower() or "none")] += 1
+    if trade_status:
+        out.append("# HELP sexybot_trades_buffered Trades in in-memory buffer by status")
+        out.append("# TYPE sexybot_trades_buffered gauge")
+        for status_lbl, count in trade_status.items():
+            out.append(f'sexybot_trades_buffered{{status="{status_lbl}"}} {count}')
+
+    body = "\n".join(out) + "\n"
+    return _SResponse(content=body, media_type="text/plain; version=0.0.4")
 
 
 @app.get("/portfolio")
