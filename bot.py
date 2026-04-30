@@ -63,6 +63,33 @@ MIN_YES_BUY_PRICE = float(os.getenv("MIN_YES_BUY_PRICE", "0.30"))
 # Anthropic spend and signal slots for genuinely tradeable markets. Env-tunable
 # so operators can experiment without a code change.
 NEAR_DECIDED_BAND = float(os.getenv("NEAR_DECIDED_BAND", "0.08"))
+# Keyword/category exclusion list applied to the Gamma API market feed BEFORE
+# any analysis. Same defaults as main_v2.py — kept in sync so both code paths
+# refuse the same long-tail political/geopolitical markets that have produced
+# the worst historical losses (Iran diplomatic-meeting -87%, uranium -78%,
+# Hormuz/Houthi/Israel/Hamas long tails). Word-boundary regex (not raw
+# substring) so "Beirut" / "tyrannical" / "Aquarian" don't get false-flagged
+# by "iran". Empty string disables. Comma-separated.
+_EXCLUDE_KEYWORDS_DEFAULT = (
+    "iran,uranium,ukraine,russia,taiwan,diplomatic,nuclear,sanctions,"
+    "trump,newsom,desantis,election,impeach,supreme court,fed chair,"
+    "hormuz,houthi,tehran,kremlin,gaza,israel,hamas,hezbollah"
+)
+EXCLUDE_KEYWORDS = [
+    k.strip() for k in os.getenv("EXCLUDE_KEYWORDS", _EXCLUDE_KEYWORDS_DEFAULT).split(",")
+    if k.strip()
+]
+EXCLUDE_CATEGORIES = [
+    c.strip().lower() for c in os.getenv("EXCLUDE_CATEGORIES", "crypto").split(",")
+    if c.strip()
+]
+import re as _re_kw
+_EXCLUDE_KW_RE = (
+    _re_kw.compile(
+        r"\b(?:" + "|".join(_re_kw.escape(k) for k in EXCLUDE_KEYWORDS) + r")\b",
+        flags=_re_kw.IGNORECASE,
+    ) if EXCLUDE_KEYWORDS else None
+)
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 API_SECRET_KEY    = os.getenv("API_SECRET_KEY", "")
@@ -872,10 +899,34 @@ class PolymarketBot:
     def get_markets(self, limit: int = 20) -> list:
         try:
             import urllib.request, json as _j
-            url = f"https://gamma-api.polymarket.com/markets?active=true&closed=false&limit={limit}&order=volume24hr&ascending=false"
+            # Fetch a larger pool than `limit` so the keyword/category filter
+            # below has room to drop excluded markets without starving the
+            # downstream signal loop. 3x is enough headroom — exclusion on the
+            # historical default list filters ~10-30% of the volume-sorted top.
+            fetch_n = max(limit, 60)
+            url = f"https://gamma-api.polymarket.com/markets?active=true&closed=false&limit={fetch_n}&order=volume24hr&ascending=false"
             req = urllib.request.Request(url, headers={"User-Agent": "polybot/1.0"})
             with urllib.request.urlopen(req, timeout=10) as r:
-                return _j.loads(r.read())
+                raw = _j.loads(r.read())
+            # Apply EXCLUDE_KEYWORDS / EXCLUDE_CATEGORIES at the source. Without
+            # this, geopolitical markets like "Strait of Hormuz traffic returns"
+            # leaked into the analyzer despite being in the env exclusion list,
+            # because the filter only existed in main_v2.py's discovery path.
+            # Keep the original ordering (volume-desc) — slice to limit at end.
+            if not EXCLUDE_KEYWORDS and not EXCLUDE_CATEGORIES:
+                return raw[:limit]
+            kept = []
+            for m in raw:
+                cat = (m.get("category") or "").lower()
+                if any(c in cat for c in EXCLUDE_CATEGORIES):
+                    continue
+                hay = (m.get("question") or "") + " " + (m.get("slug") or "")
+                if _EXCLUDE_KW_RE is not None and _EXCLUDE_KW_RE.search(hay):
+                    continue
+                kept.append(m)
+                if len(kept) >= limit:
+                    break
+            return kept
         except Exception as e:
             self._log(f"get_markets error: {e}", "error")
             return []
@@ -5571,6 +5622,8 @@ class PolymarketBot:
                     "error_cooldown_sec":  ERROR_COOLDOWN_SEC,
                     "min_yes_buy_price":   MIN_YES_BUY_PRICE,
                     "near_decided_band":   NEAR_DECIDED_BAND,
+                    "exclude_keywords_n":  len(EXCLUDE_KEYWORDS),
+                    "exclude_categories":  EXCLUDE_CATEGORIES,
                     "ai_min_confidence":   AI_MIN_CONFIDENCE,
                     "scan_interval_s":     SCAN_INTERVAL_S,
                 },
