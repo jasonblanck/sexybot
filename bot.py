@@ -234,6 +234,15 @@ CLAUDE_DAILY_BUDGET_USD = float(os.getenv("CLAUDE_DAILY_BUDGET_USD", "25.0"))
 # unnoticed for hours). Re-armed every NO_TRADE_ALERT_HOURS/2 if condition
 # persists. Set 0 to disable. No-op if Telegram creds unset or DRY_RUN.
 NO_TRADE_ALERT_HOURS = float(os.getenv("NO_TRADE_ALERT_HOURS", "6"))
+# After PRETRADE_ABORT_THRESHOLD pretrade aborts on the same token within
+# PRETRADE_ABORT_COOLDOWN_SEC, blacklist the token for the rest of the cooldown
+# window. Same idea as _error_cooldown but applied earlier in the pipeline so
+# we skip the (expensive) AI enrichment + pretrade Claude call entirely.
+# Observed today: same MegaETH market generated identical signal + abort
+# every cycle for hours, burning Anthropic spend on a structurally undeliverable
+# trade. Set THRESHOLD=0 to disable. Tune as needed.
+PRETRADE_ABORT_THRESHOLD     = int(os.getenv("PRETRADE_ABORT_THRESHOLD", "2"))
+PRETRADE_ABORT_COOLDOWN_SEC  = float(os.getenv("PRETRADE_ABORT_COOLDOWN_SEC", "1800"))
 if CLAUDE_MAX_DISABLED:
     # Force every AI feature off — keeps downstream code paths safe
     # without having to check CLAUDE_MAX_DISABLED everywhere.
@@ -441,6 +450,11 @@ class PolymarketBot:
         self._no_trade_watchdog_task: Optional[asyncio.Task] = None
         self._no_trade_alert_at:      float = 0.0
         self._service_start_at:       float = time.time()
+        # Per-token pretrade abort history. token_id -> list of unix timestamps
+        # of recent pretrade aborts. Trimmed to PRETRADE_ABORT_COOLDOWN_SEC.
+        # Once a token has >= PRETRADE_ABORT_THRESHOLD entries, it's skipped
+        # at signal-collection time before AI enrichment fires.
+        self._pretrade_abort_history: dict[str, list[float]] = {}
         # Trip after 2 consecutive insufficient-balance rejections; requires
         # a restart to clear (intentional — operator must top up and verify).
         self._balance_error_streak: int = 0
@@ -5085,6 +5099,19 @@ class PolymarketBot:
                     prices = _j.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
                     yes_p = float(prices[0]) if prices else 0.5
                     token_id = signal.get("token_id", "")
+                    # Pretrade-abort cooldown: drop tokens that have aborted
+                    # recently before they reach Phase 2 (AI enrichment). Saves
+                    # the analyze_with_claude call on structurally-undeliverable
+                    # markets that re-signal every cycle (observed today: same
+                    # MegaETH market generating signal+abort 5 cycles in a row).
+                    if PRETRADE_ABORT_THRESHOLD > 0 and token_id:
+                        _pa_now = time.time()
+                        _pa_recent = [ts for ts in self._pretrade_abort_history.get(token_id, [])
+                                      if ts > _pa_now - PRETRADE_ABORT_COOLDOWN_SEC]
+                        self._pretrade_abort_history[token_id] = _pa_recent
+                        if len(_pa_recent) >= PRETRADE_ABORT_THRESHOLD:
+                            self._bump_skip("pretrade_abort_cooldown")
+                            continue
                     _candidates.append({
                         "mkt": mkt, "signal": signal, "question": question,
                         "yes_p": yes_p, "token_id": token_id,
@@ -5416,6 +5443,11 @@ class PolymarketBot:
                             )
                             if not pre["proceed"]:
                                 self._bump_skip("pretrade_abort")
+                                # Record the abort timestamp for the cooldown
+                                # check at the next cycle's signal collection.
+                                _pa_tid = signal.get("token_id", "")
+                                if _pa_tid:
+                                    self._pretrade_abort_history.setdefault(_pa_tid, []).append(time.time())
                                 self._log(
                                     f"🛑 PRE-TRADE ABORT | {mkt_name[:40]} — {pre['reason']}",
                                     "warning",
@@ -5712,14 +5744,16 @@ class PolymarketBot:
                 "tracked_cooldowns":  len(self._error_cooldown),
                 "balance_halted":     self._balance_halt_tripped,
                 "config": {
-                    "max_entry_price":     MAX_ENTRY_PRICE,
-                    "error_cooldown_sec":  ERROR_COOLDOWN_SEC,
-                    "min_yes_buy_price":   MIN_YES_BUY_PRICE,
-                    "near_decided_band":   NEAR_DECIDED_BAND,
-                    "exclude_keywords_n":  len(EXCLUDE_KEYWORDS),
-                    "exclude_categories":  EXCLUDE_CATEGORIES,
-                    "ai_min_confidence":   AI_MIN_CONFIDENCE,
-                    "scan_interval_s":     SCAN_INTERVAL_S,
+                    "max_entry_price":          MAX_ENTRY_PRICE,
+                    "error_cooldown_sec":       ERROR_COOLDOWN_SEC,
+                    "min_yes_buy_price":        MIN_YES_BUY_PRICE,
+                    "near_decided_band":        NEAR_DECIDED_BAND,
+                    "exclude_keywords_n":       len(EXCLUDE_KEYWORDS),
+                    "exclude_categories":       EXCLUDE_CATEGORIES,
+                    "pretrade_abort_threshold": PRETRADE_ABORT_THRESHOLD,
+                    "pretrade_abort_cd_sec":    PRETRADE_ABORT_COOLDOWN_SEC,
+                    "ai_min_confidence":        AI_MIN_CONFIDENCE,
+                    "scan_interval_s":          SCAN_INTERVAL_S,
                 },
             },
         }
