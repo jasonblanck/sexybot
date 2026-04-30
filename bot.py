@@ -396,6 +396,18 @@ class PolymarketBot:
         # a restart to clear (intentional — operator must top up and verify).
         self._balance_error_streak: int = 0
         self._balance_halt_tripped: bool = False
+        # Diagnostic skip counters. Each rejection site in run_loop bumps a
+        # named key so /status can show exactly which gate is eating signals
+        # without needing to grep journalctl. cumulative = since process start;
+        # last_cycle = the previous completed cycle's tally; current_cycle =
+        # tally for the cycle in progress (swapped into last_cycle at the top
+        # of each iteration). Operator-facing — never read by trading logic.
+        self._skip_counts:           dict[str, int] = {}
+        self._skip_counts_cycle:     dict[str, int] = {}
+        self._skip_counts_last:      dict[str, int] = {}
+        self._skip_cycle_started_at: float = 0.0
+        self._skip_cycle_ended_at:   float = 0.0
+        self._skip_cycles_completed: int   = 0
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -927,6 +939,7 @@ class PolymarketBot:
         if not DRY_RUN and cd_until > time.time():
             remaining = int(cd_until - time.time())
             result["status"] = "skip_error_cooldown"
+            self._bump_skip("exec_cooldown")
             self._log(
                 f"ERROR COOLDOWN [bot]: {market[:50]!r} token in cooldown "
                 f"({remaining}s remaining) — refused"
@@ -939,6 +952,7 @@ class PolymarketBot:
         # SELL is exempt — closing a winning position at a high bid is fine.
         if not DRY_RUN and str(side).upper() == "BUY" and price >= MAX_ENTRY_PRICE:
             result["status"] = "skip_price_ceiling"
+            self._bump_skip("exec_price_ceiling")
             self._log(
                 f"PRICE CEILING [bot]: BUY {market[:50]!r} midpoint={price:.4f} "
                 f">= {MAX_ENTRY_PRICE:.2f} — refused"
@@ -987,9 +1001,13 @@ class PolymarketBot:
                 bad_resp_statuses = ("error", "unmatched", "no_match", "rejected")
                 if str(result["status"]).lower() in bad_resp_statuses:
                     self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
+                    self._bump_skip(f"exec_bad_{str(result['status']).lower()}")
+                else:
+                    self._bump_skip("exec_ok")
             except Exception as e:
                 result["status"] = "error"
                 self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
+                self._bump_skip("exec_exception")
                 self._log(
                     f"Order failed (token={token_id[:16]}… side={side} amt={amount_usdc}): "
                     f"{e} — cooldown {int(ERROR_COOLDOWN_SEC)}s",
@@ -1035,6 +1053,7 @@ class PolymarketBot:
         if not DRY_RUN and cd_until > time.time():
             remaining = int(cd_until - time.time())
             result["status"] = "skip_error_cooldown"
+            self._bump_skip("exec_cooldown")
             self._log(
                 f"ERROR COOLDOWN [bot LIMIT]: token in cooldown ({remaining}s remaining) — refused"
             )
@@ -1072,9 +1091,13 @@ class PolymarketBot:
                 bad_resp_statuses = ("error", "unmatched", "no_match", "rejected")
                 if str(result["status"]).lower() in bad_resp_statuses:
                     self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
+                    self._bump_skip(f"exec_bad_{str(result['status']).lower()}")
+                else:
+                    self._bump_skip("exec_ok")
             except Exception as e:
                 result["status"] = "error"
                 self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
+                self._bump_skip("exec_exception")
                 self._log(
                     f"Limit order failed (token={token_id[:16]}… side={side} "
                     f"price={price} size={size}): {e} — cooldown {int(ERROR_COOLDOWN_SEC)}s",
@@ -4764,11 +4787,22 @@ class PolymarketBot:
             await asyncio.to_thread(self.get_crypto_prices)
 
         while self.running:
+            # Roll the in-progress cycle counters into "last_cycle" before
+            # starting the new one. Done outside the try/except so any path
+            # out of the previous iteration (continue, break, exception) still
+            # produces a valid "last_cycle" snapshot for /status to read.
+            if self._skip_cycle_started_at > 0:
+                self._skip_counts_last      = dict(self._skip_counts_cycle)
+                self._skip_cycles_completed += 1
+                self._skip_cycle_ended_at    = time.time()
+            self._skip_counts_cycle     = {}
+            self._skip_cycle_started_at = time.time()
             try:
                 # Once the balance circuit-breaker trips, skip every bit of
                 # cycle work (markets, regime, AI, balance fetch) until a
                 # restart clears it. Operator must top up + restart anyway.
                 if self._balance_halt_tripped and not PAPER_MODE:
+                    self._bump_skip("cycle_balance_halt")
                     try:
                         await asyncio.sleep(interval)
                     except asyncio.CancelledError:
@@ -4777,6 +4811,7 @@ class PolymarketBot:
 
                 _ai_failures = 0  # circuit breaker: disable AI mid-cycle after 3 consecutive failures
                 markets = await asyncio.to_thread(self.get_markets, 30)
+                self._bump_skip("markets_scanned", len(markets))
                 self._log(f"Scanning {len(markets)} markets…")
 
                 # Refresh economic watchlist every 5 min for EconFlow strategy
@@ -4818,6 +4853,7 @@ class PolymarketBot:
                 regime = await self.assess_market_regime()
                 regime_name = regime.get("regime", "normal")
                 if regime_name == "hostile":
+                    self._bump_skip("cycle_regime_hostile")
                     self._log(
                         f"🛑 REGIME HOSTILE — skipping cycle: "
                         f"{regime.get('reasoning','')[:140]}",
@@ -4850,6 +4886,7 @@ class PolymarketBot:
                 # notional minimum. The halt branch is handled at the top of
                 # the loop before any expensive work fires.
                 if not PAPER_MODE and cycle_cash < 1.0:
+                    self._bump_skip("cycle_wallet_too_low")
                     self._log(
                         f"WALLET BELOW MIN NOTIONAL: ${cycle_cash:.2f} < $1.00 — skipping cycle",
                         "warning",
@@ -4871,7 +4908,9 @@ class PolymarketBot:
                         break
                     signal = self.analyze(mkt)
                     if not signal:
+                        self._bump_skip("analyze_no_signal")
                         continue
+                    self._bump_skip("analyze_signal_emitted")
                     question = mkt.get("question", "")
                     raw_prices = mkt.get("outcomePrices", "[0.5,0.5]")
                     prices = _j.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
@@ -4991,6 +5030,7 @@ class PolymarketBot:
                             self._log("AI circuit breaker: 3+ failures this cycle", "warning")
                     if ai:
                         if ai.get("action") == "SKIP":
+                            self._bump_skip("ai_skip")
                             self._log(f"AI SKIP: {question[:50]} — {ai.get('reasoning','')}")
                             continue
                         signal["confidence"]   = ai.get("confidence", signal["confidence"])
@@ -5014,6 +5054,7 @@ class PolymarketBot:
                     obi = ob_data.get("obi", 0)
                     buying_yes = "YES" in signal.get("signal", "")
                     if (buying_yes and obi < -0.4) or (not buying_yes and obi > 0.4):
+                        self._bump_skip("obi_oppose")
                         self._log(f"OBI SKIP: book pressure opposes trade (obi={obi:.2f}) {question[:40]}")
                         continue
 
@@ -5033,22 +5074,26 @@ class PolymarketBot:
 
                     # Stop mid-cycle if a rejection this loop tripped the halt.
                     if self._balance_halt_tripped and not PAPER_MODE:
+                        self._bump_skip("balance_halt_midcycle")
                         sig_record["skip_reason"] = "balance circuit-breaker tripped"
                         break
 
                     if signal.get("token_id") and self.has_position(signal["token_id"]):
+                        self._bump_skip("position_held")
                         self._log(f"SKIP: already have position in {signal['market'][:40]}")
                         sig_record["skip_reason"] = "already have position"
                         continue
 
                     _sig_tid = signal.get("token_id")
                     if _sig_tid and _sig_tid in _traded_tokens_this_cycle:
+                        self._bump_skip("cycle_dedupe")
                         sig_record["skip_reason"] = "already attempted this cycle"
                         continue
 
                     # ── Kelly Criterion sizing ────────────────────────────────
                     cash = cycle_cash
                     if cash < 1.0:
+                        self._bump_skip("cash_low")
                         self._log(f"SKIP: insufficient cash (${cash:.2f})")
                         sig_record["skip_reason"] = f"insufficient cash (${cash:.2f})"
                         continue
@@ -5060,6 +5105,7 @@ class PolymarketBot:
                     # Block YES buys priced as underdogs — payoff ratio <1 makes
                     # cheap longs unprofitable unless accuracy is near-perfect.
                     if is_yes_buy and entry_price < MIN_YES_BUY_PRICE:
+                        self._bump_skip("yes_underdog")
                         self._log(
                             f"LOW-PRICE YES SKIP: price={entry_price:.3f} < {MIN_YES_BUY_PRICE:.2f} "
                             f"{question[:40]}"
@@ -5094,6 +5140,7 @@ class PolymarketBot:
                     # ── Minimum edge gate (volatility-adjusted) ──────────────
                     raw_edge = p_true - entry_price
                     if raw_edge < vol_min_edge:
+                        self._bump_skip("edge_too_low")
                         self._log(f"EDGE SKIP: edge={raw_edge:.3f} < min={vol_min_edge:.2f} (vol={vol_state}) {question[:40]}")
                         sig_record["skip_reason"] = f"edge {raw_edge:.3f} < min {vol_min_edge:.2f} ({vol_state})"
                         continue
@@ -5102,6 +5149,7 @@ class PolymarketBot:
                     # Use volatility-adjusted Kelly fraction (smaller during hot markets)
                     amt = self.kelly_size(p_true, entry_price, cash, fraction=vol_kelly_fraction)
                     if amt < 0.50:
+                        self._bump_skip("kelly_too_small")
                         self._log(f"KELLY SKIP: no meaningful edge (p={p_true:.3f} price={entry_price:.3f} kelly_f={kelly_f_full:.3f})")
                         sig_record["skip_reason"] = f"Kelly edge too small (f={kelly_f_full:.3f})"
                         continue
@@ -5119,6 +5167,7 @@ class PolymarketBot:
                     # ── Execute ───────────────────────────────────────────────
                     _exec_tid = str(signal.get("token_id", ""))
                     if not _TOKEN_ID_RE.fullmatch(_exec_tid):
+                        self._bump_skip("bad_token_id")
                         self._log(f"SKIP: token_id from market data failed format check ({_exec_tid[:20]})", "error")
                         continue
 
@@ -5126,6 +5175,7 @@ class PolymarketBot:
                     # both market and limit BUYs (see place_market_order /
                     # place_limit_order).
                     if not PAPER_MODE and amt > cycle_cash:
+                        self._bump_skip("preflight_oversize")
                         self._log(
                             f"PRE-FLIGHT BALANCE SKIP: order ${amt:.2f} > cash ${cycle_cash:.2f} "
                             f"{question[:40]}",
@@ -5196,6 +5246,7 @@ class PolymarketBot:
                                 ai_reasoning    = signal.get("ai_reasoning", ""),
                             )
                             if not pre["proceed"]:
+                                self._bump_skip("pretrade_abort")
                                 self._log(
                                     f"🛑 PRE-TRADE ABORT | {mkt_name[:40]} — {pre['reason']}",
                                     "warning",
@@ -5211,6 +5262,7 @@ class PolymarketBot:
                                 )
                                 amt = adj_amt
                                 if amt < 1.0:
+                                    self._bump_skip("pretrade_downsize_below_min")
                                     sig_record["skip_reason"] = f"pretrade downsized below $1: {pre['reason']}"
                                     continue
 
@@ -5230,6 +5282,7 @@ class PolymarketBot:
                             )
                             if deep is not None:
                                 if deep["verdict"] == "abort" or deep["size_multiplier"] <= 0.01:
+                                    self._bump_skip("deep_abort")
                                     self._log(
                                         f"🛑 DEEP ABORT | {mkt_name[:40]}  —  {deep['reasoning'][:160]}",
                                         "warning",
@@ -5244,6 +5297,7 @@ class PolymarketBot:
                                     )
                                     amt = adj_amt
                                     if amt < 1.0:
+                                        self._bump_skip("deep_downsize_below_min")
                                         sig_record["skip_reason"] = f"deep downsized below $1"
                                         continue
                             result = await self._execute_order(
@@ -5270,6 +5324,7 @@ class PolymarketBot:
                             }
                             self._log(f"[ECON FLOW] Tracking {signal['side'] if 'side' in signal else 'position'} {mkt_name[:40]} — TP +8¢ / SL -5¢ / timeout 30min")
                     else:
+                        self._bump_skip("low_confidence")
                         sig_record["skip_reason"] = f"conf {signal.get('confidence',0)}% < min {min_conf}%"
 
                     try:
@@ -5321,6 +5376,14 @@ class PolymarketBot:
         if len(self.log_lines) > 500:
             self.log_lines = self.log_lines[-500:]
         getattr(log, level)(msg)
+
+    def _bump_skip(self, key: str, n: int = 1) -> None:
+        """Increment cumulative + per-cycle skip counters. Surfaced via
+        /status -> skip_counts so an operator can see which gate is the
+        bottleneck (e.g. all rejections are 'edge_too_low' → MIN_EDGE is too
+        tight). Safe to call from any thread — we only ever increment ints."""
+        self._skip_counts[key]       = self._skip_counts.get(key, 0) + n
+        self._skip_counts_cycle[key] = self._skip_counts_cycle.get(key, 0) + n
 
     async def _broadcast_state(self):
         if not self.ws_clients:
@@ -5448,6 +5511,8 @@ class PolymarketBot:
     def get_state(self) -> dict:
         cash = self.get_balance()
         positions = self.get_positions_value()
+        now = time.time()
+        active_cooldowns = sum(1 for ts in self._error_cooldown.values() if ts > now)
         d = {
             "running": self.running,
             "strategy": STRATEGY,
@@ -5462,6 +5527,29 @@ class PolymarketBot:
             "brier": self.get_brier_stats(),
             "volatility": self._vol_state,
             "gas": self._gas_cache,
+            # Diagnostic: per-rejection-reason counters. Lets an operator
+            # answer "why no trades?" from /status alone instead of grepping
+            # journalctl. cumulative is since process start; last_cycle is the
+            # most recently completed cycle's tally; current_cycle is in
+            # progress. See _bump_skip for the catalog of keys.
+            "skip_counts": {
+                "cumulative":         dict(self._skip_counts),
+                "last_cycle":         dict(self._skip_counts_last),
+                "current_cycle":      dict(self._skip_counts_cycle),
+                "cycles_completed":   self._skip_cycles_completed,
+                "cycle_started_at":   self._skip_cycle_started_at,
+                "cycle_ended_at":     self._skip_cycle_ended_at,
+                "active_cooldowns":   active_cooldowns,
+                "tracked_cooldowns":  len(self._error_cooldown),
+                "balance_halted":     self._balance_halt_tripped,
+                "config": {
+                    "max_entry_price":     MAX_ENTRY_PRICE,
+                    "error_cooldown_sec":  ERROR_COOLDOWN_SEC,
+                    "min_yes_buy_price":   MIN_YES_BUY_PRICE,
+                    "ai_min_confidence":   AI_MIN_CONFIDENCE,
+                    "scan_interval_s":     SCAN_INTERVAL_S,
+                },
+            },
         }
         if PAPER_MODE and self.paper:
             try:
