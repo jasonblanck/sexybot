@@ -2098,13 +2098,24 @@ class PolymarketBot:
             book = self.get_orderbook(token_id)
             if not book:
                 return {}
-            bids = book.get("bids", [])
-            asks = book.get("asks", [])
-            best_bid = float(bids[0]["price"]) if bids else 0
-            best_ask = float(asks[0]["price"]) if asks else 1
+            # py_clob_client returns an OrderBookSummary instance (with .bids/.asks
+            # attributes whose elements are OrderSummary instances with .price/.size
+            # attributes), not a plain dict. The previous .get("bids", []) call
+            # raised AttributeError on the typed object, fell into the bare except
+            # below, and returned {}. Result: every market looked empty to Claude
+            # and every signal got pretrade_aborted. Handle both shapes defensively
+            # so a future SDK that returns a dict keeps working.
+            def _attr(obj, key, default=None):
+                if isinstance(obj, dict):
+                    return obj.get(key, default)
+                return getattr(obj, key, default)
+            bids = _attr(book, "bids", []) or []
+            asks = _attr(book, "asks", []) or []
+            best_bid = float(_attr(bids[0], "price", 0)) if bids else 0
+            best_ask = float(_attr(asks[0], "price", 1)) if asks else 1
             spread = round(best_ask - best_bid, 4)
-            bid_depth = sum(float(b.get("size", 0)) for b in bids[:5])
-            ask_depth = sum(float(a.get("size", 0)) for a in asks[:5])
+            bid_depth = sum(float(_attr(b, "size", 0)) for b in bids[:5])
+            ask_depth = sum(float(_attr(a, "size", 0)) for a in asks[:5])
             total_depth = bid_depth + ask_depth
             obi = round((bid_depth - ask_depth) / total_depth, 3) if total_depth > 0 else 0
             return {
