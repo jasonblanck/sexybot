@@ -1068,14 +1068,36 @@ class PolymarketBot:
                     neg_risk_flag = False
                 result["neg_risk"] = neg_risk_flag
                 order_args = MarketOrderArgs(token_id=token_id, amount=amount_usdc, side=side)
-                if neg_risk_flag:
-                    signed = self.client.create_market_order(
-                        order_args,
-                        options=PartialCreateOrderOptions(neg_risk=True),
-                    )
-                else:
-                    signed = self.client.create_market_order(order_args)
-                resp = self.client.post_order(signed, OrderType.FOK)
+                def _sign_market(neg_risk: bool):
+                    if neg_risk:
+                        return self.client.create_market_order(
+                            order_args,
+                            options=PartialCreateOrderOptions(neg_risk=True),
+                        )
+                    return self.client.create_market_order(order_args)
+                signed = _sign_market(neg_risk_flag)
+                try:
+                    resp = self.client.post_order(signed, OrderType.FOK)
+                except Exception as post_exc:
+                    # Defensive retry: get_neg_risk is occasionally wrong for
+                    # individual tokens (observed 2026-04-30 on a soccer
+                    # moneyline). If the first attempt fails specifically
+                    # with order_version_mismatch, the auto-detection had it
+                    # backwards — retry once with the opposite flag. This is
+                    # idempotent because the order itself doesn't get
+                    # accepted on the first attempt.
+                    if "order_version_mismatch" in str(post_exc):
+                        neg_risk_flag = not neg_risk_flag
+                        result["neg_risk"] = neg_risk_flag
+                        result["neg_risk_retried"] = True
+                        log.warning(
+                            f"order_version_mismatch — retrying with neg_risk={neg_risk_flag} "
+                            f"(token={token_id[:16]}…)"
+                        )
+                        signed = _sign_market(neg_risk_flag)
+                        resp = self.client.post_order(signed, OrderType.FOK)
+                    else:
+                        raise
                 result["status"] = resp.get("status", "unknown")
                 result["order_id"] = resp.get("orderID")
                 self._log(
@@ -1160,14 +1182,31 @@ class PolymarketBot:
                     neg_risk_flag = False
                 result["neg_risk"] = neg_risk_flag
                 order_args = OrderArgs(token_id=token_id, price=price, size=size, side=side)
-                if neg_risk_flag:
-                    signed = self.client.create_order(
-                        order_args,
-                        options=PartialCreateOrderOptions(neg_risk=True),
-                    )
-                else:
-                    signed = self.client.create_order(order_args)
-                resp = self.client.post_order(signed, OrderType.GTC)
+                def _sign_limit(neg_risk: bool):
+                    if neg_risk:
+                        return self.client.create_order(
+                            order_args,
+                            options=PartialCreateOrderOptions(neg_risk=True),
+                        )
+                    return self.client.create_order(order_args)
+                signed = _sign_limit(neg_risk_flag)
+                try:
+                    resp = self.client.post_order(signed, OrderType.GTC)
+                except Exception as post_exc:
+                    # Defensive retry on order_version_mismatch — see
+                    # place_market_order for the full rationale.
+                    if "order_version_mismatch" in str(post_exc):
+                        neg_risk_flag = not neg_risk_flag
+                        result["neg_risk"] = neg_risk_flag
+                        result["neg_risk_retried"] = True
+                        log.warning(
+                            f"order_version_mismatch [LIMIT] — retrying with neg_risk={neg_risk_flag} "
+                            f"(token={token_id[:16]}…)"
+                        )
+                        signed = _sign_limit(neg_risk_flag)
+                        resp = self.client.post_order(signed, OrderType.GTC)
+                    else:
+                        raise
                 result["status"] = resp.get("status", "unknown")
                 result["order_id"] = resp.get("orderID")
                 self._log(
