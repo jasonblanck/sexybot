@@ -227,6 +227,13 @@ REDEEMER_CHECK_SEC     = int(os.getenv("REDEEMER_CHECK_SEC", "300"))    # 5 min 
 # Anthropic daily spend alert. If the rolling 24h Claude-API spend exceeds
 # this, a single Telegram ping is sent per UTC day. Set 0 to disable.
 CLAUDE_DAILY_BUDGET_USD = float(os.getenv("CLAUDE_DAILY_BUDGET_USD", "25.0"))
+# No-trade-fired watchdog. If the bot has been up at least this many hours
+# AND no real fill has been observed in the last NO_TRADE_ALERT_HOURS, fire
+# a single Telegram alert. Catches the failure mode of 2026-04-30 (bot
+# running, scanning markets, but no trades reaching the wire — went
+# unnoticed for hours). Re-armed every NO_TRADE_ALERT_HOURS/2 if condition
+# persists. Set 0 to disable. No-op if Telegram creds unset or DRY_RUN.
+NO_TRADE_ALERT_HOURS = float(os.getenv("NO_TRADE_ALERT_HOURS", "6"))
 if CLAUDE_MAX_DISABLED:
     # Force every AI feature off — keeps downstream code paths safe
     # without having to check CLAUDE_MAX_DISABLED everywhere.
@@ -427,6 +434,13 @@ class PolymarketBot:
         # Spend-alert task + latch (one ping per UTC day when exceeded)
         self._spend_monitor_task:   Optional[asyncio.Task] = None
         self._spend_alert_sent_ymd: str = ""
+        # No-trade watchdog — fires Telegram alert if no real fill has happened
+        # in NO_TRADE_ALERT_HOURS. Latch prevents repeated alerts within the
+        # same window. _service_start_at is used for uptime gating so a fresh
+        # restart doesn't immediately alert.
+        self._no_trade_watchdog_task: Optional[asyncio.Task] = None
+        self._no_trade_alert_at:      float = 0.0
+        self._service_start_at:       float = time.time()
         # Trip after 2 consecutive insufficient-balance rejections; requires
         # a restart to clear (intentional — operator must top up and verify).
         self._balance_error_streak: int = 0
@@ -4337,6 +4351,86 @@ class PolymarketBot:
             except asyncio.CancelledError:
                 break
 
+    def _has_real_trade_within(self, hours: float) -> bool:
+        """Return True if self.trades has at least one real fill within
+        `hours`. "Real" = status set, not in the obvious-bad / skip / sim
+        statuses. Used by the no-trade watchdog. Walks the buffer in reverse
+        and short-circuits on first match (or first older-than-cutoff)."""
+        cutoff = datetime.utcnow().timestamp() - (hours * 3600)
+        bad = {"error", "unmatched", "no_match", "rejected", "canceled", "cancelled",
+               "simulated", "skip_error_cooldown", "skip_price_ceiling", "unknown",
+               "", "none"}
+        for t in reversed(self.trades):
+            ts_iso = t.get("time", "")
+            try:
+                ts = datetime.fromisoformat(str(ts_iso).replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError):
+                continue
+            if ts < cutoff:
+                return False  # all remaining entries are older than cutoff
+            status = str(t.get("status", "")).lower()
+            if status not in bad and "error" not in status:
+                return True
+        return False
+
+    async def _no_trade_watchdog_loop(self):
+        """Background task — every 30 minutes, check whether any real trade
+        has fired in the last NO_TRADE_ALERT_HOURS. If not (and bot has been
+        running long enough, isn't halted, isn't DRY_RUN), send a Telegram
+        alert. Latch re-arms after NO_TRADE_ALERT_HOURS/2 to avoid spam.
+        Catches the failure mode of 2026-04-30: bot up + scanning + signals
+        flowing, but every signal getting silently gated — went unnoticed
+        for hours. No-op if NO_TRADE_ALERT_HOURS=0 or Telegram creds unset
+        or DRY_RUN."""
+        if (NO_TRADE_ALERT_HOURS <= 0
+            or DRY_RUN
+            or not TELEGRAM_TOKEN
+            or not TELEGRAM_CHAT_ID):
+            return
+        # Boot delay — give the bot at least one full alert window to actually
+        # trade before threatening to alert. Prevents a restart from instantly
+        # tripping the watchdog if no trade fired in the prior N hours.
+        try:
+            await asyncio.sleep(NO_TRADE_ALERT_HOURS * 3600)
+        except asyncio.CancelledError:
+            return
+        while self.running:
+            try:
+                now = time.time()
+                uptime = now - self._service_start_at
+                # Need at least one full window of uptime before alerting
+                if (uptime >= NO_TRADE_ALERT_HOURS * 3600
+                        and not self._balance_halt_tripped
+                        and not self._has_real_trade_within(NO_TRADE_ALERT_HOURS)):
+                    # Latch — re-fire only every NO_TRADE_ALERT_HOURS/2
+                    latch_seconds = NO_TRADE_ALERT_HOURS * 1800
+                    if now - self._no_trade_alert_at > latch_seconds:
+                        self._no_trade_alert_at = now
+                        try:
+                            cash = self.get_balance()
+                        except Exception:
+                            cash = -1.0
+                        cycles = self._skip_cycles_completed
+                        msg = (
+                            f"⚠️ sexybot: no real trade in {NO_TRADE_ALERT_HOURS:.1f}h.\n"
+                            f"Cash: ${cash:.2f}, cycles: {cycles}.\n"
+                            f"Check /status skip_counts for which gate is blocking."
+                        )
+                        await asyncio.to_thread(self.send_telegram, msg)
+                        self._log(
+                            f"[NO-TRADE WATCHDOG] alert sent — uptime {uptime/3600:.1f}h, "
+                            f"cycles {cycles}",
+                            "warning",
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning(f"no-trade watchdog error: {e}")
+            try:
+                await asyncio.sleep(1800)   # 30 min
+            except asyncio.CancelledError:
+                break
+
     async def _daily_summary_loop(self):
         """Background task — fires one Telegram digest per UTC day at the
         configured hour:min. No-op if Telegram creds aren't set or
@@ -5754,6 +5848,11 @@ async def lifespan(app_: FastAPI):
         if CLAUDE_DAILY_BUDGET_USD > 0 and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
             bot._spend_monitor_task = asyncio.create_task(bot._spend_monitor_loop())
             log.info(f"[SPEND ALERT] scheduled (budget ${CLAUDE_DAILY_BUDGET_USD:.2f}/day)")
+        # No-trade watchdog — silent if disabled / DRY_RUN / no Telegram.
+        if (NO_TRADE_ALERT_HOURS > 0 and not DRY_RUN
+                and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+            bot._no_trade_watchdog_task = asyncio.create_task(bot._no_trade_watchdog_loop())
+            log.info(f"[NO-TRADE WATCHDOG] scheduled (alert if no fill in {NO_TRADE_ALERT_HOURS:.1f}h)")
     else:
         log.warning("Could not connect — check .env credentials")
     yield
@@ -5775,6 +5874,8 @@ async def lifespan(app_: FastAPI):
         bot._redeemer_task.cancel()
     if bot._spend_monitor_task and not bot._spend_monitor_task.done():
         bot._spend_monitor_task.cancel()
+    if bot._no_trade_watchdog_task and not bot._no_trade_watchdog_task.done():
+        bot._no_trade_watchdog_task.cancel()
     if _bot_task and not _bot_task.done():
         _bot_task.cancel()
         try:
