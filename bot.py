@@ -55,6 +55,14 @@ DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "500"))
 # Same env var as risk.py ExecutionGate — kept in sync so the dashboard path
 # and the main_v2.py pipeline share one underdog-guard threshold.
 MIN_YES_BUY_PRICE = float(os.getenv("MIN_YES_BUY_PRICE", "0.30"))
+# Symmetric near-decided filter applied at signal generation. Drop markets where
+# yes_p <= NEAR_DECIDED_BAND or yes_p >= (1 - NEAR_DECIDED_BAND). The previous
+# hard-coded 0.02 / 0.98 left a wide 0.02-0.08 / 0.92-0.98 zone where momentum
+# signals fire on dust-filled books (top bid 0.001, top ask 0.999) that pretrade
+# always rejects. Tightening to 0.08 catches them at signal time, freeing up
+# Anthropic spend and signal slots for genuinely tradeable markets. Env-tunable
+# so operators can experiment without a code change.
+NEAR_DECIDED_BAND = float(os.getenv("NEAR_DECIDED_BAND", "0.08"))
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 API_SECRET_KEY    = os.getenv("API_SECRET_KEY", "")
@@ -4377,9 +4385,14 @@ class PolymarketBot:
         # ── Universal pre-filter: skip markets Claude can't trade profitably ──
         liq = float(market.get("liquidity", market.get("liquidityNum", 0)) or 0)
         vol = float(market.get("volume24hr", 0) or 0)
-        # Skip resolved/near-resolved markets (yes≤2% or ≥98%) — no momentum edge,
-        # just burns Anthropic API credits on already-decided outcomes
-        if yes_p <= 0.02 or yes_p >= 0.98:
+        # Skip near-decided markets — no momentum edge, just burns Anthropic API
+        # credits on already-decided outcomes. NEAR_DECIDED_BAND defaults to 0.08
+        # (so we skip yes_p ≤ 0.08 OR ≥ 0.92). Was 0.02 / 0.98 previously, which
+        # let through markets like Clavicular pregnancy (0.97), MegaETH cap
+        # (0.95-0.97), Norway WC (0.997) — all dust-filled books where pretrade
+        # aborted every signal. Tightening here moves the rejection upstream and
+        # frees signal slots for healthier markets.
+        if yes_p <= NEAR_DECIDED_BAND or yes_p >= (1.0 - NEAR_DECIDED_BAND):
             return None
         # Skip dead or illiquid markets — can't execute meaningfully.
         # Weather markets get a lower bar because they typically launch with
@@ -5557,6 +5570,7 @@ class PolymarketBot:
                     "max_entry_price":     MAX_ENTRY_PRICE,
                     "error_cooldown_sec":  ERROR_COOLDOWN_SEC,
                     "min_yes_buy_price":   MIN_YES_BUY_PRICE,
+                    "near_decided_band":   NEAR_DECIDED_BAND,
                     "ai_min_confidence":   AI_MIN_CONFIDENCE,
                     "scan_interval_s":     SCAN_INTERVAL_S,
                 },
