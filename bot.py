@@ -5693,22 +5693,59 @@ class PolymarketBot:
     _positions_cache_time: float = 0.0
 
     def get_balance(self, force: bool = False) -> float:
-        """Fetch USDC cash balance from Polymarket (sig_type=2 proxy wallet). Cached 30s."""
+        """Fetch USDC.e cash balance for the proxy wallet. Cached 30s.
+
+        Tries CLOB client first; falls back to a direct Polygon RPC
+        eth_call against USDC.e if the client is uninitialized or its
+        call throws. The fallback is what keeps the strategy loop from
+        misreading a transient CLOB-client failure as 'wallet empty'
+        (cache resets to 0 on restart, so a single dropped API call
+        otherwise gates every cycle on cycle_wallet_too_low)."""
         if not force and time.time() - self._balance_cache_time < 30:
             return self._balance_cache
-        if not self.client:
-            return self._balance_cache
+
+        if self.client:
+            try:
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)
+                result = self.client.get_balance_allowance(params)
+                raw = float(result.get("balance", 0))
+                self._balance_cache = round(raw / 1_000_000, 2)
+                self._balance_cache_time = time.time()
+                return self._balance_cache
+            except Exception as e:
+                log.warning(f"get_balance CLOB path failed: {e!r} — trying RPC fallback")
+
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)
-            result = self.client.get_balance_allowance(params)
-            raw = float(result.get("balance", 0))
+            proxy = os.getenv("POLYMARKET_FUNDER", "") or self.get_proxy_wallet()
+            if not proxy:
+                log.warning("get_balance RPC fallback: no proxy wallet address")
+                return self._balance_cache
+            import json as _j
+            usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+            addr_padded = proxy.lower().removeprefix("0x").rjust(64, "0")
+            call_data = "0x70a08231" + addr_padded
+            payload = {
+                "jsonrpc": "2.0", "method": "eth_call", "id": 1,
+                "params": [{"to": usdc_e, "data": call_data}, "latest"],
+            }
+            req = _ureq.Request(
+                "https://polygon-rpc.com",
+                data=_j.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with _ureq.urlopen(req, timeout=5) as r:
+                resp = _j.loads(r.read())
+            hex_balance = resp.get("result") or "0x0"
+            raw = int(hex_balance, 16)
             self._balance_cache = round(raw / 1_000_000, 2)
             self._balance_cache_time = time.time()
+            log.info(f"get_balance via Polygon RPC fallback: ${self._balance_cache:.2f}")
             return self._balance_cache
         except Exception as e:
-            log.debug(f"get_balance error: {e}")
-            return self._balance_cache
+            log.warning(f"get_balance RPC fallback failed: {e!r}")
+
+        return self._balance_cache
 
     _PM_HEADERS = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
