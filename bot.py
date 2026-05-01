@@ -4487,10 +4487,19 @@ class PolymarketBot:
                         except Exception:
                             cash = -1.0
                         cycles = self._skip_cycles_completed
+                        top = sorted(
+                            self._skip_counts.items(),
+                            key=lambda kv: kv[1],
+                            reverse=True,
+                        )[:3]
+                        blockers = (
+                            ", ".join(f"{k}: {v}" for k, v in top)
+                            if top else "none recorded"
+                        )
                         msg = (
                             f"⚠️ sexybot: no real trade in {NO_TRADE_ALERT_HOURS:.1f}h.\n"
                             f"Cash: ${cash:.2f}, cycles: {cycles}.\n"
-                            f"Check /status skip_counts for which gate is blocking."
+                            f"Top blockers: {blockers}"
                         )
                         await asyncio.to_thread(self.send_telegram, msg)
                         self._log(
