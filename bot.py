@@ -5704,15 +5704,22 @@ class PolymarketBot:
         if not force and time.time() - self._balance_cache_time < 30:
             return self._balance_cache
 
+        clob_balance: float | None = None
         if self.client:
             try:
                 from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
                 params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)
                 result = self.client.get_balance_allowance(params)
                 raw = float(result.get("balance", 0))
-                self._balance_cache = round(raw / 1_000_000, 2)
-                self._balance_cache_time = time.time()
-                return self._balance_cache
+                clob_balance = round(raw / 1_000_000, 2)
+                if clob_balance > 0:
+                    self._balance_cache = clob_balance
+                    self._balance_cache_time = time.time()
+                    return self._balance_cache
+                log.warning(
+                    f"get_balance CLOB returned ${clob_balance:.2f} (raw={result!r}) "
+                    f"— verifying via RPC"
+                )
             except Exception as e:
                 log.warning(f"get_balance CLOB path failed: {e!r} — trying RPC fallback")
 
@@ -5720,7 +5727,7 @@ class PolymarketBot:
             proxy = os.getenv("POLYMARKET_FUNDER", "") or self.get_proxy_wallet()
             if not proxy:
                 log.warning("get_balance RPC fallback: no proxy wallet address")
-                return self._balance_cache
+                return self._balance_cache if clob_balance is None else clob_balance
             import json as _j
             usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
             addr_padded = proxy.lower().removeprefix("0x").rjust(64, "0")
@@ -5738,13 +5745,23 @@ class PolymarketBot:
                 resp = _j.loads(r.read())
             hex_balance = resp.get("result") or "0x0"
             raw = int(hex_balance, 16)
-            self._balance_cache = round(raw / 1_000_000, 2)
+            rpc_balance = round(raw / 1_000_000, 2)
+            # Use whichever is larger — if CLOB silently returned 0 but the
+            # wallet actually has USDC.e, RPC is the source of truth.
+            chosen = max(rpc_balance, clob_balance or 0.0)
+            self._balance_cache = chosen
             self._balance_cache_time = time.time()
-            log.info(f"get_balance via Polygon RPC fallback: ${self._balance_cache:.2f}")
+            log.info(
+                f"get_balance: clob=${clob_balance if clob_balance is not None else 'n/a'} "
+                f"rpc=${rpc_balance:.2f} → using ${chosen:.2f}"
+            )
             return self._balance_cache
         except Exception as e:
             log.warning(f"get_balance RPC fallback failed: {e!r}")
 
+        if clob_balance is not None:
+            self._balance_cache = clob_balance
+            self._balance_cache_time = time.time()
         return self._balance_cache
 
     _PM_HEADERS = {
