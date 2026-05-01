@@ -5750,13 +5750,13 @@ class PolymarketBot:
                 log.warning("get_balance RPC fallback: no proxy wallet address")
                 return self._balance_cache if clob_balance is None else clob_balance
             import json as _j
-            usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+            # Polymarket migrated from USDC.e to native USDC (Circle) — query
+            # both so funds in either contract show up. Take the larger.
+            tokens = [
+                ("USDC.e", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+                ("USDC",   "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"),
+            ]
             addr_padded = proxy.lower().removeprefix("0x").rjust(64, "0")
-            call_data = "0x70a08231" + addr_padded
-            payload = {
-                "jsonrpc": "2.0", "method": "eth_call", "id": 1,
-                "params": [{"to": usdc_e, "data": call_data}, "latest"],
-            }
             rpc_endpoints = [
                 "https://polygon.llamarpc.com",
                 "https://polygon-bor-rpc.publicnode.com",
@@ -5764,28 +5764,39 @@ class PolymarketBot:
                 "https://1rpc.io/matic",
                 "https://polygon-rpc.com",
             ]
-            rpc_balance: float | None = None
-            for url in rpc_endpoints:
-                try:
-                    req = _ureq.Request(
-                        url,
-                        data=_j.dumps(payload).encode("utf-8"),
-                        headers={
-                            "Content-Type": "application/json",
-                            "User-Agent": "sexybot/1.0",
-                        },
-                    )
-                    with _ureq.urlopen(req, timeout=5) as r:
-                        resp = _j.loads(r.read())
-                    if "result" in resp and resp["result"]:
-                        raw = int(resp["result"], 16)
-                        rpc_balance = round(raw / 1_000_000, 2)
-                        log.info(f"get_balance RPC ({url}) → ${rpc_balance:.2f}")
-                        break
-                except Exception as e:
-                    log.debug(f"get_balance RPC {url} failed: {e!r}")
+            balances: dict[str, float] = {}
+            for tok_name, tok_addr in tokens:
+                call_data = "0x70a08231" + addr_padded
+                payload = {
+                    "jsonrpc": "2.0", "method": "eth_call", "id": 1,
+                    "params": [{"to": tok_addr, "data": call_data}, "latest"],
+                }
+                for url in rpc_endpoints:
+                    try:
+                        req = _ureq.Request(
+                            url,
+                            data=_j.dumps(payload).encode("utf-8"),
+                            headers={
+                                "Content-Type": "application/json",
+                                "User-Agent": "sexybot/1.0",
+                            },
+                        )
+                        with _ureq.urlopen(req, timeout=5) as r:
+                            resp = _j.loads(r.read())
+                        if "result" in resp and resp["result"]:
+                            raw = int(resp["result"], 16)
+                            balances[tok_name] = round(raw / 1_000_000, 2)
+                            break
+                    except Exception as e:
+                        log.debug(f"get_balance RPC {url} ({tok_name}) failed: {e!r}")
+            if balances:
+                log.info(
+                    f"get_balance on-chain ({proxy[:6]}…{proxy[-4:]}): "
+                    + ", ".join(f"{k}=${v:.2f}" for k, v in balances.items())
+                )
+            rpc_balance = max(balances.values()) if balances else None
             if rpc_balance is None:
-                log.warning("get_balance: all RPC endpoints failed")
+                log.warning("get_balance: all RPC endpoints failed for both tokens")
                 if clob_balance is not None:
                     self._balance_cache = clob_balance
                     self._balance_cache_time = time.time()
