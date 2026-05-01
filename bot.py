@@ -5706,22 +5706,43 @@ class PolymarketBot:
 
         clob_balance: float | None = None
         if self.client:
-            try:
-                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)
-                result = self.client.get_balance_allowance(params)
-                raw = float(result.get("balance", 0))
-                clob_balance = round(raw / 1_000_000, 2)
-                if clob_balance > 0:
-                    self._balance_cache = clob_balance
-                    self._balance_cache_time = time.time()
-                    return self._balance_cache
-                log.warning(
-                    f"get_balance CLOB returned ${clob_balance:.2f} (raw={result!r}) "
-                    f"— verifying via RPC"
-                )
-            except Exception as e:
-                log.warning(f"get_balance CLOB path failed: {e!r} — trying RPC fallback")
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)
+            for attempt in (0, 1):
+                try:
+                    result = self.client.get_balance_allowance(params)
+                    raw = float(result.get("balance", 0))
+                    clob_balance = round(raw / 1_000_000, 2)
+                    if clob_balance > 0:
+                        self._balance_cache = clob_balance
+                        self._balance_cache_time = time.time()
+                        return self._balance_cache
+                    log.warning(
+                        f"get_balance CLOB returned ${clob_balance:.2f} (raw={result!r}) "
+                        f"— verifying via RPC"
+                    )
+                    break
+                except Exception as e:
+                    err = str(e).lower()
+                    auth_err = ("401" in err or "unauthorized" in err
+                                or "invalid api key" in err)
+                    if auth_err and attempt == 0:
+                        log.warning(
+                            "get_balance CLOB 401 — re-deriving L2 API creds and retrying"
+                        )
+                        try:
+                            derived = self.client.create_or_derive_api_creds()
+                            self.client.set_api_creds(derived)
+                            log.info(
+                                f"get_balance: re-derived L2 creds "
+                                f"(api_key prefix={derived.api_key[:8]}…)"
+                            )
+                            continue
+                        except Exception as e2:
+                            log.warning(f"create_or_derive_api_creds failed: {e2!r}")
+                            break
+                    log.warning(f"get_balance CLOB path failed: {e!r} — trying RPC fallback")
+                    break
 
         try:
             proxy = os.getenv("POLYMARKET_FUNDER", "") or self.get_proxy_wallet()
@@ -5736,18 +5757,39 @@ class PolymarketBot:
                 "jsonrpc": "2.0", "method": "eth_call", "id": 1,
                 "params": [{"to": usdc_e, "data": call_data}, "latest"],
             }
-            req = _ureq.Request(
+            rpc_endpoints = [
+                "https://polygon.llamarpc.com",
+                "https://polygon-bor-rpc.publicnode.com",
+                "https://rpc.ankr.com/polygon",
+                "https://1rpc.io/matic",
                 "https://polygon-rpc.com",
-                data=_j.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-            )
-            with _ureq.urlopen(req, timeout=5) as r:
-                resp = _j.loads(r.read())
-            hex_balance = resp.get("result") or "0x0"
-            raw = int(hex_balance, 16)
-            rpc_balance = round(raw / 1_000_000, 2)
-            # Use whichever is larger — if CLOB silently returned 0 but the
-            # wallet actually has USDC.e, RPC is the source of truth.
+            ]
+            rpc_balance: float | None = None
+            for url in rpc_endpoints:
+                try:
+                    req = _ureq.Request(
+                        url,
+                        data=_j.dumps(payload).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "sexybot/1.0",
+                        },
+                    )
+                    with _ureq.urlopen(req, timeout=5) as r:
+                        resp = _j.loads(r.read())
+                    if "result" in resp and resp["result"]:
+                        raw = int(resp["result"], 16)
+                        rpc_balance = round(raw / 1_000_000, 2)
+                        log.info(f"get_balance RPC ({url}) → ${rpc_balance:.2f}")
+                        break
+                except Exception as e:
+                    log.debug(f"get_balance RPC {url} failed: {e!r}")
+            if rpc_balance is None:
+                log.warning("get_balance: all RPC endpoints failed")
+                if clob_balance is not None:
+                    self._balance_cache = clob_balance
+                    self._balance_cache_time = time.time()
+                return self._balance_cache
             chosen = max(rpc_balance, clob_balance or 0.0)
             self._balance_cache = chosen
             self._balance_cache_time = time.time()
