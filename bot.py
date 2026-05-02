@@ -5761,11 +5761,14 @@ class PolymarketBot:
                 log.warning("get_balance RPC fallback: no proxy wallet address")
                 return self._balance_cache if clob_balance is None else clob_balance
             import json as _j
-            # Polymarket migrated from USDC.e to native USDC (Circle) — query
-            # both so funds in either contract show up. Take the larger.
+            # CLOB V2 (2026-04-28) introduced pUSD as the trading collateral —
+            # funds get migrated from USDC.e/USDC into pUSD when you use V2.
+            # Query all three so the largest balance wins regardless of where
+            # the wallet's collateral currently lives.
             tokens = [
                 ("USDC.e", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
                 ("USDC",   "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"),
+                ("pUSD",   "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"),
             ]
             addr_padded = proxy.lower().removeprefix("0x").rjust(64, "0")
             rpc_endpoints = [
