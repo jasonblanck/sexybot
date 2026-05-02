@@ -3,7 +3,7 @@ executor.py
 Polymarket V2 — Limit Order Execution Pipeline
 
 Auth flow:
-  1. ClobClient.create_or_derive_api_creds() calls L1 ClobAuth EIP-712 once
+  1. ClobClient.create_or_derive_api_key() calls L1 ClobAuth EIP-712 once
   2. All subsequent calls use L2 HMAC (api_key + secret)
 
 Balance: fetched once per scan cycle by the caller; passed into
@@ -85,7 +85,7 @@ def _make_client(private_key: str, funder_address: Optional[str] = None) -> Clob
         signature_type = sig_type,
         funder         = funder,
     )
-    creds = client.create_or_derive_api_creds()
+    creds = client.create_or_derive_api_key()
     client.set_api_creds(creds)
     mode = {0: "EOA", 1: "POLY_PROXY", 2: "POLY_GNOSIS_SAFE"}.get(sig_type, str(sig_type))
     log.info(

@@ -877,7 +877,7 @@ class PolymarketBot:
             # Always derive fresh L2 creds from the wallet rather than trusting
             # POLYMARKET_API_KEY/SECRET/PASSPHRASE in .env: those are V1 creds
             # that started returning 401 after the CLOB V2 cutover (2026-04-28),
-            # and create_or_derive_api_creds() is deterministic per (wallet, nonce)
+            # and create_or_derive_api_key() is deterministic per (wallet, nonce)
             # so re-deriving doesn't churn the key.
             l1 = ClobClient(
                 host=CLOB_HOST,
@@ -887,7 +887,7 @@ class PolymarketBot:
                 signature_type=0,
             )
             self._log("Deriving L2 API credentials from wallet…")
-            derived = l1.create_or_derive_api_creds()
+            derived = l1.create_or_derive_api_key()
             self.client = ClobClient(
                 host=CLOB_HOST,
                 chain_id=CHAIN_ID,
@@ -5730,7 +5730,7 @@ class PolymarketBot:
                             "get_balance CLOB 401 — re-deriving L2 API creds and retrying"
                         )
                         try:
-                            derived = self.client.create_or_derive_api_creds()
+                            derived = self.client.create_or_derive_api_key()
                             self.client.set_api_creds(derived)
                             log.info(
                                 f"get_balance: re-derived L2 creds "
@@ -5738,7 +5738,7 @@ class PolymarketBot:
                             )
                             continue
                         except Exception as e2:
-                            log.warning(f"create_or_derive_api_creds failed: {e2!r}")
+                            log.warning(f"create_or_derive_api_key failed: {e2!r}")
                             break
                     log.warning(f"get_balance CLOB path failed: {e!r} — trying RPC fallback")
                     break
