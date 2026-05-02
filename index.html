@@ -203,6 +203,10 @@ body[data-theme="light"] .panel{box-shadow:var(--hero-shadow);}
 .badge{font-family:var(--mono);font-size:9px;font-weight:500;padding:2px 6px;border-radius:2px;text-align:center;letter-spacing:1px;}
 .badge-y{background:#00cc6618;color:var(--green);border:1px solid #00cc6630;}
 .badge-n{background:#ff335518;color:var(--red);border:1px solid #ff335530;}
+.badge-err{background:#88888818;color:var(--text3);border:1px solid #88888830;}
+.tlog-pnl-pos{color:var(--green);font-weight:600;}
+.tlog-pnl-neg{color:var(--red);font-weight:600;}
+.tlog-amt-muted{color:var(--text3);}
 .badge-traded{background:#3399ff18;color:var(--blue);border:1px solid #3399ff30;}
 .badge-skip{background:#55555518;color:var(--text3);border:1px solid #55555530;}
 .badge-block{background:#ff335518;color:var(--red);border:1px solid #ff335530;}
@@ -1424,10 +1428,9 @@ async function fetchBot(){
       document.getElementById('sig-feed').innerHTML=sigs.slice(-25).reverse().map(s=>{const isY=s.signal&&s.signal.includes('YES');const slug=(s.market||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,60);const mkt=safeHtml(s.market||'');return`<div class="feed-item"><span class="badge ${isY?'badge-y':'badge-n'}">${isY?'YES':'NO'}</span><span class="feed-mkt"><a href="https://polymarket.com/event/${safeHtml(slug)}" target="_blank" rel="noopener noreferrer">${mkt.slice(0,56)}${mkt.length>56?'…':''}</a></span><span class="feed-conf">${safeHtml(String(s.confidence||0))}%</span></div>`;}).join('');
       const topSig=sigs[sigs.length-1];if(topSig&&topSig.time!==_lastSigTime){_lastSigTime=topSig.time;const row=document.querySelector('#sig-feed .feed-item');if(row)row.classList.add((topSig.signal||'').includes('YES')?'flash-buy':'flash-sell');}
     }
-    if(trades.length>0){
-      document.getElementById('tlog').innerHTML=trades.slice(-25).reverse().map(t=>{const isY=t.side==='YES'||t.side==='BUY';return`<div class="tlog-item"><span class="tlog-mkt">${safeHtml((t.market||'').slice(0,36))}…</span><span class="badge ${isY?'badge-y':'badge-n'}">${safeHtml(t.side||'BUY')}</span><span class="tlog-amt">${fmt$(t.amount_usdc||t.amount||0)}</span></div>`;}).join('');
-      const topTrade=trades[trades.length-1];if(topTrade&&topTrade.time!==_lastTradeTime){_lastTradeTime=topTrade.time;const row=document.querySelector('#tlog .tlog-item');if(row)row.classList.add((topTrade.side==='BUY'||topTrade.side==='YES')?'flash-buy':'flash-sell');}
-    }
+    // Trade history is rendered by fetchActivity() against /activity, which
+    // joins placement state with resolution P&L. The legacy inline render
+    // only had moment-of-placement data so it could never show wins/losses.
     const logs=d.log||[];
     _allLogs=logs;
     if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(line=>{let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return`<div class="${c}">${safeHtml(line)}</div>`;}).join('');}
@@ -1599,6 +1602,57 @@ async function fetchPortfolio(){
 }
 let _portfolioCache=null;
 
+/* ── ACTIVITY (TRADE HISTORY w/ resolution P&L) ──
+   Uses /activity which queries the trades DB for the full BUY → resolve
+   lifecycle, so we can render winning / losing redemptions inline with
+   the original orders (Polymarket-style). The legacy inline render in
+   fetchBot() only had moment-of-placement data — replaced below. */
+async function fetchActivity(){
+  try{
+    const r=await fetch(`${BOT}/activity?limit=25`);
+    if(!r.ok)return;
+    const events=await r.json();
+    const el=document.getElementById('tlog');
+    if(!el)return;
+    if(!events||events.length===0){
+      el.innerHTML='<div style="color:var(--text3);font-size:11px;padding:8px 0">no trades yet</div>';
+      return;
+    }
+    el.innerHTML=events.map(t=>{
+      const market=safeHtml((t.market||'').slice(0,36));
+      const cost=Math.abs(parseFloat(t.amount)||0);
+      let badge,amt;
+      if(t.resolved){
+        const pnl=parseFloat(t.realized_pnl)||0;
+        const won=!!t.won;
+        badge=`<span class="badge ${won?'badge-y':'badge-n'}">${won?'WIN':'LOSS'}</span>`;
+        const sign=pnl>=0?'+':'−';
+        const cls=pnl>=0?'tlog-pnl-pos':'tlog-pnl-neg';
+        amt=`<span class="tlog-amt">${fmt$(cost)} <span class="${cls}">${sign}${fmt$(Math.abs(pnl))}</span></span>`;
+      }else if(t.kind==='error'){
+        badge='<span class="badge badge-err">ERR</span>';
+        amt=`<span class="tlog-amt tlog-amt-muted">${fmt$(cost)}</span>`;
+      }else{
+        // open / delayed / matched / live — order placed, awaiting resolution
+        const isY=t.side==='YES'||t.side==='BUY';
+        badge=`<span class="badge ${isY?'badge-y':'badge-n'}">${safeHtml(t.side||'BUY')}</span>`;
+        amt=`<span class="tlog-amt">${fmt$(cost)}</span>`;
+      }
+      return`<div class="tlog-item"><span class="tlog-mkt">${market}…</span>${badge}${amt}</div>`;
+    }).join('');
+    // Flash the top row when a new event comes in
+    const topTime=events[0]&&events[0].time;
+    if(topTime&&topTime!==_lastTradeTime){
+      _lastTradeTime=topTime;
+      const row=document.querySelector('#tlog .tlog-item');
+      if(row){
+        const flashCls=events[0].resolved?(events[0].won?'flash-buy':'flash-sell'):'flash-buy';
+        row.classList.add(flashCls);
+      }
+    }
+  }catch(e){}
+}
+
 /* ── PAPER PORTFOLIO ── */
 async function fetchPaperPortfolio(){
   try{
@@ -1689,7 +1743,7 @@ function applyState(d){
   if(d.gas&&d.gas.gwei!=null){const g=d.gas;const gc=g.multiplier>=4?'r':g.multiplier>=2.5?'o':g.multiplier>=1.5?'y':'g';document.getElementById('gas-state').innerHTML=`<span class="${gc}">${g.gwei} gwei · ${g.multiplier}x</span>`;}
   const sigs=d.signals||[];_allSignals=sigs;document.getElementById('sig-count').textContent=sigs.length;
   if(sigs.length>0){document.getElementById('sig-feed').innerHTML=sigs.slice(-25).reverse().map(s=>{const isY=s.signal&&s.signal.includes('YES');return`<div class="feed-item"><span class="badge ${isY?'badge-y':'badge-n'}">${isY?'YES':'NO'}</span><span class="feed-mkt">${safeHtml((s.market||'').slice(0,56))}</span><span class="feed-conf">${parseFloat(s.confidence||0)||0}%</span></div>`;}).join('');}
-  if(trades.length>0){document.getElementById('tlog').innerHTML=trades.slice(-25).reverse().map(t=>{const isY=t.side==='YES'||t.side==='BUY';return`<div class="tlog-item"><span class="tlog-mkt">${safeHtml((t.market||'').slice(0,36))}...</span><span class="badge ${isY?'badge-y':'badge-n'}">${safeHtml(t.side||'BUY')}</span><span class="tlog-amt">${fmt$(t.amount_usdc||t.amount||0)}</span></div>`;}).join('');}
+  // tlog is owned by fetchActivity() — see /activity endpoint for rationale.
   const logs=d.log||[];_allLogs=logs;
   if(logs.length>0){document.getElementById('blog').innerHTML=logs.slice(-60).reverse().map(line=>{let c='li';if(line.includes('ERROR')||line.includes('failed'))c='le';else if(line.includes('SIGNAL'))c='ls';else if(line.includes('ORDER')||line.includes('DRY'))c='lo';return`<div class="${c}">${safeHtml(line)}</div>`;}).join('');}
   updateChart(trades);
@@ -2405,8 +2459,9 @@ async function applyReview(reviewId,idx,btn){
   }
 }
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();_pollBacktestStatus();fetchClaudeMax();fetchCalibration();fetchSpend();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchActivity();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();_pollBacktestStatus();fetchClaudeMax();fetchCalibration();fetchSpend();
 setInterval(fetchBot,15000);
+setInterval(fetchActivity,15000);
 setInterval(fetchPortfolio,30000);
 setInterval(fetchMarkets,60000);
 setInterval(fetchFMP,300000);

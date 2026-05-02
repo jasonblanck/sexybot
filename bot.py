@@ -6351,6 +6351,66 @@ def portfolio():
     })
 
 
+@app.get("/activity")
+def get_activity(limit: int = 50):
+    """Recent trade activity with full lifecycle (BUY → resolve → P&L).
+
+    Mirrors Polymarket's portfolio history view: each row is a complete
+    BUY-to-resolution event so the dashboard can show wins/losses inline
+    with the original orders, rather than just the moment-of-placement
+    rows that /status's in-memory `trades` list returns.
+
+    Excludes paper / dry-run rows. Errors are included so they stay
+    visible to the operator instead of being silently filtered.
+    """
+    limit = max(1, min(int(limit), 200))
+    try:
+        rows = bot.db.execute(
+            "SELECT time, market, side, amount, price, shares, status, "
+            "       order_id, resolved, won, realized_pnl, resolved_at "
+            "  FROM trades "
+            " WHERE COALESCE(dry_run,0) = 0 "
+            " ORDER BY time DESC "
+            " LIMIT ?",
+            (limit,),
+        ).fetchall()
+    except Exception as e:
+        log.warning(f"/activity query failed: {e!r}")
+        return JSONResponse([])
+
+    out = []
+    for r in rows:
+        # status normalization: bucket the >50k distinct error strings
+        # the bot has historically logged into a single "error" so the
+        # frontend can render one badge instead of free-form text.
+        status_raw = r[6] or ""
+        if status_raw.startswith("error"):
+            kind = "error"
+        elif status_raw in ("delayed", "matched", "filled", "live"):
+            kind = "open"
+        elif status_raw in ("simulated",):
+            kind = "simulated"
+        else:
+            kind = status_raw or "unknown"
+
+        out.append({
+            "time":         r[0],
+            "market":       r[1],
+            "side":         r[2],
+            "amount":       r[3],
+            "price":        r[4],
+            "shares":       r[5],
+            "status":       status_raw,
+            "kind":         kind,
+            "order_id":     r[7],
+            "resolved":     bool(r[8]),
+            "won":          bool(r[9]) if r[9] is not None else None,
+            "realized_pnl": r[10],
+            "resolved_at":  r[11],
+        })
+    return JSONResponse(out)
+
+
 @app.post("/start", dependencies=[Depends(require_api_key)])
 async def start_bot(interval: Optional[float] = None):
     # Default to the env-configured SCAN_INTERVAL_S so /start respects the
