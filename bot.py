@@ -5695,12 +5695,19 @@ class PolymarketBot:
     def get_balance(self, force: bool = False) -> float:
         """Fetch USDC.e cash balance for the proxy wallet. Cached 30s.
 
-        Tries CLOB client first; falls back to a direct Polygon RPC
+        BOT_CAPITAL_USD env override: when set, returns that value and
+        skips CLOB/RPC. Workaround for when Polymarket's /balance-allowance
+        returns 401 despite /order accepting the same HMAC keys.
+
+        Otherwise tries CLOB client; falls back to a direct Polygon RPC
         eth_call against USDC.e if the client is uninitialized or its
-        call throws. The fallback is what keeps the strategy loop from
-        misreading a transient CLOB-client failure as 'wallet empty'
-        (cache resets to 0 on restart, so a single dropped API call
-        otherwise gates every cycle on cycle_wallet_too_low)."""
+        call throws."""
+        override = os.getenv("BOT_CAPITAL_USD")
+        if override:
+            try:
+                return float(override)
+            except ValueError:
+                log.warning(f"BOT_CAPITAL_USD={override!r} is not a valid float")
         if not force and time.time() - self._balance_cache_time < 30:
             return self._balance_cache
 
