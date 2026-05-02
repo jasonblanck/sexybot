@@ -873,30 +873,42 @@ class PolymarketBot:
             self._log("ERROR: PRIVATE_KEY not set in .env", "error")
             return False
         try:
+            creds = None
+            if API_KEY and API_SECRET and API_PASSPHRASE:
+                creds = ApiCreds(
+                    api_key=API_KEY,
+                    api_secret=API_SECRET,
+                    api_passphrase=API_PASSPHRASE,
+                )
             funder = os.getenv("POLYMARKET_FUNDER", "")
-            # Always derive fresh L2 creds from the wallet rather than trusting
-            # POLYMARKET_API_KEY/SECRET/PASSPHRASE in .env: those are V1 creds
-            # that started returning 401 after the CLOB V2 cutover (2026-04-28),
-            # and create_or_derive_api_key() is deterministic per (wallet, nonce)
-            # so re-deriving doesn't churn the key.
-            l1 = ClobClient(
-                host=CLOB_HOST,
-                chain_id=CHAIN_ID,
-                key=PRIVATE_KEY,
-                funder=funder if funder else None,
-                signature_type=0,
-            )
-            self._log("Deriving L2 API credentials from wallet…")
-            derived = l1.create_or_derive_api_key()
+            # signature_type=2 (builder/proxy wallet) required when using API creds
+            sig_type = 2 if creds else 0
             self.client = ClobClient(
                 host=CLOB_HOST,
                 chain_id=CHAIN_ID,
                 key=PRIVATE_KEY,
-                creds=derived,
+                creds=creds,
                 funder=funder if funder else None,
-                signature_type=2 if funder else 0,
+                signature_type=sig_type,
             )
-            self._log(f"L2 key: {derived.api_key[:8]}…")
+            if not creds:
+                # V2 derive_api_key returns 400 "Could not derive" for wallets
+                # that didn't have V2 keys yet. Initial V2 keys had to be
+                # minted out-of-band via create_api_key (Cloudflare blocks
+                # that endpoint from non-browser TLS — used curl_cffi once
+                # to seed POLYMARKET_API_KEY/SECRET/PASSPHRASE in .env).
+                self._log("Deriving L2 API credentials from wallet…")
+                derived = self.client.create_or_derive_api_key()
+                self.client.set_api_creds(derived)
+                self.client = ClobClient(
+                    host=CLOB_HOST,
+                    chain_id=CHAIN_ID,
+                    key=PRIVATE_KEY,
+                    creds=derived,
+                    funder=funder if funder else None,
+                    signature_type=2,
+                )
+                self._log(f"L2 key: {derived.api_key[:8]}…")
             ok = self.client.get_ok()
             self._log(f"Connected to Polymarket CLOB — {ok}")
             self.init_db()
