@@ -1391,13 +1391,26 @@ class PolymarketBot:
     # below feed the Market Movers panel.
     FMP_TICKERS = ["SPY", "^DJI", "^IXIC", "AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN"]
 
+    # Stocks/indices don't move fast enough vs. dashboard refresh to need
+    # 5-min freshness, and FMP's free-tier quota is the hard ceiling. 30-min
+    # TTL cuts daily call count from 9 × 288 = 2592 to 9 × 48 = 432, which
+    # fits comfortably under 250-1000/day plans. Surface refreshes still
+    # happen plenty often for a passive dashboard panel.
+    FMP_CACHE_TTL = 1800
+
     def get_fmp_market(self) -> dict:
-        """Fetch stock quotes from FMP and compute market sentiment score."""
+        """Fetch stock quotes from FMP and compute market sentiment score.
+        Serves last-known-good cache when fresh fetches fail (e.g. FMP
+        429s) so the MARKET MOVERS / INDEXES / top-bar panels don't go
+        blank for an entire day after one rate-limit hit."""
         import json as _j
         if not FMP_API_KEY:
             return {}
-        if time.time() - self._fmp_cache_time < 300 and self._fmp_cache:
+        if time.time() - self._fmp_cache_time < self.FMP_CACHE_TTL and self._fmp_cache:
             return self._fmp_cache
+        # Track whether THIS call hit a rate limit so we don't poison the
+        # cache with partial data when only the first 1-2 tickers landed.
+        rate_limited = False
         results = {}
         for sym in self.FMP_TICKERS:
             try:
@@ -1417,7 +1430,18 @@ class PolymarketBot:
                         "mktcap": q.get("marketCap"),
                     }
             except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "Too Many Requests" in err_str:
+                    rate_limited = True
                 log.debug(f"FMP quote {sym} error: {e}")
+        # Don't poison the cache on a rate-limit blip — keep serving the
+        # last-known-good payload so the dashboard panels stay populated
+        # until the FMP quota resets. Bump _fmp_cache_time so we don't
+        # immediately hammer FMP again on the next request.
+        if rate_limited and len(results) < len(self.FMP_TICKERS) and self._fmp_cache:
+            log.warning(f"FMP rate-limited (got {len(results)}/{len(self.FMP_TICKERS)}); serving cached payload")
+            self._fmp_cache_time = time.time()
+            return self._fmp_cache
         if results:
             # Market sentiment: % of tickers up, weighted by magnitude
             changes = [v["change_pct"] for v in results.values()]
