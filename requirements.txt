@@ -7,7 +7,7 @@
 #   eth-keyfile — must be <0.9  (0.9.x broke eth-account compatibility)
 
 # ── Polymarket CLOB ────────────────────────────────────────────────────────────
-py_clob_client==0.34.6
+py_clob_client_v2==1.0.0
 py_order_utils==0.3.2
 poly_eip712_structs==0.0.1
 py_builder_signing_sdk==0.0.2

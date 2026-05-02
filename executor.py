@@ -17,16 +17,16 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
+from py_clob_client_v2 import ClobClient
+from py_clob_client_v2.clob_types import (
     AssetType,
     BalanceAllowanceParams,
     OrderArgs,
     OrderType,
     PartialCreateOrderOptions,
 )
-from py_clob_client.constants import POLYGON
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client_v2.constants import POLYGON
+from py_clob_client_v2.order_builder.constants import BUY, SELL
 
 from orderbook_ws import BookManager
 from risk import BalanceInfo, ExecutionGate, GateVerdict
@@ -34,15 +34,15 @@ from signing import OrderSide
 
 log = logging.getLogger(__name__)
 
-# py_clob_client uses a shared httpx.Client with no timeout — patch it to 15 s
+# py_clob_client_v2 uses a shared httpx.Client with no timeout — patch it to 15 s
 # so get_balance_allowance / post_order / create_order never hang indefinitely.
 try:
     import httpx as _httpx
-    import py_clob_client.http_helpers.helpers as _clob_http
+    import py_clob_client_v2.http_helpers.helpers as _clob_http
     _clob_http._http_client = _httpx.Client(http2=True, timeout=15.0)
-    log.debug("py_clob_client HTTP timeout patched to 15 s")
+    log.debug("py_clob_client_v2 HTTP timeout patched to 15 s")
 except Exception as _e:
-    log.warning("Could not patch py_clob_client timeout: %s", _e)
+    log.warning("Could not patch py_clob_client_v2 timeout: %s", _e)
 
 CLOB_HOST = "https://clob.polymarket.com"
 

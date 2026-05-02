@@ -1,5 +1,5 @@
 """
-Polymarket Trading Bot — fixed for py_clob_client v0.34+
+Polymarket Trading Bot — migrated to py_clob_client_v2 for CLOB V2 (Apr 28 2026)
 """
 import asyncio, json, logging, os, time, sqlite3, re as _re_mod
 from datetime import datetime, date
@@ -18,13 +18,13 @@ _TOKEN_ID_RE = _re_mod.compile(r"[0-9a-fA-F]{1,80}")
 _VALID_SIDES  = {"BUY", "SELL", "YES", "NO"}
 
 try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import (
+    from py_clob_client_v2 import ClobClient
+    from py_clob_client_v2.clob_types import (
         ApiCreds, OrderArgs, OrderType,
         MarketOrderArgs, PartialCreateOrderOptions,
     )
 except ImportError as e:
-    raise SystemExit(f"Missing dependency: {e}\nRun: pip install py-clob-client")
+    raise SystemExit(f"Missing dependency: {e}\nRun: pip install py-clob-client-v2")
 
 try:
     import uvicorn
@@ -5713,7 +5713,7 @@ class PolymarketBot:
 
         clob_balance: float | None = None
         if self.client:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)
             for attempt in (0, 1):
                 try:
