@@ -243,6 +243,7 @@ body[data-theme="light"] .panel{box-shadow:var(--hero-shadow);}
 .see-all a:hover{color:var(--accent);}
 .crypto-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);gap:10px;}
 .crypto-row:last-child{border-bottom:none;}
+.crypto-divider{margin-top:10px;padding:6px 0 4px;font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--text3);text-transform:uppercase;border-top:1px solid var(--border);text-align:center;}
 .crypto-sym{font-family:var(--mono);font-size:12px;font-weight:500;}
 .crypto-price{font-family:var(--mono);font-size:12px;}
 /* ── INNER PAGE LAYOUT ── */
@@ -687,6 +688,9 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
         <div class="stat-row"><span class="stat-lbl">Trades</span><span class="stat-val b" id="ntrades">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Win rate</span><span class="stat-val y" id="winrate">—</span></div>
         <div class="wr-bar"><div class="wr-fill" id="wrfill" style="width:0%"></div></div>
+        <div class="stat-row" style="margin-top:8px"><span class="stat-lbl">Today · trades</span><span class="stat-val b" id="today-trades">—</span></div>
+        <div class="stat-row"><span class="stat-lbl">Today · realized P&amp;L</span><span class="stat-val" id="today-pnl">—</span></div>
+        <div class="stat-row"><span class="stat-lbl">Today · win rate</span><span class="stat-val y" id="today-winrate">—</span></div>
         <div class="stat-row" style="margin-top:8px"><span class="stat-lbl">Strategy</span><span class="stat-val o" id="strat">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Mode</span><span class="stat-val" id="mode">—</span></div>
         <div class="stat-row" id="paper-mode-row" style="display:none"><span class="stat-lbl">Paper Bal</span><span class="stat-val p" id="paper-bal-mini">—</span></div>
@@ -787,21 +791,18 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <div class="panel-footer"><span>Source · Open-Meteo</span><span>refresh 10m</span></div>
     </div>
     <div class="panel">
-      <div class="panel-title">CRYPTO <span class="pill pill-live">LIVE</span></div>
+      <div class="panel-title">CRYPTO + INDEXES <span class="pill pill-live">LIVE</span></div>
       <div class="crypto-row"><span class="crypto-sym o">BTC</span><span class="crypto-price" id="cbtc">—</span><span id="cbtcc">—</span></div>
       <div class="crypto-row"><span class="crypto-sym b">ETH</span><span class="crypto-price" id="ceth">—</span><span id="cethc">—</span></div>
       <div class="crypto-row"><span class="crypto-sym p">SOL</span><span class="crypto-price" id="csol">—</span><span id="csolc">—</span></div>
       <div class="crypto-row"><span class="crypto-sym g">POL</span><span class="crypto-price" id="cpol">—</span><span id="cpolc">—</span></div>
-      <div class="panel-footer"><span>Source · CoinGecko</span><span>refresh 30s</span></div>
-    </div>
-    <div class="panel">
-      <div class="panel-title">INDEXES <span class="pill pill-live">LIVE</span></div>
+      <div class="crypto-divider">INDEXES</div>
       <div class="crypto-row"><span class="crypto-sym o">DOW</span><span class="crypto-price" id="idow">—</span><span id="idowc">—</span></div>
       <div class="crypto-row"><span class="crypto-sym b">NASDAQ</span><span class="crypto-price" id="indx">—</span><span id="indxc">—</span></div>
       <div class="crypto-row"><span class="crypto-sym p">SPY</span><span class="crypto-price" id="ispy">—</span><span id="ispyc">—</span></div>
       <div class="crypto-row"><span class="crypto-sym g">OIL</span><span class="crypto-price" id="ioil">—</span><span id="ioilc">—</span></div>
       <div class="crypto-row"><span class="crypto-sym o">US 10Y</span><span class="crypto-price" id="i10y">—</span><span id="i10yc">—</span></div>
-      <div class="panel-footer"><span>Source · FMP · FRED</span><span>refresh 60s</span></div>
+      <div class="panel-footer"><span>CoinGecko · FMP · FRED</span><span>refresh 30s</span></div>
     </div>
   </div>
   <div class="col">
@@ -1456,7 +1457,7 @@ async function fetchMarkets(){
   try{
     const r=await fetch(`${BOT}/markets`);const markets=await r.json();
     if(!Array.isArray(markets)||!markets.length)return;
-    document.getElementById('mkt-body').innerHTML=markets.slice(0,10).map(m=>{
+    document.getElementById('mkt-body').innerHTML=markets.slice(0,25).map(m=>{
       let prices;try{prices=JSON.parse(m.outcomePrices||'[0.5,0.5]');}catch{prices=[0.5,0.5];}
       const yes=(parseFloat(prices[0])*100).toFixed(0);const no=(parseFloat(prices[1]!=null?prices[1]:1-prices[0])*100).toFixed(0);
       const vol=parseFloat(m.volume24hr||0);const vs=vol>=1e6?'$'+(vol/1e6).toFixed(1)+'M':vol>=1000?'$'+(vol/1000).toFixed(0)+'K':'$'+vol.toFixed(0);
@@ -1626,16 +1627,41 @@ let _portfolioCache=null;
    fetchBot() only had moment-of-placement data — replaced below. */
 async function fetchActivity(){
   try{
-    const r=await fetch(`${BOT}/activity?limit=25`);
+    // Pull more rows than the panel needs so today-stats below sees the
+    // full picture even after the panel slices to 25 visible rows.
+    const r=await fetch(`${BOT}/activity?limit=200`);
     if(!r.ok)return;
     const events=await r.json();
+    // ── BOT STATS · "Today" rows ──
+    const todayPrefix=new Date().toISOString().slice(0,10);  // UTC YYYY-MM-DD
+    const todays=events.filter(e=>(e.time||'').startsWith(todayPrefix));
+    const tCount=todays.length;
+    const tResolved=todays.filter(e=>e.resolved);
+    const tPnl=tResolved.reduce((s,e)=>s+(parseFloat(e.realized_pnl)||0),0);
+    const tWins=tResolved.filter(e=>e.won).length;
+    const tWr=tResolved.length>0?Math.round(tWins/tResolved.length*100):0;
+    const tEl=document.getElementById('today-trades');
+    if(tEl)tEl.textContent=String(tCount);
+    const pnlEl=document.getElementById('today-pnl');
+    if(pnlEl){
+      const sign=tPnl>=0?'+':'−';
+      const cls=tPnl>=0?'g':'r';
+      pnlEl.className='stat-val '+cls;
+      pnlEl.textContent=tResolved.length>0?sign+fmt$(Math.abs(tPnl)):'—';
+    }
+    const wrEl=document.getElementById('today-winrate');
+    if(wrEl)wrEl.textContent=tResolved.length>0?(tWr+'% ('+tWins+'/'+tResolved.length+')'):'—';
+    // ── TRADE HISTORY panel ──
     const el=document.getElementById('tlog');
     if(!el)return;
     if(!events||events.length===0){
       el.innerHTML='<div style="color:var(--text3);font-size:11px;padding:8px 0">no trades yet</div>';
       return;
     }
-    el.innerHTML=events.map(t=>{
+    // Render only the most recent 25 in the panel (today-stats already
+    // saw the full pool above).
+    const visible=events.slice(0,25);
+    el.innerHTML=visible.map(t=>{
       const market=safeHtml((t.market||'').slice(0,36));
       const cost=Math.abs(parseFloat(t.amount)||0);
       let badge,amt;
