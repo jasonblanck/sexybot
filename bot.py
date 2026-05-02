@@ -1357,9 +1357,13 @@ class PolymarketBot:
     ]
 
     # Key tickers: SPY (S&P proxy), plus individual mega-caps relevant to predictions
-    # SPY/DIA/QQQ are the index ETF surface for the dashboard's INDEXES
-    # panel (S&P 500 / Dow / Nasdaq). Stocks below feed Market Movers.
-    FMP_TICKERS = ["SPY", "DIA", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN"]
+    # SPY (S&P 500 ETF) + ^DJI (Dow index) + ^IXIC (Nasdaq Composite)
+    # feed the dashboard's INDEXES panel. ETFs DIA/QQQ would be more
+    # natural matches for SPY's slot but they're 402 Payment Required
+    # on the current FMP plan tier; the actual indices via Yahoo
+    # notation (^DJI, ^IXIC) are included on the same plan. Stocks
+    # below feed the Market Movers panel.
+    FMP_TICKERS = ["SPY", "^DJI", "^IXIC", "AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN"]
 
     def get_fmp_market(self) -> dict:
         """Fetch stock quotes from FMP and compute market sentiment score."""

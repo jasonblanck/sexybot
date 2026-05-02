@@ -1708,9 +1708,10 @@ async function fetchFMP(){
     const r=await fetch(`${BOT}/fmp`);const d=await r.json();_fmpCache=d;
     const s=d._sentiment||{};const sc=s.spy_change_pct||0;const scls=sc>=0?'g':'r';
     document.getElementById('fmp-sentiment').innerHTML=`<span class="${scls}">SPY ${sc>=0?'+':''}${sc.toFixed(2)}% · ${s.up_count||0}/${s.total||0} up</span>`;
-    // INDEXES panel rows — DOW (DIA ETF), NASDAQ (QQQ), SPY are real-time
-    // intraday from FMP; OIL + US 10Y populated by fetchMarketData (FRED).
-    const idxMap=[['DIA','idow','idowc'],['QQQ','indx','indxc'],['SPY','ispy','ispyc']];
+    // INDEXES panel rows — DOW (^DJI), NASDAQ (^IXIC), SPY (ETF) are
+    // real-time intraday from FMP; OIL + US 10Y are populated by
+    // fetchMarketData (FRED).
+    const idxMap=[['^DJI','idow','idowc'],['^IXIC','indx','indxc'],['SPY','ispy','ispyc']];
     idxMap.forEach(([sym,priceId,chgId])=>{
       const q=d[sym]; if(!q) return;
       const pEl=document.getElementById(priceId), cEl=document.getElementById(chgId);
