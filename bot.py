@@ -2549,7 +2549,10 @@ class PolymarketBot:
         13k+ Brier predictions unresolved). Cached lookups via the
         markets endpoint by clob_token_ids."""
         try:
-            url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
+            # closed=true is required: gamma's default filter excludes closed
+            # markets, but those are exactly the ones we need to settle.
+            # Active markets correctly return [] → function returns None below.
+            url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}&closed=true"
             data = None
             # Try plain urllib first (fast); fall back to curl_cffi on 403,
             # which is what Cloudflare returns when its TLS-fingerprint
