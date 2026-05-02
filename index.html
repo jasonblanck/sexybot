@@ -2307,13 +2307,15 @@ async function fetchRealizedPnl(){
   }catch(e){}
 }
 /* Render a {label: {trades, pnl, profitable_rate, win_rate}} dict into a
-   small monospace table. Empty / null dicts hide the wrapper entirely. */
+   small monospace table. Hides the wrapper entirely when there's nothing
+   to compare — empty dict, or only one bucket (a single-row "by strategy"
+   table tells you nothing the headline cards don't already say). */
 function renderPnlBreakdown(idPrefix, dict){
   const wrap=document.getElementById(idPrefix+'-wrap');
   const body=document.getElementById(idPrefix+'-body');
   if(!wrap||!body) return;
   const entries=Object.entries(dict||{}).filter(([k,v])=>v&&(v.trades||0)>0);
-  if(entries.length===0){wrap.style.display='none'; return;}
+  if(entries.length<=1){wrap.style.display='none'; return;}
   wrap.style.display='';
   // Sort by absolute |pnl| desc so the biggest movers float to the top.
   entries.sort((a,b)=>Math.abs(parseFloat(b[1].pnl)||0)-Math.abs(parseFloat(a[1].pnl)||0));
