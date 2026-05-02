@@ -115,19 +115,30 @@ safe to rerun.
 ## 6. Backups
 
 `/root/polybot/.env` contains secrets and **is not in git** (see
-`.gitignore`). It's the only thing on the VPS that can't be rebuilt
-from this repo. Periodically refresh the iCloud copy:
+`.gitignore`). The trade DB at `/root/polybot/trades.db` (SQLite) holds
+the realized P&L history. Both are backed up automatically:
+
+- **Weekly cron on the VPS** (Sundays at 5am UTC) runs
+  [`scripts/weekly_backup.sh`](../scripts/weekly_backup.sh), which
+  GPG-encrypts `.env` + `trades.db` and writes the blob to two places:
+    - `/var/backups/sexybot/` on the VPS (rotated, last 8)
+    - The private repo `jasonblanck/sexybot-backups` (rotated, last 8)
+- **Encryption passphrase** lives in iCloud at
+  `sexybot-backup-passphrase.txt` and on the VPS at
+  `/root/polybot/.backup-passphrase` (chmod 600).
+
+Restore from a backup:
 
 ```sh
-scp root@159.65.201.165:/root/polybot/.env \
-    "$HOME/Library/Mobile Documents/com~apple~CloudDocs/sexybot.env.$(date +%Y%m%d)"
+# Pick a snapshot from the GitHub repo, then:
+gpg --batch --decrypt \
+    --passphrase "$(cat ~/Library/Mobile\ Documents/com~apple~CloudDocs/sexybot-backup-passphrase.txt)" \
+    sexybot-backup-YYYYMMDD-HHMM.tgz.gpg | tar xzv
+# yields .env and trades.db — drop into /root/polybot/ on a new VPS,
+# install dependencies (see CLAUDE.md), and `systemctl start sexybot`.
 ```
 
-The trade DB at `/root/polybot/trades.db` (SQLite) holds the realized
-P&L history. If you care about preserving it through a VPS migration:
+If you need to decrypt on the Mac and don't have GPG yet:
+`brew install gnupg`.
 
-```sh
-ssh root@159.65.201.165 "tar czf /tmp/sexybot-state.tgz -C /root/polybot .env trades.db"
-scp root@159.65.201.165:/tmp/sexybot-state.tgz \
-    "$HOME/Library/Mobile Documents/com~apple~CloudDocs/sexybot-vps-backup-$(date +%Y%m%d).tgz"
-```
+To trigger a fresh backup on demand: `ssh root@159.65.201.165 /root/polybot/weekly_backup.sh`.
