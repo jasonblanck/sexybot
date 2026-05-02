@@ -42,6 +42,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("polybot")
 
+# Suppress the SDK's "[py_clob_client_v2] request error status=404 …
+# /midpoint … No orderbook exists for the requested token id" line. After a
+# market resolves the orderbook is removed, so the trade-outcome resolver's
+# CLOB-midpoint probe always 404s on the way to the gamma fallback. The bot
+# correctly handles None and continues — the SDK's loud ERROR log just makes
+# real problems harder to find. Drops only this exact case; every other
+# 4xx/5xx the SDK reports is preserved.
+class _SuppressMidpoint404(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        if "status=404" in msg and "/midpoint" in msg and "No orderbook exists" in msg:
+            return False
+        return True
+logging.getLogger("py_clob_client_v2").addFilter(_SuppressMidpoint404())
+
 CLOB_HOST      = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 CHAIN_ID       = int(os.getenv("CHAIN_ID", "137"))
 PRIVATE_KEY    = os.getenv("PRIVATE_KEY", "")
@@ -5068,7 +5083,12 @@ class PolymarketBot:
 
     async def run_loop(self, interval: float = 30.0):
         self.running = True
-        ai_enabled = bool(ANTHROPIC_API_KEY)
+        # AI gate is the conjunction: key present AND not kill-switched. The
+        # circuit breaker downstream uses this to decide whether a None
+        # ai-result is a "failure" (key set but call returned None) vs an
+        # expected no-op (kill switch on, AI never called). Without this
+        # the breaker fires every cycle the moment 3 signals come through.
+        ai_enabled = bool(ANTHROPIC_API_KEY) and not CLAUDE_MAX_DISABLED
         self._log(f"Bot started — strategy={STRATEGY} dry_run={DRY_RUN} interval={interval}s AI={'ON' if ai_enabled else 'OFF'} FRED={'ON' if FRED_API_KEY else 'OFF'}")
         # Pre-warm shared caches in thread executor (non-blocking)
         await asyncio.to_thread(self.get_macro_context)

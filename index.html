@@ -1747,15 +1747,24 @@ async function fetchFMP(){
     const r=await fetch(`${BOT}/fmp`);const d=await r.json();_fmpCache=d;
     const s=d._sentiment||{};const sc=s.spy_change_pct||0;const scls=sc>=0?'g':'r';
     document.getElementById('fmp-sentiment').innerHTML=`<span class="${scls}">SPY ${sc>=0?'+':''}${sc.toFixed(2)}% · ${s.up_count||0}/${s.total||0} up</span>`;
-    // INDEXES panel rows — DOW (^DJI), NASDAQ (^IXIC), SPY (ETF) are
-    // real-time intraday from FMP; OIL + US 10Y are populated by
-    // fetchMarketData (FRED).
-    const idxMap=[['^DJI','idow','idowc'],['^IXIC','indx','indxc'],['SPY','ispy','ispyc']];
-    idxMap.forEach(([sym,priceId,chgId])=>{
+    // INDEXES panel rows + top-bar pills — DOW (^DJI), NASDAQ (^IXIC),
+    // SPY (ETF) are real-time intraday from FMP; OIL + US 10Y are
+    // populated by fetchMarketData (FRED). Top bar (hdow/hspx/hndq)
+    // used to be fetched directly from Yahoo by fetchIndices() but
+    // that is browser-CORS-blocked from the dashboard's host — those
+    // pills sat at "—" forever. Pulling from the FMP cache instead.
+    const idxMap=[['^DJI','idow','idowc','hdow'],['^IXIC','indx','indxc','hndq'],['SPY','ispy','ispyc','hspx']];
+    const fmtIdx=n=>n>=10000?Number(n).toLocaleString('en-US',{maximumFractionDigits:0}):Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+    idxMap.forEach(([sym,priceId,chgId,topId])=>{
       const q=d[sym]; if(!q) return;
       const pEl=document.getElementById(priceId), cEl=document.getElementById(chgId);
       if(pEl&&q.price!=null) pEl.textContent='$'+Number(q.price).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
       if(cEl&&q.change_pct!=null){const c=q.change_pct;cEl.innerHTML=`<span class="${c>=0?'g':'r'}">${c>=0?'+':''}${c.toFixed(2)}%</span>`;}
+      const topEl=document.getElementById(topId);
+      if(topEl&&q.price!=null&&q.change_pct!=null){
+        const c=q.change_pct;const col=c>=0?'#00cc66':'#ff3355';
+        topEl.innerHTML=`<span style="color:${col}">${fmtIdx(q.price)}<span style="font-size:9px;margin-left:3px;">${c>=0?'+':''}${c.toFixed(2)}%</span></span>`;
+      }
     });
     const names={SPY:'S&P 500 ETF',AAPL:'Apple Inc.',MSFT:'Microsoft Corp.',NVDA:'NVIDIA Corp.',TSLA:'Tesla, Inc.',META:'Meta Platforms',AMZN:'Amazon.com'};
     const tickers=['SPY','AAPL','MSFT','NVDA','TSLA','META','AMZN','GOOG'];
@@ -1769,18 +1778,17 @@ async function fetchFMP(){
   }catch(e){}
 }
 
-/* ── INDICES ── */
-function isMarketOpen(){const now=new Date();const et=new Date(now.toLocaleString('en-US',{timeZone:'America/New_York'}));const day=et.getDay();if(day===0||day===6)return false;const h=et.getHours(),m=et.getMinutes();return(h*60+m)>=570&&(h*60+m)<960;}
-async function fetchIndices(){
-  try{
-    const live=isMarketOpen();const syms=live?'%5EDJI,%5EGSPC,%5EIXIC':'YM%3DF,ES%3DF,NQ%3DF';
-    const r=await fetch('https://query1.finance.yahoo.com/v7/finance/quote?symbols='+syms,{headers:{'Accept':'application/json'}});
-    const d=await r.json();const quotes=(d.quoteResponse&&d.quoteResponse.result)||[];
-    const ids=['hdow','hspx','hndq'];
-    const fmtI=n=>n>=10000?Number(n).toLocaleString('en-US',{maximumFractionDigits:0}):Number(n).toLocaleString('en-US',{maximumFractionDigits:2});
-    quotes.forEach((q,i)=>{const el=document.getElementById(ids[i]);if(!el)return;const c=parseFloat(q.regularMarketChangePercent||0);const col=c>=0?'#00cc66':'#ff3355';el.innerHTML=`<span style="color:${col}">${fmtI(q.regularMarketPrice)}<span style="font-size:9px;margin-left:3px;">${c>=0?'+':''}${c.toFixed(2)}%</span></span>`;});
-  }catch(e){}
-}
+/* ── INDICES ──
+   Removed: previously fetched DOW / S&P / NDX directly from Yahoo every 60s
+   for the top-bar pills, but Yahoo's Finance v7 quote endpoint is browser-
+   CORS-blocked from this dashboard's host so the call always failed and the
+   pills sat at "—" forever. The top-bar pills are now populated by
+   fetchFMP() (same FMP indices we already fetch for the INDEXES panel),
+   killing one always-failing network round-trip per minute. fetchIndices
+   was a no-op kept around as a stub so the init list and setInterval line
+   below don't blow up; safe to drop entirely once a follow-up cleans
+   those up. */
+function fetchIndices(){/* deprecated — see comment above */}
 
 /* ── WEBSOCKET ── */
 function connectWS(){
@@ -2565,7 +2573,7 @@ async function applyReview(reviewId,idx,btn){
 initChart();psCalc();
 fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchActivity();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();_pollBacktestStatus();fetchClaudeMax();fetchCalibration();fetchSpend();
 setInterval(fetchBot,15000);
-setInterval(fetchActivity,15000);
+setInterval(fetchActivity,30000);
 setInterval(fetchPortfolio,30000);
 setInterval(fetchMarkets,60000);
 setInterval(fetchFMP,300000);
