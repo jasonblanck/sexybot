@@ -152,6 +152,10 @@ CLAUDE_FAST_MODEL      = os.getenv("CLAUDE_FAST_MODEL", "claude-haiku-4-5")
 CLAUDE_ADAPTIVE_THINK  = os.getenv("CLAUDE_ADAPTIVE_THINK", "true").lower() == "true"
 REGIME_DETECTOR_ENABLED = os.getenv("REGIME_DETECTOR", "true").lower() == "true"
 NIGHTLY_REVIEW_ENABLED  = os.getenv("NIGHTLY_REVIEW",  "true").lower() == "true"
+# Explicit opt-in: lets the operator keep the once-a-day nightly review
+# running even with CLAUDE_MAX_DISABLE on. Cheap (~$0.10 / night) and
+# gives the only feedback loop on why the bot is winning or losing.
+_NIGHTLY_REVIEW_FORCED  = os.getenv("NIGHTLY_REVIEW",  "").lower() == "true"
 # Pre-trade Claude sanity check: right before a real order places, ask Haiku
 # if conditions still support the trade. Catches signals firing into
 # breaking-news reversals. Skipped below PRETRADE_MIN_USD to keep cost and
@@ -269,12 +273,19 @@ if CLAUDE_MAX_DISABLED:
     # Force every AI feature off — keeps downstream code paths safe
     # without having to check CLAUDE_MAX_DISABLED everywhere.
     REGIME_DETECTOR_ENABLED = False
-    NIGHTLY_REVIEW_ENABLED  = False
+    # NIGHTLY_REVIEW is the one feature the operator can opt back in
+    # even with the kill switch on (NIGHTLY_REVIEW=true in .env). It's
+    # ~$0.10/night, runs once daily, and never touches the live trade
+    # path — only writes a recommendations row the operator manually
+    # applies. Everything else stays force-off.
+    if not _NIGHTLY_REVIEW_FORCED:
+        NIGHTLY_REVIEW_ENABLED = False
     PRETRADE_CHECK_ENABLED  = False
     DEEP_ANALYZE_ENABLED    = False
     AUTO_APPLY_ENABLED      = False
     BACKTEST_WEEKLY_ENABLED = False
-    log.warning("CLAUDE_MAX_DISABLE=true — all Claude Max features are OFF")
+    _kept = " (nightly review kept ON via NIGHTLY_REVIEW=true)" if NIGHTLY_REVIEW_ENABLED else ""
+    log.warning(f"CLAUDE_MAX_DISABLE=true — all Claude Max features are OFF{_kept}")
 
 try:
     from paper import PolymarketPaperHandler, paper_resolution_oracle as _paper_oracle
