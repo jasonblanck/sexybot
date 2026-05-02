@@ -794,6 +794,15 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <div class="crypto-row"><span class="crypto-sym g">POL</span><span class="crypto-price" id="cpol">—</span><span id="cpolc">—</span></div>
       <div class="panel-footer"><span>Source · CoinGecko</span><span>refresh 30s</span></div>
     </div>
+    <div class="panel">
+      <div class="panel-title">INDEXES <span class="pill pill-live">LIVE</span></div>
+      <div class="crypto-row"><span class="crypto-sym o">DOW</span><span class="crypto-price" id="idow">—</span><span id="idowc">—</span></div>
+      <div class="crypto-row"><span class="crypto-sym b">NASDAQ</span><span class="crypto-price" id="indx">—</span><span id="indxc">—</span></div>
+      <div class="crypto-row"><span class="crypto-sym p">SPY</span><span class="crypto-price" id="ispy">—</span><span id="ispyc">—</span></div>
+      <div class="crypto-row"><span class="crypto-sym g">OIL</span><span class="crypto-price" id="ioil">—</span><span id="ioilc">—</span></div>
+      <div class="crypto-row"><span class="crypto-sym o">US 10Y</span><span class="crypto-price" id="i10y">—</span><span id="i10yc">—</span></div>
+      <div class="panel-footer"><span>Source · FMP · FRED</span><span>refresh 60s</span></div>
+    </div>
   </div>
   <div class="col">
     <!-- Hidden placeholders — retained so existing fetchPortfolio writes don't throw
@@ -1528,8 +1537,16 @@ async function fetchMarketData(){
     const r=await fetch('/api/market-data');const d=await r.json();_mktDataCache=d;
     const fmtChg=c=>{if(c==null)return '';const s=parseFloat(c).toFixed(2);return` <span style="font-size:10px;color:${c>=0?'#00cc66':'#ff3355'}">${c>=0?'+':''}${s}%</span>`;};
     if(d.vix){const v=d.vix;document.getElementById('mkt-vix').innerHTML=parseFloat(v.price).toFixed(2)+fmtChg(v.change);document.getElementById('wm-vix').innerHTML=parseFloat(v.price).toFixed(2)+fmtChg(v.change);}
-    if(d.oil){const o=d.oil;document.getElementById('mkt-oil').innerHTML='$'+parseFloat(o.price).toFixed(2)+fmtChg(o.change);}
-    if(d.t10y){const t=d.t10y;document.getElementById('mkt-t10y').innerHTML=parseFloat(t.price).toFixed(3)+'%'+fmtChg(t.change);document.getElementById('wm-t10y').innerHTML=parseFloat(t.price).toFixed(3)+'%'+fmtChg(t.change);}
+    if(d.oil){const o=d.oil;const oilPrice='$'+parseFloat(o.price).toFixed(2);document.getElementById('mkt-oil').innerHTML=oilPrice+fmtChg(o.change);
+      // INDEXES panel — OIL price + change %
+      const oilEl=document.getElementById('ioil'),oilC=document.getElementById('ioilc');
+      if(oilEl)oilEl.textContent=oilPrice;
+      if(oilC&&o.change!=null){const c=parseFloat(o.change);oilC.innerHTML=`<span class="${c>=0?'g':'r'}">${c>=0?'+':''}${c.toFixed(2)}%</span>`;}}
+    if(d.t10y){const t=d.t10y;const yieldStr=parseFloat(t.price).toFixed(3)+'%';document.getElementById('mkt-t10y').innerHTML=yieldStr+fmtChg(t.change);document.getElementById('wm-t10y').innerHTML=yieldStr+fmtChg(t.change);
+      // INDEXES panel — US 10Y yield + bp change
+      const ty=document.getElementById('i10y'),tyC=document.getElementById('i10yc');
+      if(ty)ty.textContent=yieldStr;
+      if(tyC&&t.change!=null){const c=parseFloat(t.change);const bp=Math.round(c*100);tyC.innerHTML=`<span class="${c>=0?'g':'r'}">${c>=0?'+':''}${bp}bp</span>`;}}
     if(d.fear_greed){const fg=d.fear_greed;const score=fg.score;const col=score<=25?'#ff3355':score<=45?'#ff9900':score<=55?'#ffcc00':score<=75?'#99cc00':'#00cc66';const html=`<span style="color:${col}">${score} — ${safeHtml(fg.rating)}</span>`;document.getElementById('mkt-fg').innerHTML=html;document.getElementById('wm-fg').innerHTML=html;}
     syncVmx();
   }catch(e){}
@@ -1691,6 +1708,15 @@ async function fetchFMP(){
     const r=await fetch(`${BOT}/fmp`);const d=await r.json();_fmpCache=d;
     const s=d._sentiment||{};const sc=s.spy_change_pct||0;const scls=sc>=0?'g':'r';
     document.getElementById('fmp-sentiment').innerHTML=`<span class="${scls}">SPY ${sc>=0?'+':''}${sc.toFixed(2)}% · ${s.up_count||0}/${s.total||0} up</span>`;
+    // INDEXES panel rows — DOW (DIA ETF), NASDAQ (QQQ), SPY are real-time
+    // intraday from FMP; OIL + US 10Y populated by fetchMarketData (FRED).
+    const idxMap=[['DIA','idow','idowc'],['QQQ','indx','indxc'],['SPY','ispy','ispyc']];
+    idxMap.forEach(([sym,priceId,chgId])=>{
+      const q=d[sym]; if(!q) return;
+      const pEl=document.getElementById(priceId), cEl=document.getElementById(chgId);
+      if(pEl&&q.price!=null) pEl.textContent='$'+Number(q.price).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+      if(cEl&&q.change_pct!=null){const c=q.change_pct;cEl.innerHTML=`<span class="${c>=0?'g':'r'}">${c>=0?'+':''}${c.toFixed(2)}%</span>`;}
+    });
     const names={SPY:'S&P 500 ETF',AAPL:'Apple Inc.',MSFT:'Microsoft Corp.',NVDA:'NVIDIA Corp.',TSLA:'Tesla, Inc.',META:'Meta Platforms',AMZN:'Amazon.com'};
     const tickers=['SPY','AAPL','MSFT','NVDA','TSLA','META','AMZN','GOOG'];
     const rows=tickers.filter(t=>d[t]).map(t=>{
