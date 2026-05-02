@@ -2550,8 +2550,27 @@ class PolymarketBot:
         markets endpoint by clob_token_ids."""
         try:
             url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
-            with _ureq.urlopen(url, timeout=8) as r:
-                data = json.loads(r.read().decode())
+            data = None
+            # Try plain urllib first (fast); fall back to curl_cffi on 403,
+            # which is what Cloudflare returns when its TLS-fingerprint
+            # detection rejects stdlib clients. CF rejects intermittently —
+            # the SDK's own httpx handshake works most of the time, urllib's
+            # less so, but the gamma endpoint flips between accept and 403
+            # without obvious cause. Two paths gives us best of both.
+            try:
+                with _ureq.urlopen(url, timeout=8) as r:
+                    data = json.loads(r.read().decode())
+            except Exception as e:
+                if "403" in str(e):
+                    try:
+                        from curl_cffi import requests as _cffi
+                        r = _cffi.get(url, impersonate="chrome", timeout=8)
+                        if r.status_code == 200:
+                            data = r.json()
+                    except Exception as e2:
+                        log.debug(f"_gamma curl_cffi fallback failed (token={token_id[:16]}…): {e2}")
+                else:
+                    raise
             if not isinstance(data, list) or not data:
                 return None
             m = data[0]
