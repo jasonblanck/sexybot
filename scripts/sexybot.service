@@ -1,0 +1,15 @@
+[Unit]
+Description=SEXYBOT Polymarket Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/polybot
+Environment=PATH=/root/polybot/venv/bin
+ExecStart=/root/polybot/venv/bin/python3 bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

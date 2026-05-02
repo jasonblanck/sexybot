@@ -5,10 +5,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Infrastructure
 
 - **VPS**: DigitalOcean at `159.65.201.165` — always-on, runs the bot 24/7
-- **Service**: `sexybot` (systemd) — auto-starts on boot
+- **Service**: `sexybot` (systemd) — auto-starts on boot. Unit file lives at `/etc/systemd/system/sexybot.service` on the VPS; canonical copy in repo at [scripts/sexybot.service](scripts/sexybot.service).
 - **Code root**: `/root/polybot/` on the VPS
 - **Dashboard**: nginx serves `index.html` from `/var/www/html/`, proxies API to port 8000
 - **GitHub**: `github.com/jasonblanck/sexybot` — source of truth for all code
+
+## When the bot stops trading
+
+See [docs/disaster_recovery.md](docs/disaster_recovery.md) — runbook for `order_version_mismatch`, 401 on `/order`, `Could not derive api key`, and other failure modes that have actually bitten us. Includes the curl_cffi-based V2 API key bootstrap ([scripts/bootstrap_v2_api_keys.py](scripts/bootstrap_v2_api_keys.py)) needed when Polymarket rotates their auth schema.
 
 ## Common Commands
 
