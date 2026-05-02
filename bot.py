@@ -2733,7 +2733,11 @@ class PolymarketBot:
                 "SELECT id, token_id, price, shares, side FROM trades "
                 "WHERE resolved=0 AND dry_run=0 AND token_id IS NOT NULL "
                 "AND token_id != '' AND shares > 0 "
-                "AND status IN ('matched','filled','simulated') "
+                # V2 CLOB returns status='delayed' or 'live' for orders that
+                # get queued in the book and matched async, instead of the
+                # V1 'matched'/'filled'. Include those so today's wins
+                # actually settle. 'simulated' kept for paper/dry-run audit.
+                "AND status IN ('matched','filled','simulated','delayed','live') "
                 "AND order_type='market' "
                 "ORDER BY id LIMIT ?",
                 (limit,),
@@ -2849,7 +2853,7 @@ class PolymarketBot:
                 "by_regime_30d":   _breakdown("regime_at_entry"),
                 "unresolved": int(self.db.execute(
                     "SELECT COUNT(*) FROM trades WHERE resolved=0 AND dry_run=0 "
-                    "AND status IN ('matched','filled','simulated') "
+                    "AND status IN ('matched','filled','simulated','delayed','live') "
                     "AND order_type='market'"
                 ).fetchone()[0] or 0),
             }
