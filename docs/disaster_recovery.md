@@ -123,11 +123,11 @@ scp root@159.65.201.165:/root/polybot/.env \
     "$HOME/Library/Mobile Documents/com~apple~CloudDocs/sexybot.env.$(date +%Y%m%d)"
 ```
 
-The trade DB at `/root/polybot/sexybot.db` (SQLite) holds the realized
+The trade DB at `/root/polybot/trades.db` (SQLite) holds the realized
 P&L history. If you care about preserving it through a VPS migration:
 
 ```sh
-ssh root@159.65.201.165 "tar czf /tmp/sexybot-state.tgz -C /root/polybot .env sexybot.db"
+ssh root@159.65.201.165 "tar czf /tmp/sexybot-state.tgz -C /root/polybot .env trades.db"
 scp root@159.65.201.165:/tmp/sexybot-state.tgz \
     "$HOME/Library/Mobile Documents/com~apple~CloudDocs/sexybot-vps-backup-$(date +%Y%m%d).tgz"
 ```
