@@ -2,7 +2,14 @@
 Polymarket Trading Bot — migrated to py_clob_client_v2 for CLOB V2 (Apr 28 2026)
 """
 import asyncio, json, logging, os, time, sqlite3, re as _re_mod
-from datetime import datetime, date
+from datetime import datetime, date, timezone
+
+def _utcnow() -> datetime:
+    # Naive UTC datetime — matches the format previously produced by the
+    # deprecated stdlib utcnow(). Kept naive (tzinfo=None) so the strings
+    # stored in trades.db continue to compare correctly with SQLite's
+    # datetime('now'), which is also a naive UTC string.
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 # Brier-score self-calibration helper. Reads historical predicted_prob vs
 # actual_outcome from brier_scores and shrinks future predictions toward
 # the realized base rate. Silent no-op until there are ≥30 resolved rows.
@@ -434,6 +441,12 @@ class PolymarketBot:
         self.ws_clients: list = []
         self._monitor_active: bool = False  # guard against duplicate position_monitor_loop tasks
         self._paper_oracle_task: Optional[asyncio.Task] = None   # single paper oracle task handle
+        # Strong references to fire-and-forget tasks (telegram alerts etc.).
+        # asyncio only weak-references tasks created via create_task, so a
+        # short-lived task without a saved reference can be GC'd before it
+        # finishes — silently dropping the alert. Add to this set on create,
+        # discard on completion (via add_done_callback). See _spawn_alert.
+        self._pending_alerts: set[asyncio.Task] = set()
         self._anthropic_client = None   # lazy-init on first analyze_with_claude call; reused thereafter
         # Regime detector state — updated hourly by assess_market_regime, read per-cycle
         self._regime_cache: dict = {
@@ -527,6 +540,20 @@ class PolymarketBot:
                 pass
         except Exception as e:
             log.warning(f"Telegram failed: {e}")
+
+    def _spawn_alert(self, msg: str) -> None:
+        """Fire a Telegram alert without blocking the caller and without
+        risking the task being GC'd before it runs. asyncio only keeps a
+        weak reference to tasks created via create_task, so a fire-and-
+        forget pattern can silently lose the alert."""
+        try:
+            task = asyncio.create_task(asyncio.to_thread(self.send_telegram, msg))
+        except RuntimeError:
+            # No running loop — caller is on a sync code path. Send inline.
+            self.send_telegram(msg)
+            return
+        self._pending_alerts.add(task)
+        task.add_done_callback(self._pending_alerts.discard)
 
     def init_db(self):
         db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades.db")
@@ -779,7 +806,7 @@ class PolymarketBot:
                     tid, market, side, shares, cost = position_args
                     self.db.execute("""INSERT OR REPLACE INTO positions
                         (token_id, market, side, shares, cost, time) VALUES (?,?,?,?,?,?)""",
-                        (tid, market, side, shares, cost, datetime.utcnow().isoformat()))
+                        (tid, market, side, shares, cost, _utcnow().isoformat()))
         except Exception as e:
             log.warning(f"DB transaction failed: {e}")
 
@@ -859,7 +886,7 @@ class PolymarketBot:
 
     def get_daily_loss(self) -> float:
         try:
-            today = datetime.utcnow().strftime("%Y-%m-%d")  # match UTC stored in time column
+            today = _utcnow().strftime("%Y-%m-%d")  # match UTC stored in time column
             cur = self.db.execute(
                 "SELECT SUM(amount) FROM trades WHERE time LIKE ? AND dry_run=0 AND status='matched'",
                 (f"{today}%",))
@@ -884,7 +911,7 @@ class PolymarketBot:
         Only removes positions older than 7 days to guard against the 30-market fetch window."""
         try:
             from datetime import timedelta
-            cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+            cutoff = (_utcnow() - timedelta(days=7)).isoformat()
             cur = self.db.execute("SELECT token_id FROM positions WHERE time < ?", (cutoff,))
             to_remove = [row[0] for row in cur.fetchall() if row[0] not in active_token_ids]
             if to_remove:
@@ -900,7 +927,7 @@ class PolymarketBot:
             with self.db:
                 self.db.execute("""INSERT OR REPLACE INTO positions
                     (token_id, market, side, shares, cost, time) VALUES (?,?,?,?,?,?)""",
-                    (token_id, market, side, shares, cost, datetime.utcnow().isoformat()))
+                    (token_id, market, side, shares, cost, _utcnow().isoformat()))
         except Exception as e:
             log.warning(f"Position save failed: {e}")
 
@@ -1055,7 +1082,7 @@ class PolymarketBot:
             "shares": round(amount_usdc / price, 4) if price else 0,
             "type": "market",
             "dry_run": DRY_RUN,
-            "time": datetime.utcnow().isoformat(),
+            "time": _utcnow().isoformat(),
             "status": None,
             "order_id": None,
         }
@@ -1195,7 +1222,7 @@ class PolymarketBot:
             "size": size,
             "type": "limit",
             "dry_run": DRY_RUN,
-            "time": datetime.utcnow().isoformat(),
+            "time": _utcnow().isoformat(),
             "status": None,
             "order_id": None,
         }
@@ -1794,9 +1821,7 @@ class PolymarketBot:
                         await self._execute_order(token_id, "SELL", amt, mkt, "market")
 
                         self._managed_positions.pop(token_id, None)
-                        asyncio.create_task(
-                            asyncio.to_thread(self.send_telegram,
-                                              f"Exit {side} {mkt[:40]}: {reason}"))
+                        self._spawn_alert(f"Exit {side} {mkt[:40]}: {reason}")
                     except Exception as e:
                         log.warning(f"position_monitor exit failed ({token_id[:16]}): {e}")
         finally:
@@ -2382,7 +2407,7 @@ class PolymarketBot:
                     VALUES (?,?,?,?,?,?,?,?,?)""",
                     (market[:100], token_id, side, predicted_prob, market_price,
                      kelly_f, kelly_size, reasoning[:200],
-                     datetime.utcnow().isoformat()))
+                     _utcnow().isoformat()))
         except Exception as e:
             log.debug(f"brier log error: {e}")
 
@@ -2428,7 +2453,7 @@ class PolymarketBot:
                     " cache_write_tokens, est_cost_usd, created_at) "
                     "VALUES (?,?,?,?,?,?,?)",
                     (model or "unknown", inp, out, cread, cwrt,
-                     round(est, 6), datetime.utcnow().isoformat()),
+                     round(est, 6), _utcnow().isoformat()),
                 )
         except Exception as e:
             log.debug(f"_record_claude_usage failed: {e}")
@@ -2866,7 +2891,7 @@ class PolymarketBot:
                     self.db.execute(
                         "UPDATE trades SET resolved=1, won=?, realized_pnl=?, "
                         "resolved_at=? WHERE id=?",
-                        (won, pnl, datetime.utcnow().isoformat(), trade_id),
+                        (won, pnl, _utcnow().isoformat(), trade_id),
                     )
                 settled += 1
             if settled:
@@ -3416,7 +3441,7 @@ class PolymarketBot:
             # but the sign/magnitude is a useful "how's the day going" signal).
             pnl_today = 0.0
             try:
-                today = datetime.utcnow().strftime("%Y-%m-%d")
+                today = _utcnow().strftime("%Y-%m-%d")
                 row = self.db.execute(
                     "SELECT COUNT(*), SUM(amount) FROM trades "
                     "WHERE time LIKE ? AND dry_run=0 AND status='matched'",
@@ -3430,7 +3455,7 @@ class PolymarketBot:
             daily_loss = self.get_daily_loss()
 
             ctx = (
-                f"TIME (UTC): {datetime.utcnow().isoformat()}\n"
+                f"TIME (UTC): {_utcnow().isoformat()}\n"
                 f"VIX: {macro.get('vix')}\n"
                 f"Fed Funds: {macro.get('fed_rate')}%   CPI YoY: {macro.get('cpi')}%\n"
                 f"SPY today: {fmp.get('spy_change_pct', 0):+.2f}%  up/total: "
@@ -3507,7 +3532,7 @@ class PolymarketBot:
                 "kelly_multiplier": kmult,
                 "min_edge_add":     edge_add,
                 "reasoning":        reasoning,
-                "assessed_at":      datetime.utcnow().isoformat(),
+                "assessed_at":      _utcnow().isoformat(),
             }
             self._regime_cache_time = time.time()
             # Telegram alert on *transition* to hostile. Only on the edge, not
@@ -3515,15 +3540,13 @@ class PolymarketBot:
             # sustained hostile periods. Also alert on transition OUT of
             # hostile back to normal so they know when the coast clears.
             if regime == "hostile" and prev_regime != "hostile" and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-                asyncio.create_task(asyncio.to_thread(
-                    self.send_telegram,
+                self._spawn_alert(
                     f"🛑 REGIME → HOSTILE\nNew trades halted for the cycle.\n{reasoning[:300]}"
-                ))
+                )
             elif prev_regime == "hostile" and regime != "hostile" and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-                asyncio.create_task(asyncio.to_thread(
-                    self.send_telegram,
+                self._spawn_alert(
                     f"✅ REGIME → {regime.upper()}\nTrading resumed. {reasoning[:200]}"
-                ))
+                )
             # Persist for auditing
             try:
                 with self.db:
@@ -3657,7 +3680,7 @@ class PolymarketBot:
                             "VALUES (?,?,?,?,?,?,?,?)",
                             (market_question[:200], our_side, amount_usdc,
                              entry_price, mult, 1 if proceed else 0, reason,
-                             datetime.utcnow().isoformat()),
+                             _utcnow().isoformat()),
                         )
             except Exception as e:
                 log.debug(f"pretrade_log insert failed: {e}")
@@ -3834,7 +3857,7 @@ class PolymarketBot:
                          int(initial_probability), verdict, mult, refined_prob,
                          reasoning, _j.dumps([str(e)[:200] for e in evidence][:10]),
                          DEEP_ANALYZE_MODEL, latency,
-                         datetime.utcnow().isoformat()),
+                         _utcnow().isoformat()),
                     )
             except Exception as e:
                 log.debug(f"deep_analyses insert failed: {e}")
@@ -3847,11 +3870,10 @@ class PolymarketBot:
                 "warning" if verdict == "abort" else "info",
             )
             if verdict == "abort" and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-                asyncio.create_task(asyncio.to_thread(
-                    self.send_telegram,
+                self._spawn_alert(
                     f"🛑 DEEP ANALYSIS ABORTED ${planned_amount_usdc:.2f} trade\n"
                     f"{market_question[:80]}\nReason: {reasoning[:300]}"
-                ))
+                )
             return {
                 "verdict":          verdict,
                 "size_multiplier":  mult,
@@ -4018,7 +4040,7 @@ class PolymarketBot:
             period_end   = max(times) if times else ""
 
             import json as _j
-            now_iso = datetime.utcnow().isoformat()
+            now_iso = _utcnow().isoformat()
             with self.db:
                 self.db.execute(
                     "INSERT INTO backtests (period_start, period_end, "
@@ -4118,7 +4140,7 @@ class PolymarketBot:
         # them as [applied] instead of offering an APPLY button.
         if applied:
             try:
-                now_iso = datetime.utcnow().isoformat()
+                now_iso = _utcnow().isoformat()
                 existing = self.db.execute(
                     "SELECT applied FROM strategy_reviews WHERE id=?",
                     (review_id,),
@@ -4154,7 +4176,7 @@ class PolymarketBot:
 
             # Window: last 24h of matched trades
             from datetime import timedelta as _td
-            now_utc    = datetime.utcnow()
+            now_utc    = _utcnow()
             since      = (now_utc - _td(hours=24)).replace(microsecond=0).isoformat()
             cutoff_iso = now_utc.replace(microsecond=0).isoformat()
             # Pull raw rows
@@ -4292,7 +4314,7 @@ class PolymarketBot:
                 recs = []
 
             confidence = int(decision.get("confidence", 50)) if isinstance(decision.get("confidence"), (int, float)) else 50
-            now_iso = datetime.utcnow().isoformat()
+            now_iso = _utcnow().isoformat()
             with self.db:
                 cur = self.db.execute(
                     "INSERT INTO strategy_reviews (review_date, period_start, "
@@ -4337,7 +4359,7 @@ class PolymarketBot:
         """Assemble the end-of-day digest. Pure read — no mutations. Returns
         a Telegram-ready string. Safe to call at any hour; "today" is the
         current UTC date."""
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = _utcnow().strftime("%Y-%m-%d")
         lines: list = [f"📊 SEXYBOT · {today} UTC"]
 
         # Trades today
@@ -4426,7 +4448,7 @@ class PolymarketBot:
             log.debug(f"daily summary category query failed: {e}")
 
         # Redeemer activity — only surface if we claimed anything today.
-        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        today_str = _utcnow().strftime("%Y-%m-%d")
         if self._claims_today_ymd == today_str and self._claims_today > 0:
             lines.append(f"· Redeemer: claimed/merged {self._claims_today} position(s) today")
 
@@ -4463,7 +4485,7 @@ class PolymarketBot:
                 if claimed:
                     # Track today's claims so the daily digest can report them.
                     # Reset at UTC rollover.
-                    today = datetime.utcnow().strftime("%Y-%m-%d")
+                    today = _utcnow().strftime("%Y-%m-%d")
                     if self._claims_today_ymd != today:
                         self._claims_today = 0
                         self._claims_today_ymd = today
@@ -4497,7 +4519,7 @@ class PolymarketBot:
             return
         while self.running:
             try:
-                today_str = datetime.utcnow().strftime("%Y-%m-%d")
+                today_str = _utcnow().strftime("%Y-%m-%d")
                 # Reset the latch at UTC rollover
                 if self._spend_alert_sent_ymd != today_str:
                     self._spend_alert_sent_ymd = ""
@@ -4527,7 +4549,7 @@ class PolymarketBot:
         `hours`. "Real" = status set, not in the obvious-bad / skip / sim
         statuses. Used by the no-trade watchdog. Walks the buffer in reverse
         and short-circuits on first match (or first older-than-cutoff)."""
-        cutoff = datetime.utcnow().timestamp() - (hours * 3600)
+        cutoff = _utcnow().timestamp() - (hours * 3600)
         bad = {"error", "unmatched", "no_match", "rejected", "canceled", "cancelled",
                "simulated", "skip_error_cooldown", "skip_price_ceiling", "unknown",
                "", "none"}
@@ -4620,7 +4642,7 @@ class PolymarketBot:
         from datetime import timedelta
         while self.running:
             try:
-                now = datetime.utcnow()
+                now = _utcnow()
                 target = now.replace(
                     hour   = DAILY_SUMMARY_UTC_HOUR,
                     minute = DAILY_SUMMARY_UTC_MIN,
@@ -4647,7 +4669,7 @@ class PolymarketBot:
             return
         while self.running:
             try:
-                now = datetime.utcnow()
+                now = _utcnow()
                 # Next run = next 00:05 UTC
                 from datetime import timedelta
                 next_run = now.replace(hour=0, minute=5, second=0, microsecond=0)
@@ -4675,7 +4697,7 @@ class PolymarketBot:
         from datetime import timedelta
         while self.running:
             try:
-                now = datetime.utcnow()
+                now = _utcnow()
                 # weekday(): Monday=0, ..., Sunday=6
                 days_until_sunday = (6 - now.weekday()) % 7
                 next_run = now.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=days_until_sunday)
@@ -5425,7 +5447,7 @@ class PolymarketBot:
                         self._log(f"OBI SKIP: book pressure opposes trade (obi={obi:.2f}) {question[:40]}")
                         continue
 
-                    sig_record = {**signal, "time": datetime.utcnow().isoformat(), "traded": False}
+                    sig_record = {**signal, "time": _utcnow().isoformat(), "traded": False}
                     self.signals.append(sig_record)
                     if len(self.signals) > 1000:
                         self.signals = self.signals[-1000:]
@@ -5435,7 +5457,7 @@ class PolymarketBot:
                     daily_loss = self.get_daily_loss()
                     if daily_loss >= DAILY_LOSS_LIMIT:
                         self._log(f"DAILY LOSS LIMIT HIT: ${daily_loss:.2f} — stopping trading", "error")
-                        asyncio.create_task(asyncio.to_thread(self.send_telegram, f"⚠️ Daily loss limit hit: ${daily_loss:.2f}. Bot stopped trading."))
+                        self._spawn_alert(f"⚠️ Daily loss limit hit: ${daily_loss:.2f}. Bot stopped trading.")
                         self.running = False
                         break
 
@@ -5743,7 +5765,7 @@ class PolymarketBot:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _log(self, msg: str, level: str = "info"):
-        ts = datetime.utcnow().strftime("%H:%M:%S")
+        ts = _utcnow().strftime("%H:%M:%S")
         self.log_lines.append(f"[{ts}] {msg}")
         if len(self.log_lines) > 500:
             self.log_lines = self.log_lines[-500:]
@@ -6629,7 +6651,7 @@ async def manual_trade(
             with bot.db:
                 bot.db.execute(
                     "INSERT OR REPLACE INTO idempotency_keys (key, response, created) VALUES (?,?,?)",
-                    (x_idempotency_key, json.dumps(result), datetime.utcnow().isoformat())
+                    (x_idempotency_key, json.dumps(result), _utcnow().isoformat())
                 )
         except Exception as e:
             log.debug(f"idempotency key store failed: {e}")
@@ -7022,7 +7044,7 @@ def admin_trades_csv():
     except Exception as e:
         log.warning(f"trades.csv export failed: {e}")
         raise HTTPException(status_code=500, detail="csv export failed")
-    fname = f"sexybot-trades-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.csv"
+    fname = f"sexybot-trades-{_utcnow().strftime('%Y%m%d-%H%M%S')}.csv"
     return StreamingResponse(
         iter([buf.getvalue()]),
         media_type="text/csv",
@@ -7054,7 +7076,7 @@ def admin_backup():
         log.warning(f"backup tar failed: {e}")
         raise HTTPException(status_code=500, detail="backup creation failed")
     buf.seek(0)
-    fname = f"sexybot-backup-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.tgz"
+    fname = f"sexybot-backup-{_utcnow().strftime('%Y%m%d-%H%M%S')}.tgz"
     return StreamingResponse(
         buf, media_type="application/gzip",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
@@ -7131,7 +7153,7 @@ def health():
     """Liveness probe for nginx / uptime monitors. Returns 200 iff the
     FastAPI app is responsive. Does NOT check Claude / Polymarket / DB —
     use /health/claude for feature-specific readiness."""
-    return {"status": "ok", "ts": datetime.utcnow().isoformat()}
+    return {"status": "ok", "ts": _utcnow().isoformat()}
 
 
 @app.get("/health/claude")
@@ -7142,7 +7164,7 @@ def claude_max_health():
     this once a minute so the operator can tell at a glance whether
     anything is wrong."""
     try:
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = _utcnow().isoformat()
         # Last-run timestamps from audit tables
         def _last(sql: str) -> Optional[str]:
             try:
@@ -7473,7 +7495,7 @@ async def apply_review_recommendation(review_id: int, body: dict):
     # specific index + timestamp + previous value so apply-history is auditable.
     try:
         import json as _j2
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = _utcnow().isoformat()
         existing_applied = row[1] or ""
         entry = _j2.dumps({
             "index": idx, "at": now_iso,

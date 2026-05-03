@@ -12,10 +12,18 @@ Architecture:
   - Background oracle settles positions when markets resolve
 """
 import sqlite3, json, logging, time, random, asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import urllib.request as _ureq
 
 log = logging.getLogger("polybot")
+
+
+def _utcnow() -> datetime:
+    # Naive UTC datetime — replacement for the deprecated stdlib utcnow().
+    # Kept naive (tzinfo=None) so existing isoformat() strings in the DB
+    # continue to compare correctly with SQLite's datetime('now'), which
+    # is also a naive UTC string.
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 PAPER_GAS_FEE          = 0.02    # USDC deducted per transaction (Polygon gas proxy)
@@ -206,7 +214,7 @@ class PolymarketPaperHandler:
         Return value is compatible with PolymarketBot.place_market_order() so the
         rest of the bot (DB saves, dashboard) works unchanged.
         """
-        ts = datetime.utcnow().isoformat()
+        ts = _utcnow().isoformat()
         order_id = f"PAPER-{int(time.time() * 1000)}"
         result = {
             "token_id":   token_id,
@@ -264,7 +272,7 @@ class PolymarketPaperHandler:
         """
         Simulate a limit order (fills immediately at the requested price — optimistic).
         """
-        ts = datetime.utcnow().isoformat()
+        ts = _utcnow().isoformat()
         amount_usdc = round(price * size, 4)
         total_cost  = amount_usdc + PAPER_GAS_FEE
         result = {

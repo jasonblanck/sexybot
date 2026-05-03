@@ -294,20 +294,37 @@ class PositionRedeemer:
 
     def _group_mergeable(self, positions: list[dict]) -> list[list[dict]]:
         """
-        Pair up YES/NO positions for the same conditionId that are both mergeable.
-        Returns list of [yes_pos, no_pos] pairs.
+        Pair up YES/NO positions for the same conditionId that are both
+        mergeable, where "complementary" means one is on outcome 0 and one
+        is on outcome 1 (i.e. they'd actually net to $1 of collateral on a
+        binary market). The previous version blindly took `group[:2]` for
+        any conditionId with ≥ 2 mergeable rows, which would (a) merge
+        same-side positions on a multi-outcome NegRisk market and (b)
+        silently drop the third+ position on a market with > 2 mergeable
+        rows. Both produce a transaction the CTF will revert.
         """
         by_condition: dict[str, list[dict]] = {}
         for p in positions:
             if not p.get("mergeable"):
                 continue
-            cid = p["conditionId"]
+            cid = p.get("conditionId")
+            if not cid:
+                continue
             by_condition.setdefault(cid, []).append(p)
 
-        pairs = []
+        pairs: list[list[dict]] = []
         for cid, group in by_condition.items():
-            if len(group) >= 2:
-                pairs.append(group[:2])
+            yes = next((p for p in group if int(p.get("outcomeIndex", 0)) == 0), None)
+            no  = next((p for p in group if int(p.get("outcomeIndex", 0)) == 1), None)
+            if yes is None or no is None:
+                log.debug(
+                    "PositionRedeemer: skip merge for condition %s — no complementary "
+                    "(YES + NO) pair (group has %d entries with indices %s)",
+                    cid[:18], len(group),
+                    [p.get("outcomeIndex") for p in group],
+                )
+                continue
+            pairs.append([yes, no])
         return pairs
 
     def _condition_id_bytes(self, condition_id: str) -> bytes:
@@ -353,19 +370,27 @@ class PositionRedeemer:
 
     def _merge(self, pair: list[dict]) -> bool:
         """Merge YES+NO token pair back to USDC."""
-        pos0, pos1 = pair
+        pos0, pos1 = pair   # invariant: pos0 = outcome 0 (YES), pos1 = outcome 1 (NO)
         title    = pos0.get("title", "?")[:45]
         cid      = self._condition_id_bytes(pos0["conditionId"])
         neg_risk = pos0.get("negativeRisk", False)
 
-        # Merge amount = minimum of both sides (in tokens, scaled to 1e6)
-        amount = int(min(pos0["size"], pos1["size"]) * 1_000_000)
+        # Merge amount = minimum of both sides (in tokens, scaled to 1e6).
+        # Tolerate missing/None sizes so a malformed Data API response logs
+        # and skips rather than KeyError-ing the whole redeem cycle.
+        try:
+            s0 = float(pos0.get("size", 0) or 0)
+            s1 = float(pos1.get("size", 0) or 0)
+        except (TypeError, ValueError):
+            log.debug("PositionRedeemer: merge skipped — non-numeric size on %s", title)
+            return False
+        amount = int(min(s0, s1) * 1_000_000)
         if amount <= 0:
             return False
 
         log.info(
             "MERGE | %s  sizes=[%.2f, %.2f]  merge_qty=%d  neg_risk=%s",
-            title, pos0["size"], pos1["size"], amount, neg_risk,
+            title, s0, s1, amount, neg_risk,
         )
 
         if self._dry_run:
