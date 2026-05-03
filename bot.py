@@ -514,7 +514,8 @@ class PolymarketBot:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             data = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": f"🤖 SEXYBOT\n{msg}"}).encode()
             req = _ureq.Request(url, data=data, headers={"Content-Type": "application/json"})
-            _ureq.urlopen(req, timeout=5)
+            with _ureq.urlopen(req, timeout=5):
+                pass
         except Exception as e:
             log.warning(f"Telegram failed: {e}")
 
@@ -2772,9 +2773,8 @@ class PolymarketBot:
                     for table, days in (("pretrade_log", 90),
                                          ("regime_log",   90),
                                          ("claude_usage", 90)):
-                        col = "created_at" if table != "regime_log" else "created_at"
                         cur = self.db.execute(
-                            f"DELETE FROM {table} WHERE {col} < datetime('now', ?)",
+                            f"DELETE FROM {table} WHERE created_at < datetime('now', ?)",
                             (f"-{days} days",),
                         )
                         pruned += cur.rowcount

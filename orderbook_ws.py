@@ -385,3 +385,8 @@ class BookManager:
             await client.stop()
         for task in self._ws_tasks:
             task.cancel()
+        # Await the cancellations so stop() doesn't return while WS coroutines
+        # are still finalising — otherwise callers that immediately tear down
+        # the loop can leak half-cancelled tasks.
+        if self._ws_tasks:
+            await asyncio.gather(*self._ws_tasks, return_exceptions=True)
