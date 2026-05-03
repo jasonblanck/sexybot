@@ -102,7 +102,7 @@ def _parse_market(raw: dict) -> Optional[PolyMarket]:
             category     = raw.get("category", ""),
             raw          = raw,
         )
-    except (ValueError, KeyError, IndexError) as exc:
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
         log.debug("_parse_market skip — %s", exc)
         return None
 

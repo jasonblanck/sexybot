@@ -147,8 +147,10 @@ class MarketMaker:
         ok = await asyncio.to_thread(self._ex.cancel_all_orders)
         if ok:
             for state in self._states.values():
-                state.yes_order_id = None
-                state.no_order_id  = None
+                state.yes_order_id    = None
+                state.no_order_id     = None
+                state.yes_seen_filled = 0.0
+                state.no_seen_filled  = 0.0
         log.info("MM: cancel_all issued")
 
     def record_fill(self, token_id: str, side: str, qty: float) -> None:
@@ -396,6 +398,14 @@ class MarketMaker:
                 ok = await asyncio.to_thread(self._ex.cancel_order, order_id)
                 if ok:
                     cancelled += 1
-        state.yes_order_id = None
-        state.no_order_id  = None
+        # Reset both the active id and the per-order matched-qty baseline.
+        # The next order placed against this state will be a fresh order
+        # whose size_matched starts at 0; if seen_filled stayed at the old
+        # value, _poll_fills would compute fresh = matched_new - seen_old
+        # and silently drop fills until matched climbed past the stale
+        # baseline.
+        state.yes_order_id    = None
+        state.no_order_id     = None
+        state.yes_seen_filled = 0.0
+        state.no_seen_filled  = 0.0
         return cancelled
