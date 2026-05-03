@@ -47,7 +47,11 @@ FUNDER_ADDRESS   = os.getenv("POLYMARKET_FUNDER")   # proxy wallet holding USDC.
 MIN_LIQUIDITY    = float(os.getenv("MIN_LIQUIDITY",    "10000"))
 MIN_VOLUME_24H   = float(os.getenv("MIN_VOLUME",       "1000"))
 MAX_ORDER_SIZE   = float(os.getenv("MAX_ORDER_SIZE",   "10"))
-DRY_RUN          = os.getenv("DRY_RUN", "true").lower() == "true"
+# Fail-closed: live trading requires an explicit DRY_RUN=false. Any other
+# value (including typos like "yes" / "1" / "off" or an empty string) keeps
+# the bot in dry-run. bot.py uses the same convention; previously this file
+# used `== "true"`, which would silently go live on `DRY_RUN=yes`.
+DRY_RUN          = os.getenv("DRY_RUN", "true").lower() != "false"
 SPREAD_MAX_CENTS = float(os.getenv("SPREAD_MAX_CENTS", "0.5"))
 SCAN_INTERVAL    = float(os.getenv("SCAN_INTERVAL",    "30"))
 

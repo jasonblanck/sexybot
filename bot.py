@@ -115,7 +115,16 @@ if not API_SECRET_KEY:
 # Dashboard-view password (separate from API_SECRET_KEY which guards writes).
 # The login page at /login.html POSTs to /auth/login with this. On success the
 # server sets an HttpOnly signed cookie; read endpoints require that cookie.
-DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "SEXYBOT")
+# Generate a random default if unset or empty so a fresh install isn't world-
+# readable on whatever default would otherwise be hardcoded.
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+if not DASHBOARD_PASSWORD:
+    import secrets as _sec_pw
+    DASHBOARD_PASSWORD = _sec_pw.token_urlsafe(18)
+    log.warning(
+        f"DASHBOARD_PASSWORD not set — generated ephemeral password "
+        f"(set in .env to persist): {DASHBOARD_PASSWORD}"
+    )
 SESSION_TTL_SEC    = int(os.getenv("SESSION_TTL_SEC", "604800"))  # 7 days
 FRED_API_KEY       = os.getenv("FRED_API_KEY", "")
 OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY", "")
@@ -6063,10 +6072,18 @@ _rate_buckets: dict = {}       # ip -> [count, window_start_ts]
 class _ResourceMiddleware(BaseHTTPMiddleware):
     """Enforce request body size cap and per-IP rate limiting."""
     async def dispatch(self, request: _SRequest, call_next):
-        # 1. Body size cap (guards future JSON-body endpoints too)
+        # 1. Body size cap (guards future JSON-body endpoints too).
+        # int() can raise ValueError on a malformed Content-Length; treat any
+        # unparseable value as "reject" rather than letting the exception
+        # bubble into a 500 + stack trace.
         cl = request.headers.get("content-length")
-        if cl and int(cl) > MAX_BODY_BYTES:
-            return _SResponse("Request body too large", status_code=413)
+        if cl:
+            try:
+                cl_int = int(cl)
+            except ValueError:
+                return _SResponse("Invalid Content-Length", status_code=400)
+            if cl_int > MAX_BODY_BYTES:
+                return _SResponse("Request body too large", status_code=413)
 
         # 2. Per-IP rate limit
         ip = (request.client.host if request.client else "unknown")
@@ -6283,10 +6300,17 @@ async def _session_gate(request, call_next):
     # Fast path: exempt routes
     if path in _AUTH_EXEMPT_EXACT:
         return await call_next(request)
-    # Write endpoints already require X-API-Key — skip cookie check so
-    # operator tooling (curl) still works without a browser session.
-    if request.headers.get("x-api-key"):
-        return await call_next(request)
+    # Operator tooling (curl) can authenticate with X-API-Key instead of a
+    # browser session cookie. Validate the value here — previously this
+    # branch only checked the header was *present*, so any non-empty value
+    # bypassed cookie auth on read endpoints (write endpoints were still
+    # safe via Depends(require_api_key)). Use the same constant-time
+    # comparison as the rate-limiter and require_api_key dependency.
+    _hdr_key = request.headers.get("x-api-key", "")
+    if _hdr_key:
+        if _sec_compare(_hdr_key, API_SECRET_KEY):
+            return await call_next(request)
+        return JSONResponse(status_code=401, content={"detail": "invalid api key"})
     # Everything else needs a valid session cookie
     token = request.cookies.get(SESSION_COOKIE_NAME)
     if not _verify_session_token(token):
