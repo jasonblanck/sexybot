@@ -10,6 +10,22 @@ Environment=PATH=/root/polybot/venv/bin
 ExecStart=/root/polybot/venv/bin/python3 bot.py
 Restart=always
 RestartSec=10
+# Cap restart loop: at most 5 restarts in 60 s, otherwise systemd marks the
+# unit failed instead of crash-looping forever (and pinging Telegram every
+# 10 s). Operator still gets the journalctl + alert that something is wrong.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+# Defensive sandboxing — costs nothing because the bot doesn't need them.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/polybot /var/log
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target

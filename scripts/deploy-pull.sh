@@ -20,7 +20,15 @@
 #
 # Logs: /var/log/sexybot-deploy.log
 
-set -u
+# -e: bail on the first failed command instead of marching through the rest
+#     of the deploy on a half-broken state. Each subsequent step that has its
+#     own meaningful failure mode (git fetch, systemctl restart) still uses
+#     an explicit `if !` so it can log and alert before the script exits.
+# -u: catch typos in variable names.
+# pipefail intentionally NOT set — the telegram-token grep pipelines below
+# may return empty (no match) and that's a valid "telegram not configured"
+# state, not a deploy failure.
+set -eu
 
 cd /root/polybot || exit 1
 

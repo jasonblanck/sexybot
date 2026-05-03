@@ -5760,9 +5760,17 @@ class PolymarketBot:
     async def _broadcast_state(self):
         if not self.ws_clients:
             return
+        # Only push state to clients that have completed the auth handshake.
+        # Without this filter, a connection to /ws (which is exempt from the
+        # session middleware) could just sit there listening and receive
+        # balance / positions / signals / log lines on every broadcast
+        # without ever sending an auth frame. The auth flag is set in
+        # websocket_endpoint after _sec_compare matches API_SECRET_KEY.
         payload = json.dumps(self.get_state())
         dead = []
         for ws in self.ws_clients:
+            if not getattr(ws, "_sb_authed", False):
+                continue
             try:
                 await ws.send_text(payload)
             except Exception:
@@ -6806,6 +6814,9 @@ async def websocket_endpoint(websocket: WebSocket):
             if cmd == "auth":
                 if _sec_compare(str(data.get("key", "")), API_SECRET_KEY):
                     _ws_authed = True
+                    # Mark for _broadcast_state so periodic state pushes
+                    # only reach clients that have actually authenticated.
+                    websocket._sb_authed = True
                     # Send full state now that client is authenticated
                     await websocket.send_text(json.dumps({"ok": True, "authed": True, **bot.get_state()}))
                 else:
