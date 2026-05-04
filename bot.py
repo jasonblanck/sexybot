@@ -2859,6 +2859,15 @@ class PolymarketBot:
                         "resolved_at=? WHERE id=?",
                         (won, pnl, datetime.utcnow().isoformat(), trade_id),
                     )
+                    # Drop the matching positions row in lockstep. Without
+                    # this the dashboard keeps showing resolved-as-loss
+                    # tokens as "open" forever — the legacy _sync_positions
+                    # cleanup only prunes rows older than 7 days, so a
+                    # position from yesterday's game stayed visible
+                    # showing -100% / -$5 long after it had actually
+                    # resolved. The only safe time to drop a position is
+                    # right when we settle its trade outcome here.
+                    self.db.execute("DELETE FROM positions WHERE token_id=?", (token_id,))
                 settled += 1
             if settled:
                 self._log(f"[TRADE OUTCOMES] Settled {settled} trade(s) this pass")
