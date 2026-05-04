@@ -2156,6 +2156,14 @@ class PolymarketBot:
     # WSJ public RSS (World/Markets/Business). Free headlines + descriptions.
     _wsj_cache: list = []
     _wsj_cache_time: float = 0
+    # SEC EDGAR — recent corporate filings (10-K, 8-K, S-1, etc).
+    _sec_filings_cache: list = []
+    _sec_filings_cache_time: float = 0
+    # MLB / NHL official APIs — schedule + scores for active games.
+    _mlb_cache: list = []
+    _mlb_cache_time: float = 0
+    _nhl_cache: list = []
+    _nhl_cache_time: float = 0
     # Whale position cache: (wallet_lower, token_id) -> {"balance": int, "t": ts}.
     # 10-min TTL is balanced against RPC cost — whale positions don't move
     # by-the-second, but we want to catch big new entries within ~10 min.
@@ -3314,22 +3322,29 @@ class PolymarketBot:
             log.warning(f"USGS earthquakes fetch failed: {e}")
             return self._usgs_cache or []
 
-    _WSJ_FEEDS = (
-        ("World",    "https://feeds.a.dj.com/rss/RSSWorldNews.xml"),
-        ("Markets",  "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"),
-        ("Business", "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml"),
+    # Combined RSS news feeds. WSJ subscription not needed — these are
+    # the publicly-readable feeds. Source label distinguishes WSJ vs NPR
+    # vs BBC in the prompt so Claude can weight them appropriately.
+    _NEWS_RSS_FEEDS = (
+        ("WSJ-World",     "https://feeds.a.dj.com/rss/RSSWorldNews.xml"),
+        ("WSJ-Markets",   "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"),
+        ("WSJ-Business",  "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml"),
+        ("NPR",           "https://feeds.npr.org/1001/rss.xml"),
+        ("BBC",           "https://feeds.bbci.co.uk/news/rss.xml"),
     )
 
     def get_wsj_headlines(self) -> list:
-        """WSJ public RSS — top headlines from World/Markets/Business sections.
-        30-min cache (shared across feeds). Headlines + descriptions are
-        public; full article text remains paywalled but isn't needed for
-        signal context — Claude reasons fine off the headline + summary."""
+        """Combined public RSS — WSJ World/Markets/Business + NPR + BBC.
+        30-min cache shared across feeds. Public headlines + descriptions
+        are sufficient for signal context; full WSJ article text remains
+        paywalled but Claude reasons fine off the summary. Source label
+        in each row identifies the feed (WSJ-Markets, NPR, BBC, etc.) so
+        Claude can weight by source quality."""
         if time.time() - self._wsj_cache_time < 1800 and self._wsj_cache:
             return self._wsj_cache
         import xml.etree.ElementTree as _ET
         rows = []
-        for section, url in self._WSJ_FEEDS:
+        for section, url in self._NEWS_RSS_FEEDS:
             try:
                 req = _ureq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                 with _ureq.urlopen(req, timeout=6) as r:
@@ -3341,7 +3356,7 @@ class PolymarketBot:
                     if title:
                         rows.append({"section": section, "title": title, "desc": desc, "pub": pub})
             except Exception as e:
-                log.warning(f"WSJ {section} feed failed: {e}")
+                log.warning(f"News RSS {section} failed: {e}")
         # Only update cache if at least one feed succeeded — don't overwrite
         # good cached data with empty rows on a transient outage.
         if rows:
@@ -3522,6 +3537,102 @@ class PolymarketBot:
             "gap_pp": gap, "direction": direction, "alerted": True,
         }
 
+    def get_sec_recent_filings(self, limit: int = 30) -> list:
+        """SEC EDGAR latest filings via the public Atom feed. 30-min cache.
+        Useful for filings markets ('Will X file 10-K by Y'). SEC requires
+        a User-Agent that identifies the requester per their access policy."""
+        if time.time() - self._sec_filings_cache_time < 1800 and self._sec_filings_cache:
+            return self._sec_filings_cache
+        try:
+            import xml.etree.ElementTree as _ET
+            url = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent"
+                   f"&type=&company=&dateb=&owner=include&count={limit}&output=atom")
+            req = _ureq.Request(url, headers={
+                "User-Agent": "sexybot polybot-research@example.com",
+                "Accept": "application/atom+xml",
+            })
+            with _ureq.urlopen(req, timeout=6) as r:
+                root = _ET.fromstring(r.read())
+            ns = {"a": "http://www.w3.org/2005/Atom"}
+            rows = []
+            for entry in root.findall("a:entry", ns)[:limit]:
+                title = (entry.findtext("a:title", "", ns) or "").strip()[:200]
+                summary = (entry.findtext("a:summary", "", ns) or "").strip()[:200]
+                updated = (entry.findtext("a:updated", "", ns) or "").strip()[:25]
+                if title:
+                    rows.append({"title": title, "summary": summary, "updated": updated})
+            if rows:
+                self._sec_filings_cache = rows
+                self._sec_filings_cache_time = time.time()
+            return rows or self._sec_filings_cache or []
+        except Exception as e:
+            log.warning(f"SEC EDGAR fetch failed: {e}")
+            return self._sec_filings_cache or []
+
+    def get_mlb_games(self) -> list:
+        """MLB official schedule API — today's games + state. 10-min cache.
+        Free public endpoint, no auth. Useful for MLB markets on Polymarket."""
+        if time.time() - self._mlb_cache_time < 600 and self._mlb_cache:
+            return self._mlb_cache
+        try:
+            url = "https://statsapi.mlb.com/api/v1/schedule?sportId=1"
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0", "Accept": "application/json"})
+            with _ureq.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read())
+            rows = []
+            for d in (data.get("dates") or [])[:2]:
+                for g in (d.get("games") or [])[:25]:
+                    teams = g.get("teams", {})
+                    away = teams.get("away", {}).get("team", {}).get("name", "?")
+                    home = teams.get("home", {}).get("team", {}).get("name", "?")
+                    away_score = teams.get("away", {}).get("score")
+                    home_score = teams.get("home", {}).get("score")
+                    state = (g.get("status") or {}).get("detailedState", "")
+                    start = g.get("gameDate", "")[:16]
+                    rows.append({
+                        "away": away, "home": home,
+                        "away_score": away_score, "home_score": home_score,
+                        "state": state, "start": start,
+                    })
+            if rows:
+                self._mlb_cache = rows
+                self._mlb_cache_time = time.time()
+            return rows or self._mlb_cache or []
+        except Exception as e:
+            log.warning(f"MLB schedule fetch failed: {e}")
+            return self._mlb_cache or []
+
+    def get_nhl_games(self) -> list:
+        """NHL official schedule API — current week. 10-min cache. Free, no auth."""
+        if time.time() - self._nhl_cache_time < 600 and self._nhl_cache:
+            return self._nhl_cache
+        try:
+            url = "https://api-web.nhle.com/v1/schedule/now"
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0", "Accept": "application/json"})
+            with _ureq.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read())
+            rows = []
+            for week in (data.get("gameWeek") or [])[:3]:
+                for g in (week.get("games") or [])[:20]:
+                    away = (g.get("awayTeam") or {}).get("placeName", {}).get("default", "?")
+                    home = (g.get("homeTeam") or {}).get("placeName", {}).get("default", "?")
+                    away_score = (g.get("awayTeam") or {}).get("score")
+                    home_score = (g.get("homeTeam") or {}).get("score")
+                    state = g.get("gameState", "")
+                    start = g.get("startTimeUTC", "")[:16]
+                    rows.append({
+                        "away": away, "home": home,
+                        "away_score": away_score, "home_score": home_score,
+                        "state": state, "start": start,
+                    })
+            if rows:
+                self._nhl_cache = rows
+                self._nhl_cache_time = time.time()
+            return rows or self._nhl_cache or []
+        except Exception as e:
+            log.warning(f"NHL schedule fetch failed: {e}")
+            return self._nhl_cache or []
+
     def get_active_storms(self) -> list:
         """NHC active tropical storms — useful for weather/hurricane markets.
         Public NOAA endpoint, no auth, 30-min cache. Empty list outside
@@ -3610,9 +3721,35 @@ class PolymarketBot:
                 _q_words_lc = set(w for w in question.lower().split() if len(w) >= 4)
                 rel_wsj = [r for r in wsj if any(w in r.get("title","").lower() or w in r.get("desc","").lower() for w in _q_words_lc)]
                 if rel_wsj:
-                    ctx_parts.append("WSJ HEADLINES (relevant):")
+                    ctx_parts.append("RSS NEWS (WSJ/NPR/BBC, relevant):")
                     for r in rel_wsj[:5]:
                         ctx_parts.append(f"  [{r.get('section','')}] {r.get('title','')}")
+            sec_filings = research.get("sec_filings") or []
+            if sec_filings:
+                _q_words_lc = set(w for w in question.lower().split() if len(w) >= 4)
+                rel_sec = [r for r in sec_filings if any(w in r.get("title","").lower() for w in _q_words_lc)]
+                if rel_sec:
+                    ctx_parts.append("SEC EDGAR FILINGS (matching this question):")
+                    for r in rel_sec[:5]:
+                        ctx_parts.append(f"  [{r.get('updated','')[:10]}] {r.get('title','')}")
+            mlb_games = research.get("mlb_games") or []
+            if mlb_games:
+                _q_words_lc = set(w for w in question.lower().split() if len(w) >= 4)
+                rel_mlb = [g for g in mlb_games if any(w in (g.get("away","")+" "+g.get("home","")).lower() for w in _q_words_lc)]
+                if rel_mlb:
+                    ctx_parts.append("MLB GAMES (today, official schedule):")
+                    for g in rel_mlb[:5]:
+                        score = "" if g.get("away_score") is None else f" {g.get('away_score','-')}-{g.get('home_score','-')}"
+                        ctx_parts.append(f"  {g.get('away','?')} @ {g.get('home','?')}{score} [{g.get('state','')}] {g.get('start','')}")
+            nhl_games = research.get("nhl_games") or []
+            if nhl_games:
+                _q_words_lc = set(w for w in question.lower().split() if len(w) >= 4)
+                rel_nhl = [g for g in nhl_games if any(w in (g.get("away","")+" "+g.get("home","")).lower() for w in _q_words_lc)]
+                if rel_nhl:
+                    ctx_parts.append("NHL GAMES (current week, official schedule):")
+                    for g in rel_nhl[:5]:
+                        score = "" if g.get("away_score") is None else f" {g.get('away_score','-')}-{g.get('home_score','-')}"
+                        ctx_parts.append(f"  {g.get('away','?')} @ {g.get('home','?')}{score} [{g.get('state','')}] {g.get('start','')}")
             tavily = research.get("tavily", "")
             if tavily:
                 # Match the fetcher's 600-char-per-snippet × 3 snippets upper
@@ -5220,6 +5357,40 @@ class PolymarketBot:
         except Exception:
             pass
 
+        # Cross-market arb signals today — useful for evaluating signal
+        # quality before we ever turn auto-execution on.
+        try:
+            arb_row = self.db.execute(
+                "SELECT COUNT(*), "
+                "       SUM(CASE WHEN direction='buy_poly_yes' THEN 1 ELSE 0 END), "
+                "       MAX(ABS(gap_pp)) "
+                "FROM arb_signals WHERE created_at >= datetime('now','start of day')"
+            ).fetchone()
+            n_arb = int(arb_row[0] or 0)
+            n_yes = int(arb_row[1] or 0)
+            biggest_gap = float(arb_row[2] or 0) * 100  # gap_pp stored as 0-1; show as percent points
+            if n_arb:
+                lines.append(
+                    f"· Arb signals: {n_arb} today ({n_yes} buy_yes / {n_arb - n_yes} buy_no) · "
+                    f"biggest gap {biggest_gap:.1f}pp"
+                )
+        except Exception as e:
+            log.debug(f"daily summary arb_signals query failed: {e}")
+
+        # External-API health (cheap status flags read from instance state).
+        try:
+            ext_flags = []
+            if TAVILY_API_KEY:
+                ext_flags.append("tavily=" + ("ok" if not self._tavily_last_error else "DOWN"))
+            if THE_ODDS_API_KEY and self._oddsapi_remaining is not None:
+                ext_flags.append(f"oddsapi={self._oddsapi_remaining}/500")
+            if OPENROUTER_API_KEY:
+                ext_flags.append("openrouter=" + ("ok" if not self._openrouter_last_error else "DOWN"))
+            if ext_flags:
+                lines.append(f"· APIs: {' · '.join(ext_flags)}")
+        except Exception:
+            pass
+
         return "\n".join(lines)
 
     async def _redeemer_loop(self):
@@ -6178,6 +6349,14 @@ class PolymarketBot:
                             # Earthquake markets — separate from weather; same conditional fetch pattern.
                             if any(k in _q_lower for k in ("earthquake", "richter", "magnitude ", "seismic")):
                                 _tasks["earthquakes"] = asyncio.to_thread(self.get_usgs_earthquakes)
+                            # SEC EDGAR — for corporate-filings / IPO / earnings markets.
+                            if any(k in _q_lower for k in ("file 10-k", "file 10-q", "file 8-k", "ipo", "s-1", "earnings", "filing", "sec ")):
+                                _tasks["sec_filings"] = asyncio.to_thread(self.get_sec_recent_filings)
+                            # MLB / NHL official stats — independent of TheOddsAPI moneylines.
+                            if any(k in _q_lower for k in ("mlb ", " mlb", "world series", "yankees", "dodgers", "red sox", "cubs", "astros", "mets", "braves")):
+                                _tasks["mlb_games"] = asyncio.to_thread(self.get_mlb_games)
+                            if any(k in _q_lower for k in ("nhl ", " nhl", "stanley cup", "rangers", "bruins", "leafs", "canadiens", "oilers", "kings")):
+                                _tasks["nhl_games"] = asyncio.to_thread(self.get_nhl_games)
                             # Sportsbook odds — fires only when the question
                             # explicitly names a league (NBA/NFL/MLB/...). Hard
                             # budget guard inside the fetcher (free tier is
@@ -7217,7 +7396,7 @@ def _verify_session_token(token: Optional[str]) -> bool:
 # monitors work; /auth/* obviously; /ws is gated by its own handshake;
 # the kill/start/stop/settings endpoints all use X-API-Key instead.
 _AUTH_EXEMPT_EXACT = {
-    "/health", "/health/claude", "/health/runtime", "/health/openrouter",
+    "/health", "/health/claude", "/health/runtime", "/health/openrouter", "/health/all",
     "/auth/login", "/auth/verify", "/auth/logout", "/auth/check",
     "/login", "/login.html",
     "/favicon.ico",
@@ -8136,6 +8315,134 @@ def runtime_health():
     except Exception as e:
         log.warning(f"/health/runtime error: {e}")
         return JSONResponse({"error": "internal error"}, status_code=500)
+
+
+@app.get("/health/all")
+async def health_all(request: Request):
+    """Aggregate health probe — combines /health/runtime + /health/openrouter
+    plus claude_usage cache-hit summary, brier_scores calibrator status,
+    and recent arb_signal counts. Designed for the morning routine to hit
+    once instead of N separate curls."""
+    try:
+        cutoff_24h = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        def _scalar(sql, params=(), default=None):
+            try:
+                row = bot.db.execute(sql, params).fetchone()
+                return row[0] if row and row[0] is not None else default
+            except Exception:
+                return default
+        # Reuse the runtime payload exactly so morning routine doesn't need
+        # a second call.
+        runtime = {
+            "ts":                  datetime.utcnow().isoformat(),
+            "bot_running":         bot.running,
+            "new_trades_paused":   bot._new_trades_paused,
+            "balance_halted":      bot._balance_halt_tripped,
+            "strategy":            STRATEGY,
+            "dry_run":             DRY_RUN,
+            "claude_max_disabled": CLAUDE_MAX_DISABLED,
+            "regime":              (bot._regime_cache or {}).get("regime", "unknown"),
+            "regime_assessed_at":  (bot._regime_cache or {}).get("assessed_at"),
+            "last_trade_at":       _scalar("SELECT MAX(time) FROM trades WHERE dry_run=0"),
+            "trades_24h":          _scalar("SELECT COUNT(*) FROM trades WHERE dry_run=0 AND time >= ?", (cutoff_24h,), 0),
+            "filled_24h":          _scalar("SELECT COUNT(*) FROM trades WHERE dry_run=0 AND status IN ('filled','matched') AND time >= ?", (cutoff_24h,), 0),
+            "open_positions":      _scalar("SELECT COUNT(*) FROM positions", (), 0),
+        }
+        # External-API health (no extra calls — read instance state)
+        ext = {
+            "tavily_ok":             bool(TAVILY_API_KEY) and not bot._tavily_last_error,
+            "tavily_last_error":     bot._tavily_last_error or None,
+            "openrouter_configured": bool(OPENROUTER_API_KEY),
+            "openrouter_last_error": bot._openrouter_last_error or None,
+            "oddsapi_configured":    bool(THE_ODDS_API_KEY),
+            "oddsapi_remaining":     bot._oddsapi_remaining,
+            "oddsapi_low_budget":    bot._oddsapi_remaining is not None and bot._oddsapi_remaining < 100,
+        }
+        # Claude usage / cache hit rate over last 24h
+        cache_stats = {}
+        try:
+            r = bot.db.execute(
+                "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), "
+                "       SUM(cache_read_tokens), SUM(cache_write_tokens), "
+                "       SUM(est_cost_usd) "
+                "FROM claude_usage WHERE created_at >= ?",
+                (cutoff_24h,),
+            ).fetchone()
+            calls, inp, outp, cr, cw, cost = r or (0, 0, 0, 0, 0, 0)
+            inp = int(inp or 0); outp = int(outp or 0)
+            cr  = int(cr  or 0); cw  = int(cw  or 0)
+            total_billed_in = inp + cr + cw
+            cache_stats = {
+                "calls_24h":      int(calls or 0),
+                "input_tokens":   inp,
+                "output_tokens":  outp,
+                "cache_read":     cr,
+                "cache_write":    cw,
+                "cache_hit_rate": round(cr / total_billed_in, 3) if total_billed_in else 0.0,
+                "spend_24h_usd":  round(float(cost or 0), 4),
+            }
+        except Exception as _e:
+            log.debug(f"/health/all cache_stats error: {_e}")
+        # Calibrator status (>=30 resolved samples to be active)
+        try:
+            n_resolved = _scalar("SELECT COUNT(*) FROM brier_scores WHERE resolved=1", (), 0)
+            calibrator = {
+                "active":          n_resolved >= 30,
+                "resolved_samples": n_resolved,
+            }
+        except Exception:
+            calibrator = {"active": False, "resolved_samples": None}
+        # Arb signals today
+        try:
+            arb_today = _scalar(
+                "SELECT COUNT(*) FROM arb_signals WHERE created_at >= datetime('now','start of day')", (), 0
+            )
+            arb_24h = _scalar(
+                "SELECT COUNT(*) FROM arb_signals WHERE created_at >= ?", (cutoff_24h,), 0
+            )
+        except Exception:
+            arb_today = arb_24h = 0
+        # OpenRouter live probe (one tiny call)
+        openrouter_probe = {"ok": False, "configured": bool(OPENROUTER_API_KEY)}
+        if OPENROUTER_API_KEY:
+            try:
+                payload = json.dumps({
+                    "model": "anthropic/claude-haiku-4-5",
+                    "messages": [{"role": "user", "content": "Reply OK."}],
+                    "max_tokens": 5,
+                }).encode()
+                req = _ureq.Request(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    data=payload,
+                    headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+                )
+                def _call():
+                    with _ureq.urlopen(req, timeout=15) as r:
+                        return json.loads(r.read())
+                d = await asyncio.to_thread(_call)
+                bot._openrouter_last_success_ts = time.time()
+                bot._openrouter_last_error = ""
+                openrouter_probe = {
+                    "ok":            True,
+                    "configured":    True,
+                    "input_tokens":  d.get("usage", {}).get("prompt_tokens"),
+                    "output_tokens": d.get("usage", {}).get("completion_tokens"),
+                }
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"[:200]
+                bot._openrouter_last_error = err
+                openrouter_probe = {"ok": False, "configured": True, "detail": err}
+        return {
+            "runtime":          runtime,
+            "external":         ext,
+            "claude_usage_24h": cache_stats,
+            "calibrator":       calibrator,
+            "arb_signals":      {"today": arb_today, "last_24h": arb_24h},
+            "openrouter_probe": openrouter_probe,
+        }
+    except Exception as e:
+        log.warning(f"/health/all error: {e}")
+        return JSONResponse({"error": str(e)[:200]}, status_code=500)
 
 
 @app.get("/health/openrouter")
