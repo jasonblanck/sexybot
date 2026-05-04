@@ -605,6 +605,24 @@ class PolymarketBot:
                 token_id TEXT PRIMARY KEY, market TEXT,
                 side TEXT, shares REAL, cost REAL, time TEXT
             )""")
+            # Cross-market arb signals — every time detect_arb_gap finds a
+            # comparable Kalshi/Predictit/Manifold market diverging from
+            # Polymarket by ≥ARB_ALERT_THRESHOLD_PP we log a row here. The
+            # operator (or future auto-arb logic) can analyse this table
+            # to validate signal quality before enabling auto-execution.
+            self.db.execute("""CREATE TABLE IF NOT EXISTS arb_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id TEXT,
+                polymarket_question TEXT,
+                polymarket_yes_price REAL,
+                peer TEXT,
+                peer_market TEXT,
+                peer_prob REAL,
+                gap_pp REAL,
+                direction TEXT,
+                created_at TEXT NOT NULL
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_arb_signals_time ON arb_signals(created_at)")
             self.db.execute("""CREATE TABLE IF NOT EXISTS brier_scores (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 market TEXT, token_id TEXT, side TEXT,
@@ -3473,6 +3491,22 @@ class PolymarketBot:
         self._arb_alert_seen[dedup_key] = time.time()
 
         direction = "buy_poly_yes" if gap > 0 else "buy_poly_no"
+        # Persist every detected gap (whether telegram fires or is rate-
+        # limited) so the operator / future auto-arb logic can validate
+        # signal quality offline.
+        try:
+            with self.db:
+                self.db.execute(
+                    "INSERT INTO arb_signals "
+                    "(token_id, polymarket_question, polymarket_yes_price, peer, "
+                    " peer_market, peer_prob, gap_pp, direction, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (token_id, question[:300], poly_p, peer, peer_q[:300],
+                     peer_p, gap, direction, datetime.utcnow().isoformat()),
+                )
+        except Exception as _db_e:
+            log.debug(f"arb_signals insert failed: {_db_e}")
+
         msg = (
             f"💰 ARB SIGNAL ({peer.upper()})\n"
             f"PolyMarket: {question[:60]}\n"
