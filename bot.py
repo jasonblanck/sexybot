@@ -2,7 +2,7 @@
 Polymarket Trading Bot — migrated to py_clob_client_v2 for CLOB V2 (Apr 28 2026)
 """
 import asyncio, json, logging, os, time, sqlite3, re as _re_mod
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 # Brier-score self-calibration helper. Reads historical predicted_prob vs
 # actual_outcome from brier_scores and shrinks future predictions toward
 # the realized base rate. Silent no-op until there are ≥30 resolved rows.
@@ -6284,7 +6284,7 @@ def _verify_session_token(token: Optional[str]) -> bool:
 # monitors work; /auth/* obviously; /ws is gated by its own handshake;
 # the kill/start/stop/settings endpoints all use X-API-Key instead.
 _AUTH_EXEMPT_EXACT = {
-    "/health", "/health/claude",
+    "/health", "/health/claude", "/health/runtime",
     "/auth/login", "/auth/logout", "/auth/check",
     "/login", "/login.html",
     "/favicon.ico",
@@ -7111,6 +7111,37 @@ def health():
     FastAPI app is responsive. Does NOT check Claude / Polymarket / DB —
     use /health/claude for feature-specific readiness."""
     return {"status": "ok", "ts": datetime.utcnow().isoformat()}
+
+
+@app.get("/health/runtime")
+def runtime_health():
+    """Runtime snapshot for the daily remote health-check. Public; no
+    sensitive numbers (no balance, no PnL, no order ids). Surfaces only
+    enough state to tell whether the bot is alive and trading."""
+    try:
+        cutoff_24h = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        def _scalar(sql: str, params: tuple = (), default=None):
+            try:
+                row = bot.db.execute(sql, params).fetchone()
+                return row[0] if row and row[0] is not None else default
+            except Exception:
+                return default
+        return {
+            "ts":                  datetime.utcnow().isoformat(),
+            "bot_running":         bot.running,
+            "strategy":            STRATEGY,
+            "dry_run":             DRY_RUN,
+            "claude_max_disabled": CLAUDE_MAX_DISABLED,
+            "regime":              (bot._regime_cache or {}).get("regime", "unknown"),
+            "regime_assessed_at":  (bot._regime_cache or {}).get("assessed_at"),
+            "last_trade_at":       _scalar("SELECT MAX(time) FROM trades WHERE dry_run=0"),
+            "trades_24h":          _scalar("SELECT COUNT(*) FROM trades WHERE dry_run=0 AND time >= ?", (cutoff_24h,), 0),
+            "filled_24h":          _scalar("SELECT COUNT(*) FROM trades WHERE dry_run=0 AND status IN ('filled','matched') AND time >= ?", (cutoff_24h,), 0),
+            "open_positions":      _scalar("SELECT COUNT(*) FROM positions", (), 0),
+        }
+    except Exception as e:
+        log.warning(f"/health/runtime error: {e}")
+        return JSONResponse({"error": "internal error"}, status_code=500)
 
 
 @app.get("/health/claude")
