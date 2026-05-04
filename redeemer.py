@@ -337,12 +337,18 @@ class PositionRedeemer:
             # Build array large enough for this outcome index (NegRisk can have >2 outcomes)
             amounts = [0] * max(2, outcome_index + 1)
             amounts[outcome_index] = size_scaled
-            data = self._neg_risk.encodeABI(fn_name="redeemPositions", args=[cid, amounts])
+            # web3.py 7.x renamed encodeABI(fn_name=…) to
+            # encode_abi(abi_element_identifier=…) — the old camelCase
+            # name silently raised AttributeError on every redeem,
+            # leaving winning positions stuck on Polymarket as
+            # unredeemed value (showed up as a cash mismatch between
+            # the bot dashboard and polymarket.com).
+            data = self._neg_risk.encode_abi(abi_element_identifier="redeemPositions", args=[cid, amounts])
             target = NEG_RISK_ADAPTER
         else:
             # Regular CTF: redeemPositions(collateral, parentCollectionId, conditionId, indexSets)
-            data = self._ctf.encodeABI(
-                fn_name="redeemPositions",
+            data = self._ctf.encode_abi(
+                abi_element_identifier="redeemPositions",
                 args=[USDC_ADDRESS, NULL_BYTES32, cid, [index_set]],
             )
             target = CTF_ADDRESS
@@ -374,12 +380,12 @@ class PositionRedeemer:
 
         if neg_risk:
             amounts = [amount, amount]
-            data = self._neg_risk.encodeABI(fn_name="mergePositions", args=[cid, amounts])
+            data = self._neg_risk.encode_abi(abi_element_identifier="mergePositions", args=[cid, amounts])
             target = NEG_RISK_ADAPTER
         else:
             # indexSets [1, 2] = YES (bit 0) and NO (bit 1) for a binary market
-            data = self._ctf.encodeABI(
-                fn_name="mergePositions",
+            data = self._ctf.encode_abi(
+                abi_element_identifier="mergePositions",
                 args=[USDC_ADDRESS, NULL_BYTES32, cid, [1, 2], amount],
             )
             target = CTF_ADDRESS

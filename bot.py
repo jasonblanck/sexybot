@@ -4237,7 +4237,12 @@ class PolymarketBot:
             # max_tokens to leave room for thinking + structured output.
             review_kwargs = {
                 "model": CLAUDE_MODEL,
-                "max_tokens": 3000,
+                # max_tokens covers thinking + tool output. Sonnet w/ adaptive
+                # thinking can spend 4-8k tokens reasoning before the
+                # structured review even starts; the old 3000 ceiling left
+                # essentially zero room for the actual recommendations and
+                # we'd hit stop_reason="max_tokens" + skip the night.
+                "max_tokens": 8000,
                 "system": [{
                     "type": "text",
                     "text": system,
@@ -4259,7 +4264,7 @@ class PolymarketBot:
                 msg = await asyncio.to_thread(
                     client.messages.create,
                     model=CLAUDE_FAST_MODEL,
-                    max_tokens=1500,
+                    max_tokens=2500,
                     system=system,
                     messages=[{"role": "user", "content": ctx}],
                     tools=[_TOOL_REVIEW],
