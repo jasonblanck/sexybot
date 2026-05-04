@@ -225,6 +225,14 @@ DEEP_ANALYZE_ENABLED   = os.getenv("DEEP_ANALYZE", "true").lower() == "true"
 DEEP_ANALYZE_MIN_USD   = float(os.getenv("DEEP_ANALYZE_MIN_USD", "20.0"))
 DEEP_ANALYZE_MODEL     = os.getenv("DEEP_ANALYZE_MODEL", "claude-opus-4-6")
 DEEP_ANALYZE_TIMEOUT_S = float(os.getenv("DEEP_ANALYZE_TIMEOUT_S", "45.0"))
+# Multi-model consensus: after deep_analyze gets Claude's verdict, also ask
+# a non-Anthropic model via OpenRouter for an independent second opinion.
+# Asymmetric — disagreement only ever DOWNGRADES the trade (proceed→downsize,
+# downsize→abort). Never upgrades. Cost: one ~200-token chat-completions
+# call per deep_analyze invocation, ~$0.001-0.005 depending on model.
+CONSENSUS_ENABLED      = os.getenv("CONSENSUS_ENABLED", "true").lower() == "true"
+CONSENSUS_MODEL        = os.getenv("CONSENSUS_MODEL", "openai/gpt-5-mini")
+CONSENSUS_TIMEOUT_S    = float(os.getenv("CONSENSUS_TIMEOUT_S", "20.0"))
 # Auto-apply: after a nightly review, auto-apply recommendations that are
 # (a) on safelisted params, (b) within a conservative bound of the current
 # value, and (c) high enough confidence. Everything else still requires
@@ -2114,6 +2122,9 @@ class PolymarketBot:
     _noaa_alerts_cache_time: float = 0
     _usgs_cache: list = []
     _usgs_cache_time: float = 0
+    # WSJ public RSS (World/Markets/Business). Free headlines + descriptions.
+    _wsj_cache: list = []
+    _wsj_cache_time: float = 0
     # Tavily / OpenRouter health (surfaced in /health/runtime so the morning
     # routine catches plan-exhaustion or a dead provider).
     _tavily_last_error: str = ""
@@ -3265,6 +3276,41 @@ class PolymarketBot:
             log.warning(f"USGS earthquakes fetch failed: {e}")
             return self._usgs_cache or []
 
+    _WSJ_FEEDS = (
+        ("World",    "https://feeds.a.dj.com/rss/RSSWorldNews.xml"),
+        ("Markets",  "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"),
+        ("Business", "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml"),
+    )
+
+    def get_wsj_headlines(self) -> list:
+        """WSJ public RSS — top headlines from World/Markets/Business sections.
+        30-min cache (shared across feeds). Headlines + descriptions are
+        public; full article text remains paywalled but isn't needed for
+        signal context — Claude reasons fine off the headline + summary."""
+        if time.time() - self._wsj_cache_time < 1800 and self._wsj_cache:
+            return self._wsj_cache
+        import xml.etree.ElementTree as _ET
+        rows = []
+        for section, url in self._WSJ_FEEDS:
+            try:
+                req = _ureq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with _ureq.urlopen(req, timeout=6) as r:
+                    root = _ET.fromstring(r.read())
+                for item in root.findall(".//item")[:20]:
+                    title = (item.findtext("title") or "").strip()[:120]
+                    desc  = (item.findtext("description") or "").strip()[:200]
+                    pub   = (item.findtext("pubDate") or "").strip()[:31]
+                    if title:
+                        rows.append({"section": section, "title": title, "desc": desc, "pub": pub})
+            except Exception as e:
+                log.warning(f"WSJ {section} feed failed: {e}")
+        # Only update cache if at least one feed succeeded — don't overwrite
+        # good cached data with empty rows on a transient outage.
+        if rows:
+            self._wsj_cache = rows
+            self._wsj_cache_time = time.time()
+        return rows or self._wsj_cache or []
+
     def get_active_storms(self) -> list:
         """NHC active tropical storms — useful for weather/hurricane markets.
         Public NOAA endpoint, no auth, 30-min cache. Empty list outside
@@ -3348,6 +3394,14 @@ class PolymarketBot:
                 ctx_parts.append("RECENT NEWS:")
                 for n in news[:3]:
                     ctx_parts.append(f"  - [{n.get('published','')}] {n.get('title','')}")
+            wsj = research.get("wsj") or []
+            if wsj:
+                _q_words_lc = set(w for w in question.lower().split() if len(w) >= 4)
+                rel_wsj = [r for r in wsj if any(w in r.get("title","").lower() or w in r.get("desc","").lower() for w in _q_words_lc)]
+                if rel_wsj:
+                    ctx_parts.append("WSJ HEADLINES (relevant):")
+                    for r in rel_wsj[:5]:
+                        ctx_parts.append(f"  [{r.get('section','')}] {r.get('title','')}")
             tavily = research.get("tavily", "")
             if tavily:
                 # Match the fetcher's 600-char-per-snippet × 3 snippets upper
@@ -4051,6 +4105,75 @@ class PolymarketBot:
 
     # ── Deep analysis for high-value trades (Claude Max) ────────────────────
     # Only fires when Kelly suggests a bet >= DEEP_ANALYZE_MIN_USD. Uses
+    async def _consensus_via_openrouter(
+        self,
+        *,
+        market_question: str,
+        our_side: str,
+        initial_probability: int,
+        planned_amount_usdc: float,
+    ) -> Optional[dict]:
+        """Independent second-opinion check on a planned trade. Calls a
+        non-Anthropic model (default openai/gpt-5-mini) via OpenRouter and
+        asks for a verdict + one-sentence reasoning. Returns
+        {verdict, reasoning} or None on any failure (no key, network error,
+        parse failure, etc.) — caller treats None as 'no consensus available,
+        keep the original Claude verdict'."""
+        if not CONSENSUS_ENABLED or not OPENROUTER_API_KEY:
+            return None
+        prompt = (
+            f"You are an independent second-opinion check on a planned "
+            f"Polymarket trade. Another AI model already produced a verdict; "
+            f"give YOUR independent take, NOT a critique of theirs.\n\n"
+            f"MARKET QUESTION: {market_question}\n"
+            f"OUR SIDE: {our_side}\n"
+            f"OUR INITIAL PROBABILITY ESTIMATE: {initial_probability}%\n"
+            f"PLANNED TRADE SIZE: ${planned_amount_usdc:.2f} USDC\n\n"
+            f"Should we PROCEED, DOWNSIZE (cut to 50%), or ABORT this trade?\n"
+            f"Output ONLY a JSON object on a single line, no markdown fences, "
+            f"no commentary:\n"
+            f'{{"verdict": "proceed"|"downsize"|"abort", "reasoning": "<one sentence>"}}'
+        )
+        payload = {
+            "model": CONSENSUS_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 200,
+            "temperature": 0.2,
+        }
+        try:
+            req = _ureq.Request(
+                "https://openrouter.ai/api/v1/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+            )
+            def _call():
+                with _ureq.urlopen(req, timeout=CONSENSUS_TIMEOUT_S) as r:
+                    return json.loads(r.read())
+            data = await asyncio.to_thread(_call)
+            text = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+            result = json.loads(text)
+            verdict = str(result.get("verdict", "")).lower().strip()
+            if verdict not in ("proceed", "downsize", "abort"):
+                log.warning(f"Consensus model returned unknown verdict {verdict!r}; ignoring")
+                return None
+            self._openrouter_last_success_ts = time.time()
+            self._openrouter_last_error = ""
+            return {
+                "verdict":   verdict,
+                "reasoning": str(result.get("reasoning", ""))[:300],
+                "model":     CONSENSUS_MODEL,
+            }
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"[:200]
+            self._openrouter_last_error = err
+            log.warning(f"Consensus check via OpenRouter failed: {err}")
+            return None
+
     # Opus 4.6 with adaptive thinking + the server-side web_search tool so
     # Claude can search the web for real-time news on the exact market
     # question. Returns a verdict that can override the fast-pass decision:
@@ -4197,6 +4320,51 @@ class PolymarketBot:
                 refined_prob = initial_probability
             refined_prob = max(0, min(100, refined_prob))
             reasoning = str(d.get("reasoning", ""))[:1000]
+
+            # ── Multi-model consensus check ───────────────────────────────
+            # Independent second opinion from a non-Anthropic model. Asymmetric:
+            # only ever DOWNGRADES the verdict (proceed→downsize→abort). Never
+            # upgrades. If the consensus call fails (network, parse, no key)
+            # we silently keep Claude's verdict — the consensus is insurance,
+            # not a hard dependency.
+            if verdict != "abort":
+                consensus = await self._consensus_via_openrouter(
+                    market_question=market_question,
+                    our_side=our_side,
+                    initial_probability=initial_probability,
+                    planned_amount_usdc=planned_amount_usdc,
+                )
+                if consensus is not None:
+                    rank = {"proceed": 2, "downsize": 1, "abort": 0}
+                    c_verdict = consensus["verdict"]
+                    if rank.get(c_verdict, 2) < rank.get(verdict, 2):
+                        original = verdict
+                        verdict = c_verdict
+                        if verdict == "abort":
+                            mult = 0.0
+                        elif verdict == "downsize":
+                            mult = min(mult, 0.5)
+                        log.warning(
+                            f"DEEP CONSENSUS DOWNGRADE: claude={original} "
+                            f"{consensus['model']}={c_verdict} → final={verdict}"
+                        )
+                        reasoning = (
+                            f"{reasoning} | CONSENSUS DOWNGRADE: "
+                            f"{consensus['model']}={c_verdict} "
+                            f"({consensus['reasoning'][:140]})"
+                        )[:1000]
+                        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                            asyncio.create_task(asyncio.to_thread(
+                                self.send_telegram,
+                                f"🟠 CONSENSUS DOWNGRADE on ${planned_amount_usdc:.2f} trade\n"
+                                f"{market_question[:80]}\n"
+                                f"claude={original} → {consensus['model'].split('/')[-1]}={c_verdict}\n"
+                                f"Reason: {consensus['reasoning'][:200]}"
+                            ))
+                    else:
+                        # Models agreed (or consensus was more permissive — we
+                        # ignore that direction). Note in reasoning for audit.
+                        reasoning = f"{reasoning} | consensus_agree:{c_verdict}"[:1000]
             evidence = d.get("evidence_used", []) or []
             if not isinstance(evidence, list):
                 evidence = []
@@ -5749,6 +5917,10 @@ class PolymarketBot:
                                 "kalshi":    asyncio.to_thread(self.get_kalshi_top),
                                 "predictit": asyncio.to_thread(self.get_predictit_markets),
                                 "manifold":  asyncio.to_thread(self.get_manifold_top),
+                                # WSJ headlines — cached 30 min; the per-question
+                                # filter in analyze_with_claude only surfaces items
+                                # whose title/desc share keywords with the question.
+                                "wsj":       asyncio.to_thread(self.get_wsj_headlines),
                             }
                             if TAVILY_API_KEY:
                                 _tasks["tavily"] = asyncio.to_thread(self.get_tavily_research, c["question"][:80])
