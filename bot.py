@@ -111,11 +111,19 @@ API_SECRET_KEY    = os.getenv("API_SECRET_KEY", "")
 if not API_SECRET_KEY:
     import secrets as _sec
     API_SECRET_KEY = _sec.token_hex(24)
-    log.warning(f"API_SECRET_KEY not set — generated ephemeral key (set in .env to persist): {API_SECRET_KEY[:6]}…")
+    log.warning("API_SECRET_KEY not set — generated ephemeral key (set in .env to persist)")
 # Dashboard-view password (separate from API_SECRET_KEY which guards writes).
 # The login page at /login.html POSTs to /auth/login with this. On success the
 # server sets an HttpOnly signed cookie; read endpoints require that cookie.
-DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "SEXYBOT")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+if not DASHBOARD_PASSWORD or DASHBOARD_PASSWORD == "SEXYBOT":
+    # Refuse to start with a missing / default password. The old fallback
+    # "SEXYBOT" was a publicly-known string and let anyone with the dashboard
+    # URL log in. Set DASHBOARD_PASSWORD in /root/polybot/.env to a real secret.
+    raise SystemExit(
+        "DASHBOARD_PASSWORD must be set in .env to a non-default value "
+        "(not 'SEXYBOT'). Aborting startup to prevent unauthenticated dashboard access."
+    )
 SESSION_TTL_SEC    = int(os.getenv("SESSION_TTL_SEC", "604800"))  # 7 days
 FRED_API_KEY       = os.getenv("FRED_API_KEY", "")
 OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY", "")
@@ -860,8 +868,11 @@ class PolymarketBot:
             total = cur.fetchone()[0] or 0
             return float(total)
         except Exception as e:
-            log.warning(f"get_daily_loss DB error: {e}")
-            return 0.0
+            # Fail closed: report infinity so the daily-loss halt fires. A
+            # silent return of 0.0 would let trading continue while we're
+            # blind to the real loss — strictly worse than briefly pausing.
+            log.error(f"get_daily_loss DB error — failing closed: {e}")
+            return float("inf")
 
     def has_position(self, token_id: str) -> bool:
         try:
@@ -5789,7 +5800,12 @@ class PolymarketBot:
                 except Exception:
                     pass
                 await asyncio.sleep(backoff)
-                self.running = True  # reset for the relaunch
+                # If the operator hit /stop during the backoff, honor it.
+                # Without this check, the supervisor would override an
+                # explicit stop and re-launch run_loop anyway.
+                if not self.running:
+                    self._log("Operator /stop during crash backoff — supervisor exiting", "info")
+                    return
                 continue
             # Clean exit: run_loop returned because self.running flipped False.
             # That's an operator /stop — respect it and end the supervisor too.
