@@ -148,6 +148,17 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 # gives real-time. Silent no-op if key is unset.
 POLYGON_API_KEY    = os.getenv("POLYGON_API_KEY", "")
 THE_ODDS_API_KEY   = os.getenv("THE_ODDS_API_KEY", "")
+# Portfolio concentration cap — refuse new BUYs whose execution would
+# push our total exposure to that market's category over this fraction
+# of the open book. 0 disables the check; 1.0 effectively disables it.
+# Default 0.50 = no single category > 50% of book.
+MAX_CATEGORY_EXPOSURE_PCT = float(os.getenv("MAX_CATEGORY_EXPOSURE_PCT", "0.50"))
+# Tiered drawdown — at WARN_AT_DAILY_LOSS_PCT × DAILY_LOSS_LIMIT we start
+# scaling new-trade size linearly toward 0 at the full limit. Soft warning
+# before the hard halt; gives the bot a chance to stop bleeding before it
+# stops trading entirely. 0.5 means "scale down once we hit half our daily
+# loss budget".
+WARN_AT_DAILY_LOSS_PCT = float(os.getenv("WARN_AT_DAILY_LOSS_PCT", "0.50"))
 # Whale wallet tracker — comma-separated Polygon addresses to query for
 # Polymarket positions on candidate tokens. Empty by default; populate
 # with addresses of consistently profitable Polymarket traders to use
@@ -526,6 +537,11 @@ class PolymarketBot:
         # at UTC midnight when get_daily_loss() returns 0. Distinct from
         # `running` so position monitoring, exits, and other loops keep working.
         self._new_trades_paused: bool = False
+        # Tiered drawdown attenuation: when daily_loss is between
+        # WARN_AT_DAILY_LOSS_PCT × DAILY_LOSS_LIMIT and the full limit, this
+        # multiplier scales every trade's Kelly size down linearly. 1.0 = no
+        # attenuation (loss < warn threshold), 0.0 = full halt (loss >= limit).
+        self._daily_loss_attenuation: float = 1.0
         # Diagnostic skip counters. Each rejection site in run_loop bumps a
         # named key so /status can show exactly which gate is eating signals
         # without needing to grep journalctl. cumulative = since process start;
@@ -2985,6 +3001,25 @@ class PolymarketBot:
         except Exception as e:
             log.warning(f"resolve_trade_outcomes error: {e}")
             return 0
+
+    def get_category_exposure(self) -> dict:
+        """Return {category: open_cost_usdc} for currently-open positions.
+        Joins `positions` to the most-recent BUY in `trades` on token_id
+        to attribute category. Used by the per-trade concentration check.
+        Empty dict on any DB error so the caller can fail open."""
+        try:
+            rows = self.db.execute(
+                "SELECT COALESCE(t.category, 'unknown') AS cat, "
+                "       SUM(p.cost) "
+                "FROM positions p "
+                "LEFT JOIN trades t ON p.token_id = t.token_id "
+                "     AND t.side LIKE 'BUY%' AND t.dry_run = 0 "
+                "GROUP BY COALESCE(t.category, 'unknown')"
+            ).fetchall()
+            return {str(r[0] or "unknown"): float(r[1] or 0.0) for r in rows}
+        except Exception as e:
+            log.warning(f"get_category_exposure error: {e}")
+            return {}
 
     def get_realized_pnl_summary(self) -> dict:
         """Aggregate realized P&L stats across time windows, plus per-strategy
@@ -6190,6 +6225,23 @@ class PolymarketBot:
                             self.send_telegram,
                             f"✅ Daily loss reset (${_dl:.2f}) — new trade entry resumed.",
                         ))
+                    # Tiered attenuation between warn-pct and the hard limit.
+                    # Linear ramp: full size below the warn threshold, scaled
+                    # toward zero as we approach the limit.
+                    if 0 < WARN_AT_DAILY_LOSS_PCT < 1 and DAILY_LOSS_LIMIT > 0:
+                        warn_dl = WARN_AT_DAILY_LOSS_PCT * DAILY_LOSS_LIMIT
+                        if _dl >= warn_dl:
+                            attenuation = max(0.0, (DAILY_LOSS_LIMIT - _dl) / (DAILY_LOSS_LIMIT - warn_dl))
+                            if attenuation < self._daily_loss_attenuation - 0.05:
+                                # Telegram once per material step-down to surface the warning.
+                                asyncio.create_task(asyncio.to_thread(
+                                    self.send_telegram,
+                                    f"🟠 Daily-loss WARN: ${_dl:.2f} of ${DAILY_LOSS_LIMIT:.0f} — "
+                                    f"sizing reduced to {attenuation*100:.0f}% of Kelly."
+                                ))
+                            self._daily_loss_attenuation = round(attenuation, 3)
+                        elif self._daily_loss_attenuation < 1.0:
+                            self._daily_loss_attenuation = 1.0
 
                 _ai_failures = 0  # circuit breaker: disable AI mid-cycle after 3 consecutive failures
                 markets = await asyncio.to_thread(self.get_markets, 30)
@@ -6775,6 +6827,60 @@ class PolymarketBot:
                                         self._bump_skip("deep_downsize_below_min")
                                         sig_record["skip_reason"] = f"deep downsized below $1"
                                         continue
+                            # ── Tiered drawdown attenuation ────────────────
+                            # If the cycle-top daily-loss check set an
+                            # attenuation < 1.0, scale this trade's size down
+                            # before the concentration check / execution. Hard
+                            # halt (attenuation = 0) is already handled above
+                            # via _new_trades_paused so we never reach here
+                            # with attenuation == 0.
+                            if self._daily_loss_attenuation < 1.0 and not PAPER_MODE:
+                                attenuated = round(amt * self._daily_loss_attenuation, 2)
+                                if attenuated < amt:
+                                    self._log(
+                                        f"[DRAWDOWN-ATTENUATE] {amt:.2f} → {attenuated:.2f} "
+                                        f"(×{self._daily_loss_attenuation:.2f})"
+                                    )
+                                    amt = attenuated
+                                    if amt < 1.0:
+                                        self._bump_skip("drawdown_attenuate_below_min")
+                                        sig_record["skip_reason"] = (
+                                            f"drawdown attenuation below $1 min"
+                                        )
+                                        continue
+
+                            # ── Portfolio concentration check ──────────────
+                            # Skip the trade if it would push this market's
+                            # category over MAX_CATEGORY_EXPOSURE_PCT of our
+                            # open book. Single-category blowups (e.g. one
+                            # election going hostile to us) are the dominant
+                            # tail risk on Polymarket. Fails open on any error
+                            # so a malformed query never blocks trading.
+                            if 0 < MAX_CATEGORY_EXPOSURE_PCT < 1 and not PAPER_MODE:
+                                try:
+                                    cat = (_attribution_base.get("category") or "unknown")
+                                    exp_map = self.get_category_exposure()
+                                    cat_exp   = exp_map.get(cat, 0.0)
+                                    total_exp = sum(exp_map.values())
+                                    new_total = total_exp + amt
+                                    new_cat_pct = (cat_exp + amt) / new_total if new_total > 0 else 0.0
+                                    if new_cat_pct > MAX_CATEGORY_EXPOSURE_PCT:
+                                        self._log(
+                                            f"[CONCENTRATION] skip {cat!r}: would be "
+                                            f"{new_cat_pct*100:.1f}% of book (cap "
+                                            f"{MAX_CATEGORY_EXPOSURE_PCT*100:.0f}%) after ${amt:.2f}",
+                                            "warning",
+                                        )
+                                        self._bump_skip("category_concentration")
+                                        sig_record["skip_reason"] = (
+                                            f"category concentration {cat} "
+                                            f"would be {new_cat_pct*100:.0f}% > cap "
+                                            f"{MAX_CATEGORY_EXPOSURE_PCT*100:.0f}%"
+                                        )
+                                        continue
+                                except Exception as _conc_e:
+                                    log.debug(f"concentration check error (allowing trade): {_conc_e}")
+
                             result = await self._execute_order(
                                 signal["token_id"], "BUY", amt, mkt_name,
                                 attribution=_attribution_base,
