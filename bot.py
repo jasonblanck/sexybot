@@ -4138,18 +4138,18 @@ class PolymarketBot:
             try:
                 msg = await asyncio.to_thread(client.messages.create, **api_kwargs)
             except Exception as api_err:
-                # Fall back to a minimal Haiku call without thinking/caching
-                # — keeps the bot trading even if Sonnet is rate-limited or
-                # the adaptive-thinking parameter isn't accepted by the
-                # installed SDK version.
+                # Fall back to a minimal Haiku call without thinking. Cache
+                # markers on system + tool let Haiku reuse the same prefix
+                # across calls — Sonnet's audit showed Haiku fallbacks at
+                # 0% hit rate previously.
                 log.warning(f"Claude primary call failed ({api_err}); falling back to {CLAUDE_FAST_MODEL}")
                 msg = await asyncio.to_thread(
                     client.messages.create,
                     model=CLAUDE_FAST_MODEL,
                     max_tokens=500,
-                    system=system_prompt,
+                    system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
                     messages=[{"role": "user", "content": user_prompt}],
-                    tools=[_TOOL_ANALYZE],
+                    tools=[{**_TOOL_ANALYZE, "cache_control": {"type": "ephemeral"}}],
                     tool_choice={"type": "tool", "name": _TOOL_ANALYZE["name"]},
                 )
             self._record_claude_usage(msg)
@@ -4269,9 +4269,9 @@ class PolymarketBot:
                 client.messages.create,
                 model=CLAUDE_FAST_MODEL,   # Haiku is plenty for this structured task
                 max_tokens=400,
-                system=system,
+                system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                 messages=[{"role": "user", "content": ctx}],
-                tools=[_TOOL_REGIME],
+                tools=[{**_TOOL_REGIME, "cache_control": {"type": "ephemeral"}}],
                 tool_choice={"type": "tool", "name": _TOOL_REGIME["name"]},
             )
             self._record_claude_usage(msg)
@@ -4420,9 +4420,9 @@ class PolymarketBot:
                     client.messages.create,
                     model=CLAUDE_FAST_MODEL,
                     max_tokens=250,
-                    system=system,
+                    system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                     messages=[{"role": "user", "content": ctx}],
-                    tools=[_TOOL_PRETRADE],
+                    tools=[{**_TOOL_PRETRADE, "cache_control": {"type": "ephemeral"}}],
                     tool_choice={"type": "tool", "name": _TOOL_PRETRADE["name"]},
                 ),
                 timeout=PRETRADE_TIMEOUT_S,
@@ -5337,13 +5337,57 @@ class PolymarketBot:
                 worst = cats[-1]
                 if len(cats) > 1 and best[1] != worst[1]:
                     lines.append(
-                        f"· 30d best: {best[0]} ${best[1]:+.2f} (n={best[2]}) · "
+                        f"· 30d cat best: {best[0]} ${best[1]:+.2f} (n={best[2]}) · "
                         f"worst: {worst[0]} ${worst[1]:+.2f} (n={worst[2]})"
                     )
                 else:
-                    lines.append(f"· 30d: {best[0]} ${best[1]:+.2f} (n={best[2]})")
+                    lines.append(f"· 30d cat: {best[0]} ${best[1]:+.2f} (n={best[2]})")
         except Exception as e:
             log.debug(f"daily summary category query failed: {e}")
+
+        # 30d strategy breakdown — best vs worst strategy. Mirrors the
+        # category logic so we surface attribution on every dimension the
+        # nightly review uses.
+        try:
+            by_strat = self.db.execute(
+                "SELECT strategy, "
+                "       COALESCE(SUM(realized_pnl), 0) as pnl, "
+                "       COUNT(*) "
+                "FROM trades WHERE resolved=1 AND dry_run=0 "
+                "AND strategy IS NOT NULL AND strategy != '' "
+                "AND resolved_at >= datetime('now','-30 days') "
+                "GROUP BY strategy ORDER BY pnl DESC"
+            ).fetchall() or []
+            strats = [(r[0], float(r[1] or 0), int(r[2] or 0)) for r in by_strat if r[2]]
+            if len(strats) >= 2 and strats[0][1] != strats[-1][1]:
+                lines.append(
+                    f"· 30d strat best: {strats[0][0]} ${strats[0][1]:+.2f} (n={strats[0][2]}) · "
+                    f"worst: {strats[-1][0]} ${strats[-1][1]:+.2f} (n={strats[-1][2]})"
+                )
+            elif strats:
+                lines.append(f"· 30d strat: {strats[0][0]} ${strats[0][1]:+.2f} (n={strats[0][2]})")
+        except Exception as e:
+            log.debug(f"daily summary strategy query failed: {e}")
+
+        # 30d regime breakdown — were we losing money in cautious/hostile
+        # regimes specifically? Surfaces the real-world payoff of the
+        # regime detector.
+        try:
+            by_reg = self.db.execute(
+                "SELECT regime_at_entry, "
+                "       COALESCE(SUM(realized_pnl), 0) as pnl, "
+                "       COUNT(*) "
+                "FROM trades WHERE resolved=1 AND dry_run=0 "
+                "AND regime_at_entry IS NOT NULL AND regime_at_entry != '' "
+                "AND resolved_at >= datetime('now','-30 days') "
+                "GROUP BY regime_at_entry ORDER BY pnl DESC"
+            ).fetchall() or []
+            regs = [(r[0], float(r[1] or 0), int(r[2] or 0)) for r in by_reg if r[2]]
+            if len(regs) >= 2:
+                rstr = " · ".join(f"{r[0]}: ${r[1]:+.2f} (n={r[2]})" for r in regs)
+                lines.append(f"· 30d regime: {rstr}")
+        except Exception as e:
+            log.debug(f"daily summary regime query failed: {e}")
 
         # Redeemer activity — only surface if we claimed anything today.
         today_str = datetime.utcnow().strftime("%Y-%m-%d")
