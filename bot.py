@@ -6341,8 +6341,30 @@ def _sec_compare(a: str, b: str) -> bool:
 import base64 as _b64
 import hmac as _hmac
 import hashlib as _hashlib
+import secrets as _secrets
 
 SESSION_COOKIE_NAME = "sb_session"
+
+# Pending 2FA logins. Keyed by an opaque pending_token returned to the
+# browser after step-1 password validation; the browser then posts the
+# Telegram OTP back along with this token to /auth/verify. In-memory is
+# fine — single FastAPI process; a restart loses pending entries which
+# just forces re-login (cookies issued by /auth/verify still survive).
+_PENDING_LOGINS: dict[str, dict] = {}
+OTP_TTL_SEC      = 300   # 5 min
+OTP_MAX_ATTEMPTS = 5
+
+def _otp_generate() -> str:
+    return f"{_secrets.randbelow(1_000_000):06d}"
+
+def _pending_token_generate() -> str:
+    return _secrets.token_hex(16)
+
+def _pending_logins_gc() -> None:
+    """Drop expired pending entries — called opportunistically on each /auth/login."""
+    now = time.time()
+    for k in [k for k, v in _PENDING_LOGINS.items() if v["expires_at"] < now]:
+        _PENDING_LOGINS.pop(k, None)
 
 def _make_session_token() -> str:
     ts = str(int(time.time())).encode()
@@ -6374,7 +6396,7 @@ def _verify_session_token(token: Optional[str]) -> bool:
 # the kill/start/stop/settings endpoints all use X-API-Key instead.
 _AUTH_EXEMPT_EXACT = {
     "/health", "/health/claude", "/health/runtime",
-    "/auth/login", "/auth/logout", "/auth/check",
+    "/auth/login", "/auth/verify", "/auth/logout", "/auth/check",
     "/login", "/login.html",
     "/favicon.ico",
     "/ws",
@@ -6405,10 +6427,58 @@ async def _session_gate(request, call_next):
 
 @app.post("/auth/login")
 async def auth_login(body: dict):
-    """Validate password, issue session cookie on success."""
+    """Step 1 of 2: validate password, send OTP via Telegram, return a
+    pending_token. Client must POST that token + the OTP to /auth/verify
+    within OTP_TTL_SEC seconds to actually receive a session cookie."""
     pw = str(body.get("password", ""))
     if not _sec_compare(pw, DASHBOARD_PASSWORD):
         raise HTTPException(status_code=401, detail="Invalid password")
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("2FA login attempted but TELEGRAM_TOKEN/CHAT_ID not configured — refusing login")
+        raise HTTPException(
+            status_code=503,
+            detail="2FA channel not configured (set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID in .env)",
+        )
+    _pending_logins_gc()
+    otp = _otp_generate()
+    pending_token = _pending_token_generate()
+    _PENDING_LOGINS[pending_token] = {
+        "otp":         otp,
+        "expires_at":  time.time() + OTP_TTL_SEC,
+        "attempts":    0,
+    }
+    try:
+        await asyncio.to_thread(
+            bot.send_telegram,
+            f"🔐 SexyBot dashboard login code: {otp}\nExpires in {OTP_TTL_SEC // 60} min. If you didn't try to log in, ignore this.",
+        )
+    except Exception as e:
+        log.error(f"2FA Telegram send failed: {e}")
+        _PENDING_LOGINS.pop(pending_token, None)
+        raise HTTPException(status_code=503, detail="Failed to send 2FA code via Telegram")
+    return {"ok": True, "pending_token": pending_token, "expires_in": OTP_TTL_SEC}
+
+
+@app.post("/auth/verify")
+async def auth_verify(body: dict):
+    """Step 2 of 2: verify the Telegram OTP, issue the session cookie."""
+    pending_token = str(body.get("pending_token", ""))
+    otp_input     = str(body.get("otp", "")).strip()
+    entry = _PENDING_LOGINS.get(pending_token)
+    if not entry:
+        raise HTTPException(status_code=401, detail="Login session not found — restart from password")
+    if time.time() > entry["expires_at"]:
+        _PENDING_LOGINS.pop(pending_token, None)
+        raise HTTPException(status_code=401, detail="Code expired — restart from password")
+    entry["attempts"] += 1
+    if entry["attempts"] > OTP_MAX_ATTEMPTS:
+        _PENDING_LOGINS.pop(pending_token, None)
+        raise HTTPException(status_code=429, detail="Too many attempts — restart from password")
+    if not _sec_compare(otp_input, entry["otp"]):
+        attempts_left = OTP_MAX_ATTEMPTS - entry["attempts"]
+        raise HTTPException(status_code=401, detail=f"Invalid code ({attempts_left} attempt{'s' if attempts_left != 1 else ''} left)")
+    # Success
+    _PENDING_LOGINS.pop(pending_token, None)
     token = _make_session_token()
     resp = JSONResponse({"ok": True})
     resp.set_cookie(

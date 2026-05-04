@@ -194,8 +194,9 @@ button:disabled{opacity:0.4;cursor:not-allowed;}
 _\ \ / _/  \  / \ V // _ \ / (_)/  /
 /___//___/  /_/   |_|/____/ \___/__/</div>
         <h1>ACCESS TERMINAL</h1>
-        <div class="sub">authorization required · no trace logged</div>
+        <div class="sub" id="subText">authorization required · no trace logged</div>
 
+        <!-- Step 1: password -->
         <form id="loginForm" autocomplete="off">
           <div class="prompt">
             <span class="ps">$</span>
@@ -203,6 +204,20 @@ _\ \ / _/  \  / \ V // _ \ / (_)/  /
             <span class="caret"></span>
           </div>
           <button type="submit" id="submitBtn">[ AUTHENTICATE ]</button>
+        </form>
+
+        <!-- Step 2: Telegram OTP (hidden until step 1 succeeds) -->
+        <form id="otpForm" autocomplete="off" hidden>
+          <div class="prompt">
+            <span class="ps">2FA&gt;</span>
+            <input type="text" id="otp" name="otp" placeholder="6-digit code from telegram" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" spellcheck="false">
+            <span class="caret"></span>
+          </div>
+          <button type="submit" id="otpBtn">[ VERIFY ]</button>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;font-size:10px;letter-spacing:1.5px;color:var(--amber-dim);">
+            <span id="otpTimer">expires in 5:00</span>
+            <a href="#" id="otpBack" style="color:var(--amber-dim);text-decoration:none;border-bottom:1px dotted var(--amber-dim);">[ restart ]</a>
+          </div>
         </form>
 
         <div id="status" class="status info">awaiting input…</div>
@@ -271,28 +286,76 @@ setInterval(updateClock, 1000); updateClock();
 document.getElementById('rnd').textContent =
   Array.from({length:8},()=>'0123456789ABCDEF'[Math.floor(Math.random()*16)]).join('');
 
-// ─── Login flow ──────────────────────────────────────────────────
-const form   = document.getElementById('loginForm');
-const btn    = document.getElementById('submitBtn');
-const pwIn   = document.getElementById('pw');
-const status = document.getElementById('status');
-const panel  = document.getElementById('panel');
+// ─── Login flow (password → Telegram OTP) ───────────────────────
+const pwForm  = document.getElementById('loginForm');
+const otpForm = document.getElementById('otpForm');
+const pwBtn   = document.getElementById('submitBtn');
+const otpBtn  = document.getElementById('otpBtn');
+const pwIn    = document.getElementById('pw');
+const otpIn   = document.getElementById('otp');
+const status  = document.getElementById('status');
+const subText = document.getElementById('subText');
+const otpTimer = document.getElementById('otpTimer');
+const otpBack  = document.getElementById('otpBack');
+const panel   = document.getElementById('panel');
+
+let pendingToken = null;
+let expiresAt    = 0;
+let countdownId  = null;
 
 function setStatus(msg, cls){
   status.textContent = msg;
   status.className = 'status ' + (cls || 'info');
 }
 
-form.addEventListener('submit', async (e) => {
+function showStep(step){
+  if (step === 'pw'){
+    pwForm.hidden = false; otpForm.hidden = true;
+    subText.textContent = 'authorization required · no trace logged';
+    pwBtn.disabled = false;
+    if (countdownId){ clearInterval(countdownId); countdownId = null; }
+    pendingToken = null;
+    setTimeout(()=>pwIn.focus(), 50);
+  } else {
+    pwForm.hidden = true; otpForm.hidden = false;
+    subText.textContent = '2-factor verification · check telegram';
+    otpBtn.disabled = false;
+    otpIn.value = '';
+    setTimeout(()=>otpIn.focus(), 50);
+  }
+}
+
+function fmtCountdown(secs){
+  if (secs < 0) secs = 0;
+  const m = Math.floor(secs / 60), s = secs % 60;
+  return `expires in ${m}:${String(s).padStart(2,'0')}`;
+}
+
+function startCountdown(){
+  if (countdownId) clearInterval(countdownId);
+  const tick = () => {
+    const left = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+    otpTimer.textContent = fmtCountdown(left);
+    if (left === 0){
+      clearInterval(countdownId); countdownId = null;
+      setStatus('[ expired ] code timed out — restart from password', 'err');
+      otpBtn.disabled = true;
+    }
+  };
+  tick();
+  countdownId = setInterval(tick, 1000);
+}
+
+pwForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const pw = pwIn.value;
   if (!pw){
     setStatus('[ error ] access code required', 'err');
     return;
   }
-  btn.disabled = true;
+  pwBtn.disabled = true;
   panel.classList.add('flicker');
-  setStatus('> authenticating…', 'info');
+  setStatus('> validating…', 'info');
   try {
     const r = await fetch('/auth/login', {
       method: 'POST',
@@ -300,23 +363,81 @@ form.addEventListener('submit', async (e) => {
       body: JSON.stringify({password: pw}),
       credentials: 'same-origin'
     });
+    const data = await r.json().catch(()=>({}));
     if (r.ok) {
-      setStatus('[ ok ] access granted · routing to terminal…', 'ok');
-      setTimeout(() => { window.location.href = '/'; }, 650);
+      pendingToken = data.pending_token;
+      expiresAt = Date.now() + (data.expires_in || 300) * 1000;
+      setStatus('[ ok ] code sent to telegram · enter to continue', 'ok');
+      showStep('otp');
+      startCountdown();
     } else if (r.status === 401) {
       setStatus('[ denied ] invalid access code', 'err');
       pwIn.value = ''; pwIn.focus();
-      btn.disabled = false;
+      pwBtn.disabled = false;
+    } else if (r.status === 503) {
+      setStatus('[ error ] ' + (data.detail || '2FA channel down'), 'err');
+      pwBtn.disabled = false;
     } else {
       setStatus('[ error ] auth service HTTP ' + r.status, 'err');
-      btn.disabled = false;
+      pwBtn.disabled = false;
     }
   } catch (err) {
     setStatus('[ error ] auth service unreachable', 'err');
-    btn.disabled = false;
+    pwBtn.disabled = false;
   } finally {
     setTimeout(()=>panel.classList.remove('flicker'), 800);
   }
+});
+
+otpForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const otp = otpIn.value.trim();
+  if (!/^[0-9]{6}$/.test(otp)){
+    setStatus('[ error ] enter 6-digit numeric code', 'err');
+    return;
+  }
+  if (!pendingToken){
+    setStatus('[ error ] no pending login — restart from password', 'err');
+    showStep('pw');
+    return;
+  }
+  otpBtn.disabled = true;
+  panel.classList.add('flicker');
+  setStatus('> verifying…', 'info');
+  try {
+    const r = await fetch('/auth/verify', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({pending_token: pendingToken, otp}),
+      credentials: 'same-origin'
+    });
+    const data = await r.json().catch(()=>({}));
+    if (r.ok) {
+      setStatus('[ ok ] access granted · routing to terminal…', 'ok');
+      setTimeout(() => { window.location.href = '/'; }, 650);
+    } else if (r.status === 401){
+      setStatus('[ denied ] ' + (data.detail || 'invalid code'), 'err');
+      otpIn.value = ''; otpIn.focus();
+      otpBtn.disabled = false;
+    } else if (r.status === 429){
+      setStatus('[ blocked ] ' + (data.detail || 'too many attempts'), 'err');
+      setTimeout(()=>showStep('pw'), 1500);
+    } else {
+      setStatus('[ error ] verify service HTTP ' + r.status, 'err');
+      otpBtn.disabled = false;
+    }
+  } catch (err) {
+    setStatus('[ error ] verify service unreachable', 'err');
+    otpBtn.disabled = false;
+  } finally {
+    setTimeout(()=>panel.classList.remove('flicker'), 800);
+  }
+});
+
+otpBack.addEventListener('click', (e) => {
+  e.preventDefault();
+  showStep('pw');
+  setStatus('awaiting input…', 'info');
 });
 
 // If user already has a valid session, redirect straight to /
