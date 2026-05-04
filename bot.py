@@ -492,6 +492,10 @@ class PolymarketBot:
         # a restart to clear (intentional — operator must top up and verify).
         self._balance_error_streak: int = 0
         self._balance_halt_tripped: bool = False
+        # Pauses NEW trade entry when daily_loss >= DAILY_LOSS_LIMIT. Auto-clears
+        # at UTC midnight when get_daily_loss() returns 0. Distinct from
+        # `running` so position monitoring, exits, and other loops keep working.
+        self._new_trades_paused: bool = False
         # Diagnostic skip counters. Each rejection site in run_loop bumps a
         # named key so /status can show exactly which gate is eating signals
         # without needing to grep journalctl. cumulative = since process start;
@@ -5168,6 +5172,36 @@ class PolymarketBot:
                         break
                     continue
 
+                # ── Daily loss pause (auto-resumes at UTC midnight) ────────
+                # Pauses NEW trade entry only — the run_loop and all other
+                # `while self.running` loops (position monitor, regime,
+                # nightly review, etc.) keep working so existing positions
+                # still get TP/SL/timeout exits. get_daily_loss() filters by
+                # today's UTC date, so the pause naturally clears at 00:00 UTC.
+                if not PAPER_MODE:
+                    _dl = self.get_daily_loss()
+                    if _dl >= DAILY_LOSS_LIMIT:
+                        if not self._new_trades_paused:
+                            self._new_trades_paused = True
+                            self._log(f"DAILY LOSS LIMIT HIT: ${_dl:.2f} — pausing new trades until UTC midnight", "error")
+                            asyncio.create_task(asyncio.to_thread(
+                                self.send_telegram,
+                                f"⚠️ Daily loss limit hit: ${_dl:.2f}. New trade entry paused; resumes at UTC midnight.",
+                            ))
+                        self._bump_skip("cycle_daily_loss_pause")
+                        try:
+                            await asyncio.sleep(interval)
+                        except asyncio.CancelledError:
+                            break
+                        continue
+                    elif self._new_trades_paused:
+                        self._new_trades_paused = False
+                        self._log(f"Daily loss reset (today: ${_dl:.2f}) — resuming new trades")
+                        asyncio.create_task(asyncio.to_thread(
+                            self.send_telegram,
+                            f"✅ Daily loss reset (${_dl:.2f}) — new trade entry resumed.",
+                        ))
+
                 _ai_failures = 0  # circuit breaker: disable AI mid-cycle after 3 consecutive failures
                 markets = await asyncio.to_thread(self.get_markets, 30)
                 self._bump_skip("markets_scanned", len(markets))
@@ -5437,11 +5471,19 @@ class PolymarketBot:
                     self._log(f"SIGNAL [{signal['strategy']}] {signal['signal']} | conf={signal.get('confidence','?')}% | {signal['market'][:50]}")
 
                     # ── Daily loss guard ──────────────────────────────────────
+                    # Mid-cycle re-check (a settlement during this cycle could
+                    # push us past the limit even though the cycle-top check
+                    # passed). Pauses new trade entry; does not kill the loop.
                     daily_loss = self.get_daily_loss()
                     if daily_loss >= DAILY_LOSS_LIMIT:
-                        self._log(f"DAILY LOSS LIMIT HIT: ${daily_loss:.2f} — stopping trading", "error")
-                        asyncio.create_task(asyncio.to_thread(self.send_telegram, f"⚠️ Daily loss limit hit: ${daily_loss:.2f}. Bot stopped trading."))
-                        self.running = False
+                        if not self._new_trades_paused:
+                            self._new_trades_paused = True
+                            self._log(f"DAILY LOSS LIMIT HIT: ${daily_loss:.2f} — pausing new trades until UTC midnight", "error")
+                            asyncio.create_task(asyncio.to_thread(
+                                self.send_telegram,
+                                f"⚠️ Daily loss limit hit: ${daily_loss:.2f}. New trade entry paused; resumes at UTC midnight.",
+                            ))
+                        self._bump_skip("daily_loss_pause_midcycle")
                         break
 
                     # Stop mid-cycle if a rejection this loop tripped the halt.
@@ -5724,6 +5766,37 @@ class PolymarketBot:
                 log.debug(f"run_loop sleep interrupted: {e}")
         self._log("Bot stopped.")
         await asyncio.to_thread(self.send_telegram, "Bot stopped.")
+
+    async def run_loop_supervised(self, interval: float = 30.0):
+        """Wraps run_loop with auto-restart on unexpected exit. Inner
+        run_loop only ends cleanly when self.running is flipped False
+        (operator /stop) or on cancellation. Any other exit is treated
+        as a crash and we restart after a 10s backoff so a transient
+        bug or network blip can't leave the bot dead until manual /start."""
+        backoff = 10
+        while True:
+            try:
+                await self.run_loop(interval=interval)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log(f"run_loop crashed ({type(e).__name__}): {e!r} — auto-restart in {backoff}s", "error")
+                try:
+                    await asyncio.to_thread(
+                        self.send_telegram,
+                        f"⚠️ run_loop crashed ({type(e).__name__}): {e}. Auto-restart in {backoff}s.",
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(backoff)
+                self.running = True  # reset for the relaunch
+                continue
+            # Clean exit: run_loop returned because self.running flipped False.
+            # That's an operator /stop — respect it and end the supervisor too.
+            if not self.running:
+                return
+            # Defensive — shouldn't reach here. Tight-loop guard before retry.
+            await asyncio.sleep(1)
 
     def stop(self):
         self.running = False
@@ -6128,7 +6201,7 @@ async def lifespan(app_: FastAPI):
                 # Don't block startup on a reconcile failure; log loudly.
                 log.warning(f"[STARTUP RECONCILE] cancel_all failed: {e}")
         bot.running = True  # set before create_task to prevent double-start race at startup
-        _bot_task = asyncio.create_task(bot.run_loop(interval=SCAN_INTERVAL_S))
+        _bot_task = asyncio.create_task(bot.run_loop_supervised(interval=SCAN_INTERVAL_S))
         log.info("Bot auto-started on startup")
         if PAPER_MODE and _PAPER_AVAILABLE and bot.paper:
             bot.start_paper_oracle()
@@ -6534,7 +6607,7 @@ async def start_bot(interval: Optional[float] = None):
             )
     interval = max(10.0, min(interval, 300.0))  # clamp to [10s, 5min]
     bot.running = True  # set before task creation to prevent double-start race
-    _bot_task = asyncio.create_task(bot.run_loop(interval=interval))
+    _bot_task = asyncio.create_task(bot.run_loop_supervised(interval=interval))
     if PAPER_MODE and _PAPER_AVAILABLE:
         # Lazy-init paper handler if connect() never ran (e.g. bot started via API after startup failure)
         if not bot.paper and hasattr(bot, 'db'):
@@ -6811,7 +6884,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 global _bot_task
                 if not bot.running:
                     bot.running = True  # set before task creation to prevent double-start race
-                    _bot_task = asyncio.create_task(bot.run_loop())
+                    _bot_task = asyncio.create_task(bot.run_loop_supervised())
                     if PAPER_MODE and _PAPER_AVAILABLE and bot.paper:
                         bot.start_paper_oracle()
             elif cmd == "stop":
@@ -7129,6 +7202,8 @@ def runtime_health():
         return {
             "ts":                  datetime.utcnow().isoformat(),
             "bot_running":         bot.running,
+            "new_trades_paused":   bot._new_trades_paused,
+            "balance_halted":      bot._balance_halt_tripped,
             "strategy":            STRATEGY,
             "dry_run":             DRY_RUN,
             "claude_max_disabled": CLAUDE_MAX_DISABLED,
