@@ -147,6 +147,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 # Finnhub rate-limits or errors. Free tier is prev-close only; paid
 # gives real-time. Silent no-op if key is unset.
 POLYGON_API_KEY    = os.getenv("POLYGON_API_KEY", "")
+THE_ODDS_API_KEY   = os.getenv("THE_ODDS_API_KEY", "")
 PAPER_MODE    = os.getenv("PAPER_MODE", "false").lower() == "true"
 PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "1000.0"))
 
@@ -2098,6 +2099,12 @@ class PolymarketBot:
     _predictit_cache_time: float = 0
     _nhc_cache: list = []
     _nhc_cache_time: float = 0
+    # The Odds API — sportsbook odds for sports markets. Free tier is
+    # 500 calls/month TOTAL, so we cache per-sport for 30 min and refuse
+    # to call when remaining < 50 (reserve headroom for the rest of the month).
+    _oddsapi_cache: dict = {}    # sport_key -> {"t": ts, "events": [...]}
+    _oddsapi_remaining: Optional[int] = None  # last x-requests-remaining header value
+    _oddsapi_last_error: str = ""
     # Tavily / OpenRouter health (surfaced in /health/runtime so the morning
     # routine catches plan-exhaustion or a dead provider).
     _tavily_last_error: str = ""
@@ -3089,6 +3096,83 @@ class PolymarketBot:
             log.warning(f"Predictit fetch failed: {e}")
             return self._predictit_cache or []
 
+    @staticmethod
+    def _detect_sport_key(question: str) -> Optional[str]:
+        """Map a Polymarket question to an Odds API sport_key. Returns None
+        if no league is unambiguously named. Conservative — only fires on
+        explicit league mentions, not on team names alone, since team-name
+        matching across sports requires a separate disambiguation table."""
+        q = (question or "").lower()
+        league_map = (
+            (("nba ", " nba", "national basketball"),     "basketball_nba"),
+            (("nfl ", " nfl", "super bowl"),              "americanfootball_nfl"),
+            (("mlb ", " mlb", "world series"),            "baseball_mlb"),
+            (("nhl ", " nhl", "stanley cup"),             "icehockey_nhl"),
+            (("ufc ", " ufc"),                            "mma_mixed_martial_arts"),
+            (("premier league", "epl "),                  "soccer_epl"),
+            (("champions league",),                       "soccer_uefa_champs_league"),
+            (("ncaa basketball", "march madness"),        "basketball_ncaab"),
+            (("ncaa football",),                          "americanfootball_ncaaf"),
+            (("mls ",),                                    "soccer_usa_mls"),
+        )
+        # Pad question with spaces so " nba " matchers work at start/end.
+        padded = f" {q} "
+        for keywords, sport_key in league_map:
+            if any(k in padded for k in keywords):
+                return sport_key
+        return None
+
+    def get_oddsapi_events(self, sport_key: str) -> list:
+        """Fetch sportsbook odds for a sport. 30-min cache per sport. Hard
+        budget guard: refuses to call if remaining monthly quota < 50 to
+        reserve headroom (free tier is 500/month total). Returns top-10
+        events with top-2 books each."""
+        if not THE_ODDS_API_KEY or not sport_key:
+            return []
+        cache_entry = self._oddsapi_cache.get(sport_key)
+        if cache_entry and time.time() - cache_entry["t"] < 1800:
+            return cache_entry["events"]
+        if self._oddsapi_remaining is not None and self._oddsapi_remaining < 50:
+            # Stay under the monthly cap; serve stale if any, else empty.
+            return cache_entry["events"] if cache_entry else []
+        try:
+            url = (
+                f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+                f"?apiKey={THE_ODDS_API_KEY}&regions=us&markets=h2h&oddsFormat=american"
+            )
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0", "Accept": "application/json"})
+            with _ureq.urlopen(req, timeout=8) as r:
+                events = json.loads(r.read())
+                rem_hdr = r.headers.get("x-requests-remaining")
+                if rem_hdr is not None:
+                    try:
+                        self._oddsapi_remaining = int(rem_hdr)
+                    except ValueError:
+                        pass
+            rows = []
+            for ev in events[:10]:
+                books = ev.get("bookmakers", [])[:2]
+                book_data = []
+                for bk in books:
+                    h2h = next((m for m in bk.get("markets", []) if m.get("key") == "h2h"), None)
+                    if h2h:
+                        outcomes = [(o.get("name", ""), o.get("price")) for o in h2h.get("outcomes", [])]
+                        book_data.append({"book": bk.get("title", ""), "outcomes": outcomes})
+                rows.append({
+                    "home":     ev.get("home_team"),
+                    "away":     ev.get("away_team"),
+                    "commence": ev.get("commence_time", "")[:16],
+                    "books":    book_data,
+                })
+            self._oddsapi_cache[sport_key] = {"t": time.time(), "events": rows}
+            self._oddsapi_last_error = ""
+            return rows
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"[:200]
+            self._oddsapi_last_error = err
+            log.warning(f"OddsAPI fetch failed for {sport_key}: {err}")
+            return cache_entry["events"] if cache_entry else []
+
     def get_active_storms(self) -> list:
         """NHC active tropical storms — useful for weather/hurricane markets.
         Public NOAA endpoint, no auth, 30-min cache. Empty list outside
@@ -3217,6 +3301,23 @@ class PolymarketBot:
                 lines = ["NHC ACTIVE STORMS:"]
                 for s in storms[:5]:
                     lines.append(f"  {s.get('name','?')} ({s.get('type','')}, {s.get('intensity','')}) — {s.get('movement','')}")
+                ctx_parts.append("\n".join(lines))
+
+            # Sportsbook odds — only present when the question explicitly
+            # named a league. American odds: negative=favorite, positive=
+            # underdog, magnitude implies probability. Use as an external
+            # market consensus to compare against Polymarket's pricing.
+            sports_odds = research.get("sports_odds") or []
+            if sports_odds:
+                lines = ["SPORTSBOOK ODDS (American: -150 = ~60% implied, +200 = ~33% implied):"]
+                for ev in sports_odds[:5]:
+                    lines.append(f"  {ev.get('commence','')}  {ev.get('away')} @ {ev.get('home')}:")
+                    for b in ev.get("books", [])[:2]:
+                        outcomes_str = ", ".join(
+                            f"{n} {p:+d}" if isinstance(p, int) else f"{n} {p}"
+                            for n, p in b.get("outcomes", [])
+                        )
+                        lines.append(f"    {b.get('book','?')}: {outcomes_str}")
                 ctx_parts.append("\n".join(lines))
             # Weather forecast (only present for weather-tagged markets with
             # a resolvable location). Daily granularity, 14-day window, with
@@ -5543,6 +5644,16 @@ class PolymarketBot:
                                 # the question text mentions hurricanes/storms.
                                 if any(k in _q_lower for k in ("hurricane", "tropical storm", "cyclone", "named storm")):
                                     _tasks["storms"] = asyncio.to_thread(self.get_active_storms)
+                            # Sportsbook odds — fires only when the question
+                            # explicitly names a league (NBA/NFL/MLB/...). Hard
+                            # budget guard inside the fetcher (free tier is
+                            # 500/mo total) so this won't run away.
+                            if THE_ODDS_API_KEY:
+                                _sport_key = type(self)._detect_sport_key(c["question"])
+                                if _sport_key:
+                                    _tasks["sports_odds"] = asyncio.to_thread(
+                                        self.get_oddsapi_events, _sport_key
+                                    )
                             # Stock-ticker markets: if the question mentions one
                             # of our tracked tickers (NVDA, TSLA, SPY, etc.),
                             # fetch real-time Finnhub quotes. Silent if key unset.
@@ -7457,6 +7568,10 @@ def runtime_health():
             "tavily_last_error":   bot._tavily_last_error or None,
             "openrouter_configured": bool(OPENROUTER_API_KEY),
             "openrouter_last_error": bot._openrouter_last_error or None,
+            "oddsapi_configured":    bool(THE_ODDS_API_KEY),
+            "oddsapi_remaining":     bot._oddsapi_remaining,
+            "oddsapi_low_budget":    bot._oddsapi_remaining is not None and bot._oddsapi_remaining < 100,
+            "oddsapi_last_error":    bot._oddsapi_last_error or None,
         }
     except Exception as e:
         log.warning(f"/health/runtime error: {e}")
