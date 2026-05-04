@@ -2105,6 +2105,15 @@ class PolymarketBot:
     _oddsapi_cache: dict = {}    # sport_key -> {"t": ts, "events": [...]}
     _oddsapi_remaining: Optional[int] = None  # last x-requests-remaining header value
     _oddsapi_last_error: str = ""
+    # Manifold Markets (third prediction-market reference after Kalshi/Predictit).
+    # NOAA severe weather alerts and USGS earthquakes (only fetched for
+    # weather/earthquake-tagged questions, similar to NHC).
+    _manifold_cache: list = []
+    _manifold_cache_time: float = 0
+    _noaa_alerts_cache: list = []
+    _noaa_alerts_cache_time: float = 0
+    _usgs_cache: list = []
+    _usgs_cache_time: float = 0
     # Tavily / OpenRouter health (surfaced in /health/runtime so the morning
     # routine catches plan-exhaustion or a dead provider).
     _tavily_last_error: str = ""
@@ -3173,6 +3182,89 @@ class PolymarketBot:
             log.warning(f"OddsAPI fetch failed for {sport_key}: {err}")
             return cache_entry["events"] if cache_entry else []
 
+    def get_manifold_top(self) -> list:
+        """Top Manifold Markets by 24h volume — third prediction-market
+        reference (after Kalshi and Predictit). Public, no auth, 5-min cache.
+        Probabilities are 0.0–1.0 (Manifold convention)."""
+        if time.time() - self._manifold_cache_time < 300 and self._manifold_cache:
+            return self._manifold_cache
+        try:
+            url = "https://api.manifold.markets/v0/markets?limit=50"
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0", "Accept": "application/json"})
+            with _ureq.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read())
+            # Filter to BINARY (yes/no), unresolved, sort by 24h volume desc.
+            binary = [m for m in (data or []) if m.get("outcomeType") == "BINARY" and not m.get("isResolved")]
+            binary.sort(key=lambda m: (m.get("volume24Hours") or 0), reverse=True)
+            rows = []
+            for m in binary[:30]:
+                rows.append({
+                    "question": (m.get("question") or "")[:80],
+                    "prob":     m.get("probability"),
+                    "volume":   m.get("volume"),
+                    "vol_24h":  m.get("volume24Hours"),
+                })
+            self._manifold_cache = rows
+            self._manifold_cache_time = time.time()
+            return rows
+        except Exception as e:
+            log.warning(f"Manifold fetch failed: {e}")
+            return self._manifold_cache or []
+
+    def get_noaa_severe_alerts(self) -> list:
+        """NOAA active SEVERE weather alerts (storm/tornado/flood/freeze/etc).
+        Free public endpoint, no auth, 30-min cache. Only fetched on
+        weather-tagged questions."""
+        if time.time() - self._noaa_alerts_cache_time < 1800 and self._noaa_alerts_cache is not None:
+            return self._noaa_alerts_cache
+        try:
+            url = "https://api.weather.gov/alerts/active?severity=Severe&status=actual"
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0", "Accept": "application/geo+json"})
+            with _ureq.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read())
+            rows = []
+            for f in (data.get("features") or [])[:20]:
+                p = f.get("properties", {})
+                rows.append({
+                    "event":    p.get("event", ""),
+                    "headline": (p.get("headline") or "")[:100],
+                    "area":     (p.get("areaDesc") or "")[:80],
+                    "severity": p.get("severity", ""),
+                })
+            self._noaa_alerts_cache = rows
+            self._noaa_alerts_cache_time = time.time()
+            return rows
+        except Exception as e:
+            log.warning(f"NOAA severe alerts fetch failed: {e}")
+            return self._noaa_alerts_cache or []
+
+    def get_usgs_earthquakes(self) -> list:
+        """USGS significant earthquakes — past 7 days. Free public GeoJSON
+        feed, no auth, 1-hour cache. Only fetched on earthquake-tagged
+        questions (Polymarket has occasional 'will an earthquake of magnitude
+        X happen by Y' markets)."""
+        if time.time() - self._usgs_cache_time < 3600 and self._usgs_cache is not None:
+            return self._usgs_cache
+        try:
+            url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_week.geojson"
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0", "Accept": "application/json"})
+            with _ureq.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read())
+            rows = []
+            for f in (data.get("features") or [])[:15]:
+                p = f.get("properties", {})
+                rows.append({
+                    "place":     (p.get("place") or "")[:80],
+                    "magnitude": p.get("mag"),
+                    "tsunami":   bool(p.get("tsunami")),
+                })
+            self._usgs_cache = rows
+            self._usgs_cache_time = time.time()
+            return rows
+        except Exception as e:
+            log.warning(f"USGS earthquakes fetch failed: {e}")
+            return self._usgs_cache or []
+
     def get_active_storms(self) -> list:
         """NHC active tropical storms — useful for weather/hurricane markets.
         Public NOAA endpoint, no auth, 30-min cache. Empty list outside
@@ -3290,17 +3382,49 @@ class PolymarketBot:
                     for r in p_rel[:5]:
                         lines.append(f"  {r.get('market','')} / {r.get('contract','')}: yes={r.get('yes')} no={r.get('no')} last={r.get('last')}")
                     ctx_parts.append("\n".join(lines))
-                    ctx_parts.append(
-                        "CROSS-MARKET USAGE: if a comparable market on Kalshi or "
-                        "Predictit is materially mispriced relative to this one, "
-                        "that's information about which side has better-informed flow. "
-                        "Use it as evidence, not as a hard anchor."
-                    )
+            manifold = research.get("manifold") or []
+            if manifold and _q_words:
+                m_rel = [m for m in manifold if any(w in (m.get("question","").lower()) for w in _q_words)]
+                if m_rel:
+                    lines = ["MANIFOLD COMPARABLE (probability 0.00-1.00):"]
+                    for m in m_rel[:5]:
+                        prob = m.get("prob")
+                        prob_str = f"{prob:.3f}" if isinstance(prob, (int, float)) else "?"
+                        lines.append(f"  {m.get('question','')}: p={prob_str} (vol={m.get('volume')}, 24h={m.get('vol_24h')})")
+                    ctx_parts.append("\n".join(lines))
+            # Cross-market guidance — fired once if any of the three references
+            # surfaced relevant rows. Avoids three repeats of the same hint.
+            if (
+                (kalshi and any(w in (m.get("title", "").lower()) for m in kalshi for w in _q_words)) or
+                (predictit and any(w in ((r.get("market","")+" "+r.get("contract","")).lower()) for r in predictit for w in _q_words)) or
+                (manifold and any(w in (m.get("question","").lower()) for m in manifold for w in _q_words))
+            ):
+                ctx_parts.append(
+                    "CROSS-MARKET USAGE: if a comparable market on Kalshi, "
+                    "Predictit, or Manifold is materially mispriced relative "
+                    "to this one, that's evidence about which side has better-"
+                    "informed flow. Use it as evidence, not a hard anchor."
+                )
             storms = research.get("storms") or []
             if storms:
                 lines = ["NHC ACTIVE STORMS:"]
                 for s in storms[:5]:
                     lines.append(f"  {s.get('name','?')} ({s.get('type','')}, {s.get('intensity','')}) — {s.get('movement','')}")
+                ctx_parts.append("\n".join(lines))
+            noaa_alerts = research.get("noaa_alerts") or []
+            if noaa_alerts:
+                lines = ["NOAA SEVERE WEATHER ALERTS (active):"]
+                for a in noaa_alerts[:6]:
+                    lines.append(f"  [{a.get('severity','')}] {a.get('event','')} — {a.get('area','')[:60]}")
+                ctx_parts.append("\n".join(lines))
+            quakes = research.get("earthquakes") or []
+            if quakes:
+                lines = ["USGS RECENT SIGNIFICANT EARTHQUAKES (past 7 days):"]
+                for q in quakes[:6]:
+                    mag = q.get("magnitude")
+                    mag_str = f"M{mag:.1f}" if isinstance(mag, (int, float)) else "M?"
+                    tsunami = " [TSUNAMI]" if q.get("tsunami") else ""
+                    lines.append(f"  {mag_str} — {q.get('place','')}{tsunami}")
                 ctx_parts.append("\n".join(lines))
 
             # Sportsbook odds — only present when the question explicitly
@@ -5624,6 +5748,7 @@ class PolymarketBot:
                                 # the prompt — no relevance, no prompt cost.
                                 "kalshi":    asyncio.to_thread(self.get_kalshi_top),
                                 "predictit": asyncio.to_thread(self.get_predictit_markets),
+                                "manifold":  asyncio.to_thread(self.get_manifold_top),
                             }
                             if TAVILY_API_KEY:
                                 _tasks["tavily"] = asyncio.to_thread(self.get_tavily_research, c["question"][:80])
@@ -5644,6 +5769,13 @@ class PolymarketBot:
                                 # the question text mentions hurricanes/storms.
                                 if any(k in _q_lower for k in ("hurricane", "tropical storm", "cyclone", "named storm")):
                                     _tasks["storms"] = asyncio.to_thread(self.get_active_storms)
+                                # NOAA severe-weather alerts — broader severe-
+                                # weather coverage (tornado/flood/freeze/wildfire).
+                                if any(k in _q_lower for k in ("tornado", "flood", "blizzard", "freeze", "frost", "snowfall", "wildfire", "ice storm", "thunderstorm")):
+                                    _tasks["noaa_alerts"] = asyncio.to_thread(self.get_noaa_severe_alerts)
+                            # Earthquake markets — separate from weather; same conditional fetch pattern.
+                            if any(k in _q_lower for k in ("earthquake", "richter", "magnitude ", "seismic")):
+                                _tasks["earthquakes"] = asyncio.to_thread(self.get_usgs_earthquakes)
                             # Sportsbook odds — fires only when the question
                             # explicitly names a league (NBA/NFL/MLB/...). Hard
                             # budget guard inside the fetcher (free tier is
