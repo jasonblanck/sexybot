@@ -148,6 +148,19 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 # gives real-time. Silent no-op if key is unset.
 POLYGON_API_KEY    = os.getenv("POLYGON_API_KEY", "")
 THE_ODDS_API_KEY   = os.getenv("THE_ODDS_API_KEY", "")
+# Whale wallet tracker — comma-separated Polygon addresses to query for
+# Polymarket positions on candidate tokens. Empty by default; populate
+# with addresses of consistently profitable Polymarket traders to use
+# their position-taking as a confirmation signal in the AI context.
+POLYMARKET_WHALE_WALLETS = [
+    w.strip() for w in os.getenv("POLYMARKET_WHALE_WALLETS", "").split(",")
+    if w.strip()
+]
+# Cross-market arbitrage detector — alert when a comparable Kalshi/
+# Predictit/Manifold market diverges from Polymarket by this many percentage
+# points (0.05 = 5%). Detector only — does not auto-execute trades.
+ARB_ALERT_THRESHOLD_PP = float(os.getenv("ARB_ALERT_THRESHOLD_PP", "0.05"))
+ARB_ALERT_ENABLED      = os.getenv("ARB_ALERT_ENABLED", "true").lower() == "true"
 PAPER_MODE    = os.getenv("PAPER_MODE", "false").lower() == "true"
 PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "1000.0"))
 
@@ -2125,6 +2138,13 @@ class PolymarketBot:
     # WSJ public RSS (World/Markets/Business). Free headlines + descriptions.
     _wsj_cache: list = []
     _wsj_cache_time: float = 0
+    # Whale position cache: (wallet_lower, token_id) -> {"balance": int, "t": ts}.
+    # 10-min TTL is balanced against RPC cost — whale positions don't move
+    # by-the-second, but we want to catch big new entries within ~10 min.
+    _whale_pos_cache: dict = {}
+    # Arb-alert dedup — (token_id, peer_market) -> last_alert_ts. Suppresses
+    # duplicate Telegrams while a price gap persists. 1-hr cooldown.
+    _arb_alert_seen: dict = {}
     # Tavily / OpenRouter health (surfaced in /health/runtime so the morning
     # routine catches plan-exhaustion or a dead provider).
     _tavily_last_error: str = ""
@@ -3311,6 +3331,163 @@ class PolymarketBot:
             self._wsj_cache_time = time.time()
         return rows or self._wsj_cache or []
 
+    # CTF (Conditional Token Framework) on Polygon — Polymarket's outcome-
+    # token contract. ERC-1155 with balanceOf(account, id). Used by the
+    # whale tracker to query third-party position holdings on-chain.
+    _CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+    _CTF_BALANCEOF_ABI = [{
+        "inputs": [
+            {"name": "account", "type": "address"},
+            {"name": "id",      "type": "uint256"},
+        ],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    }]
+
+    def _ctf_balance(self, wallet: str, token_id: str) -> int:
+        """Query CTF.balanceOf(wallet, token_id) on Polygon via Alchemy.
+        Returns raw uint256 balance (6-decimal shares, like USDC). 0 on any error."""
+        if not ALCHEMY_API_KEY:
+            return 0
+        try:
+            from web3 import Web3
+            rpc = f"https://polygon-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 6}))
+            ctf = w3.eth.contract(
+                address=Web3.to_checksum_address(self._CTF_ADDRESS),
+                abi=self._CTF_BALANCEOF_ABI,
+            )
+            return int(ctf.functions.balanceOf(
+                Web3.to_checksum_address(wallet), int(token_id)
+            ).call())
+        except Exception as e:
+            log.debug(f"CTF balanceOf {wallet[:8]}.../{token_id[:8]}... failed: {e}")
+            return 0
+
+    def get_whale_positions(self, token_id: str, min_shares: float = 100.0) -> list:
+        """For a Polymarket token_id, query each configured whale wallet's
+        on-chain CTF balance. Returns list of {wallet, shares} for whales
+        with positions ≥ min_shares. 10-min per-(wallet,token_id) cache so
+        per-cycle cost is bounded.
+
+        Configure via POLYMARKET_WHALE_WALLETS env var (comma-separated
+        Polygon addresses). No-op silently when no wallets configured."""
+        if not POLYMARKET_WHALE_WALLETS or not token_id:
+            return []
+        rows = []
+        for wallet in POLYMARKET_WHALE_WALLETS:
+            key = (wallet.lower(), token_id)
+            cached = self._whale_pos_cache.get(key)
+            if cached and time.time() - cached["t"] < 600:
+                balance = cached["balance"]
+            else:
+                balance = self._ctf_balance(wallet, token_id)
+                self._whale_pos_cache[key] = {"balance": balance, "t": time.time()}
+            shares = balance / 1_000_000  # CTF outcome tokens are 6-decimal like USDC
+            if shares >= min_shares:
+                rows.append({"wallet": wallet, "shares": round(shares, 0)})
+        return rows
+
+    def detect_arb_gap(
+        self,
+        *,
+        question: str,
+        token_id: str,
+        polymarket_yes_price: float,
+        kalshi: list,
+        predictit: list,
+        manifold: list,
+    ) -> Optional[dict]:
+        """Compare Polymarket's YES price to comparable markets on Kalshi /
+        Predictit / Manifold; return the largest divergence ≥ ARB_ALERT_THRESHOLD_PP
+        as {peer, peer_question, peer_prob, gap_pp, direction} or None.
+
+        Direction = 'buy_poly_yes'  if poly is cheaper (peer rates higher prob)
+                    'buy_poly_no'   if poly is more expensive
+        Detector only — does NOT execute trades. Sends one Telegram alert
+        per (token_id, peer_market) per hour."""
+        if not ARB_ALERT_ENABLED or polymarket_yes_price is None:
+            return None
+        try:
+            poly_p = float(polymarket_yes_price)
+        except (TypeError, ValueError):
+            return None
+        if poly_p <= 0 or poly_p >= 1:
+            return None
+        q_words = set(w for w in question.lower().split() if len(w) >= 4)
+        if not q_words:
+            return None
+
+        candidates: list = []
+        # Kalshi yes_bid/yes_ask in cents → convert to dollars.
+        for m in (kalshi or []):
+            title = (m.get("title") or "").lower()
+            if not any(w in title for w in q_words):
+                continue
+            bid, ask = m.get("yes_bid"), m.get("yes_ask")
+            if bid is None or ask is None:
+                continue
+            mid = (float(bid) + float(ask)) / 200.0  # cents → dollars, midpoint
+            candidates.append(("kalshi", m.get("title", "")[:80], mid))
+        # Predictit lastTradePrice in dollars.
+        for r in (predictit or []):
+            text = ((r.get("market") or "") + " " + (r.get("contract") or "")).lower()
+            if not any(w in text for w in q_words):
+                continue
+            last = r.get("last")
+            if last is None:
+                continue
+            candidates.append(("predictit", f"{r.get('market','')} / {r.get('contract','')}"[:80], float(last)))
+        # Manifold probability already 0.0-1.0.
+        for m in (manifold or []):
+            title = (m.get("question") or "").lower()
+            if not any(w in title for w in q_words):
+                continue
+            p = m.get("prob")
+            if p is None:
+                continue
+            candidates.append(("manifold", m.get("question", "")[:80], float(p)))
+
+        # Find the candidate with the biggest absolute gap.
+        best: Optional[tuple] = None
+        for peer, peer_q, peer_p in candidates:
+            gap = peer_p - poly_p
+            if abs(gap) >= ARB_ALERT_THRESHOLD_PP:
+                if best is None or abs(gap) > abs(best[3]):
+                    best = (peer, peer_q, peer_p, gap)
+        if best is None:
+            return None
+        peer, peer_q, peer_p, gap = best
+
+        # Dedup — alert at most once per (token_id, peer_question) per hour.
+        dedup_key = (token_id, peer_q)
+        last_alert = self._arb_alert_seen.get(dedup_key, 0)
+        if time.time() - last_alert < 3600:
+            return {  # return result but skip the telegram
+                "peer": peer, "peer_question": peer_q, "peer_prob": peer_p,
+                "gap_pp": gap, "direction": "buy_poly_yes" if gap > 0 else "buy_poly_no",
+                "alerted": False,
+            }
+        self._arb_alert_seen[dedup_key] = time.time()
+
+        direction = "buy_poly_yes" if gap > 0 else "buy_poly_no"
+        msg = (
+            f"💰 ARB SIGNAL ({peer.upper()})\n"
+            f"PolyMarket: {question[:60]}\n"
+            f"Polymarket YES @ {poly_p:.3f} | {peer} @ {peer_p:.3f} (gap {gap*100:+.1f}pp)\n"
+            f"Direction: {direction.upper()}\n"
+            f"Peer market: {peer_q[:80]}"
+        )
+        log.warning(f"[ARB] {direction} gap {gap*100:+.1f}pp poly={poly_p:.3f} {peer}={peer_p:.3f} for {question[:60]}")
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            asyncio.create_task(asyncio.to_thread(self.send_telegram, msg))
+        return {
+            "peer": peer, "peer_question": peer_q, "peer_prob": peer_p,
+            "gap_pp": gap, "direction": direction, "alerted": True,
+        }
+
     def get_active_storms(self) -> list:
         """NHC active tropical storms — useful for weather/hurricane markets.
         Public NOAA endpoint, no auth, 30-min cache. Empty list outside
@@ -3480,6 +3657,25 @@ class PolymarketBot:
                     tsunami = " [TSUNAMI]" if q.get("tsunami") else ""
                     lines.append(f"  {mag_str} — {q.get('place','')}{tsunami}")
                 ctx_parts.append("\n".join(lines))
+
+            # Whale-wallet positions — empty unless POLYMARKET_WHALE_WALLETS
+            # is populated. A configured profitable trader holding a sizable
+            # position in this exact market is real signal — they've put
+            # capital behind one side, and they have a track record we trust.
+            whales = research.get("whales") or []
+            if whales:
+                lines = ["WHALE POSITIONS (configured-wallet on-chain holdings in this market):"]
+                for w in whales[:10]:
+                    addr = w.get("wallet", "")
+                    addr_short = (addr[:10] + "…" + addr[-6:]) if len(addr) >= 16 else addr
+                    lines.append(f"  {addr_short}: {w.get('shares','?')} shares")
+                ctx_parts.append("\n".join(lines))
+                ctx_parts.append(
+                    "WHALE USAGE: a tracked profitable trader holding a sizable "
+                    "position is evidence for the side they took. Use as one "
+                    "signal among many — their cost basis is unknown, only "
+                    "current holdings are visible."
+                )
 
             # Sportsbook odds — only present when the question explicitly
             # named a league. American odds: negative=favorite, positive=
@@ -5967,6 +6163,14 @@ class PolymarketBot:
                                     _tasks["finnhub_quotes"] = asyncio.to_thread(
                                         self.get_finnhub_quotes_for_question, c["question"]
                                     )
+                            # Whale-wallet position lookup — only if the operator
+                            # has populated POLYMARKET_WHALE_WALLETS. No-op
+                            # otherwise (function returns []). 10-min per
+                            # (wallet, token_id) cache bounds RPC cost.
+                            if POLYMARKET_WHALE_WALLETS and c.get("token_id"):
+                                _tasks["whales"] = asyncio.to_thread(
+                                    self.get_whale_positions, c["token_id"]
+                                )
                             _k = list(_tasks.keys())
                             _v = await asyncio.gather(*_tasks.values(), return_exceptions=True)
                             _research = {"orderbook": ob}
@@ -5975,6 +6179,24 @@ class PolymarketBot:
                             _research.setdefault("tavily", "")
                             _research.setdefault("court", "")
                             _research.setdefault("govtrack", "")
+                            # Cross-market arb detector — fire-and-forget
+                            # Telegram alert when a comparable Kalshi/
+                            # Predictit/Manifold market diverges from
+                            # Polymarket by ≥ARB_ALERT_THRESHOLD_PP. Detector
+                            # only; does not execute. Runs before the AI call
+                            # so signals fire even if Claude later skips.
+                            if ARB_ALERT_ENABLED and c.get("token_id"):
+                                try:
+                                    self.detect_arb_gap(
+                                        question=c["question"],
+                                        token_id=c["token_id"],
+                                        polymarket_yes_price=c.get("yes_p"),
+                                        kalshi=_research.get("kalshi") or [],
+                                        predictit=_research.get("predictit") or [],
+                                        manifold=_research.get("manifold") or [],
+                                    )
+                                except Exception as _arb_e:
+                                    log.debug(f"arb detector error: {_arb_e}")
                             ai_res = await self.analyze_with_claude(c["mkt"], c["yes_p"], _research)
                         except Exception as _e:
                             log.debug(f"enrich candidate error: {_e}")
