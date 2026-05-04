@@ -2090,6 +2090,21 @@ class PolymarketBot:
     _crypto_cache: dict = {}
     _crypto_cache_time: float = 0
 
+    # Cross-market reference caches (free public APIs).
+    # Kalshi public election-markets endpoint, Predictit all-markets, NHC active storms.
+    _kalshi_cache: list = []
+    _kalshi_cache_time: float = 0
+    _predictit_cache: list = []
+    _predictit_cache_time: float = 0
+    _nhc_cache: list = []
+    _nhc_cache_time: float = 0
+    # Tavily / OpenRouter health (surfaced in /health/runtime so the morning
+    # routine catches plan-exhaustion or a dead provider).
+    _tavily_last_error: str = ""
+    _tavily_last_success_ts: float = 0
+    _openrouter_last_error: str = ""
+    _openrouter_last_success_ts: float = 0
+
     # Finnhub stock quote cache. Keyed by ticker, 60s TTL per symbol.
     _finnhub_cache:      dict  = {}    # symbol → {price, change_pct, ts}
     # Common US stock tickers Polymarket frequently asks about. Narrow
@@ -2311,9 +2326,16 @@ class PolymarketBot:
             # comfortably inside Sonnet's context window.
             result = client.search(query=query, search_depth="advanced", max_results=3)
             snippets = [r.get("content","")[:600] for r in result.get("results", [])]
+            self._tavily_last_success_ts = time.time()
+            self._tavily_last_error = ""
             return " | ".join(snippets)
         except Exception as e:
-            log.debug(f"Tavily error: {e}")
+            # Bumped from log.debug to log.warning so plan-exhaustion / outage
+            # is visible in journalctl. Track in instance state so /health/runtime
+            # can surface it for the morning routine.
+            err_short = f"{type(e).__name__}: {e}"[:200]
+            self._tavily_last_error = err_short
+            log.warning(f"Tavily error: {err_short}")
             return ""
 
     def get_orderbook_depth(self, token_id: str) -> dict:
@@ -3010,6 +3032,90 @@ class PolymarketBot:
             log.debug(f"GovTrack error: {e}")
             return ""
 
+    def get_kalshi_top(self) -> list:
+        """Top Kalshi open markets — used as cross-market price reference for
+        political / event markets. Public election-markets endpoint, no auth.
+        5-min cache. Returns list of {ticker, title, yes_bid, yes_ask, volume}.
+        Yes prices are in cents 0-100 (Kalshi convention)."""
+        if time.time() - self._kalshi_cache_time < 300 and self._kalshi_cache:
+            return self._kalshi_cache
+        try:
+            url = "https://api.elections.kalshi.com/trade-api/v2/markets?status=open&limit=30"
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0", "Accept": "application/json"})
+            with _ureq.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read())
+            rows = []
+            for m in (data.get("markets") or [])[:30]:
+                rows.append({
+                    "ticker":  m.get("ticker", "") or m.get("event_ticker", ""),
+                    "title":   (m.get("title") or m.get("subtitle") or "")[:80],
+                    "yes_bid": m.get("yes_bid"),
+                    "yes_ask": m.get("yes_ask"),
+                    "volume":  m.get("volume"),
+                })
+            self._kalshi_cache = rows
+            self._kalshi_cache_time = time.time()
+            return rows
+        except Exception as e:
+            log.warning(f"Kalshi fetch failed: {e}")
+            return self._kalshi_cache or []
+
+    def get_predictit_markets(self) -> list:
+        """Predictit market snapshot — political market cross-reference.
+        Public, no auth, 5-min cache. Returns flattened contract rows
+        with yes/no prices in dollars 0.00–1.00."""
+        if time.time() - self._predictit_cache_time < 300 and self._predictit_cache:
+            return self._predictit_cache
+        try:
+            url = "https://www.predictit.org/api/marketdata/all/"
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0", "Accept": "application/json"})
+            with _ureq.urlopen(req, timeout=8) as r:
+                data = json.loads(r.read())
+            rows = []
+            for m in (data.get("markets") or [])[:25]:
+                m_name = (m.get("shortName") or m.get("name") or "")[:60]
+                for c in (m.get("contracts") or [])[:6]:
+                    rows.append({
+                        "market":   m_name,
+                        "contract": (c.get("shortName") or c.get("name") or "")[:40],
+                        "yes":      c.get("bestBuyYesCost"),
+                        "no":       c.get("bestBuyNoCost"),
+                        "last":     c.get("lastTradePrice"),
+                    })
+            self._predictit_cache = rows[:60]
+            self._predictit_cache_time = time.time()
+            return self._predictit_cache
+        except Exception as e:
+            log.warning(f"Predictit fetch failed: {e}")
+            return self._predictit_cache or []
+
+    def get_active_storms(self) -> list:
+        """NHC active tropical storms — useful for weather/hurricane markets.
+        Public NOAA endpoint, no auth, 30-min cache. Empty list outside
+        Atlantic/Pacific hurricane season."""
+        if time.time() - self._nhc_cache_time < 1800 and self._nhc_cache is not None:
+            return self._nhc_cache
+        try:
+            url = "https://www.nhc.noaa.gov/CurrentStorms.json"
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0", "Accept": "application/json"})
+            with _ureq.urlopen(req, timeout=5) as r:
+                data = json.loads(r.read())
+            rows = []
+            for s in (data.get("activeStorms") or []):
+                rows.append({
+                    "name":      s.get("name", ""),
+                    "type":      s.get("classification", ""),
+                    "intensity": s.get("intensity", ""),
+                    "movement":  s.get("movement", ""),
+                    "basin":     s.get("binNumber", ""),
+                })
+            self._nhc_cache = rows
+            self._nhc_cache_time = time.time()
+            return rows
+        except Exception as e:
+            log.warning(f"NHC fetch failed: {e}")
+            return self._nhc_cache or []
+
     async def analyze_with_claude(self, market: dict, yes_p: float, research: dict) -> Optional[dict]:
         """
         Use Claude claude-haiku-4-5 to intelligently score a market using all available context.
@@ -3078,6 +3184,40 @@ class PolymarketBot:
             govtrack = research.get("govtrack", "")
             if govtrack:
                 ctx_parts.append(f"LEGISLATION: {govtrack}")
+
+            # Cross-market price reference: Kalshi + Predictit. Filter to
+            # markets whose title shares a 4+-char keyword with our question
+            # so Claude only sees genuinely comparable markets, not 30 lines
+            # of unrelated noise.
+            _q_words = set(w for w in question.lower().split() if len(w) >= 4)
+            kalshi = research.get("kalshi") or []
+            if kalshi and _q_words:
+                k_rel = [m for m in kalshi if any(w in (m.get("title", "").lower()) for w in _q_words)]
+                if k_rel:
+                    lines = ["KALSHI COMPARABLE (yes_bid/yes_ask in cents 0-100):"]
+                    for m in k_rel[:5]:
+                        lines.append(f"  {m.get('ticker','')}: {m.get('title','')} — bid={m.get('yes_bid')} ask={m.get('yes_ask')} vol={m.get('volume')}")
+                    ctx_parts.append("\n".join(lines))
+            predictit = research.get("predictit") or []
+            if predictit and _q_words:
+                p_rel = [r for r in predictit if any(w in ((r.get("market","")+" "+r.get("contract","")).lower()) for w in _q_words)]
+                if p_rel:
+                    lines = ["PREDICTIT COMPARABLE (yes/no/last in $0.00-1.00):"]
+                    for r in p_rel[:5]:
+                        lines.append(f"  {r.get('market','')} / {r.get('contract','')}: yes={r.get('yes')} no={r.get('no')} last={r.get('last')}")
+                    ctx_parts.append("\n".join(lines))
+                    ctx_parts.append(
+                        "CROSS-MARKET USAGE: if a comparable market on Kalshi or "
+                        "Predictit is materially mispriced relative to this one, "
+                        "that's information about which side has better-informed flow. "
+                        "Use it as evidence, not as a hard anchor."
+                    )
+            storms = research.get("storms") or []
+            if storms:
+                lines = ["NHC ACTIVE STORMS:"]
+                for s in storms[:5]:
+                    lines.append(f"  {s.get('name','?')} ({s.get('type','')}, {s.get('intensity','')}) — {s.get('movement','')}")
+                ctx_parts.append("\n".join(lines))
             # Weather forecast (only present for weather-tagged markets with
             # a resolvable location). Daily granularity, 14-day window, with
             # precip probability — lets Claude compare the market's implied
@@ -5376,6 +5516,13 @@ class PolymarketBot:
                                 # never freshly routed" bug as the weather gap.
                                 "_macro": asyncio.to_thread(self.get_macro_context),
                                 "_fmp":   asyncio.to_thread(self.get_fmp_market),
+                                # Cross-market reference data (Kalshi + Predictit
+                                # for political/event markets). 5-min cached so
+                                # cheap per-cycle. analyze_with_claude filters
+                                # by question keywords before formatting into
+                                # the prompt — no relevance, no prompt cost.
+                                "kalshi":    asyncio.to_thread(self.get_kalshi_top),
+                                "predictit": asyncio.to_thread(self.get_predictit_markets),
                             }
                             if TAVILY_API_KEY:
                                 _tasks["tavily"] = asyncio.to_thread(self.get_tavily_research, c["question"][:80])
@@ -5392,6 +5539,10 @@ class PolymarketBot:
                                     _tasks["weather_forecast"] = asyncio.to_thread(
                                         self.get_weather_for_location, _city
                                     )
+                                # NHC active tropical storms — only relevant if
+                                # the question text mentions hurricanes/storms.
+                                if any(k in _q_lower for k in ("hurricane", "tropical storm", "cyclone", "named storm")):
+                                    _tasks["storms"] = asyncio.to_thread(self.get_active_storms)
                             # Stock-ticker markets: if the question mentions one
                             # of our tracked tickers (NVDA, TSLA, SPY, etc.),
                             # fetch real-time Finnhub quotes. Silent if key unset.
@@ -6395,7 +6546,7 @@ def _verify_session_token(token: Optional[str]) -> bool:
 # monitors work; /auth/* obviously; /ws is gated by its own handshake;
 # the kill/start/stop/settings endpoints all use X-API-Key instead.
 _AUTH_EXEMPT_EXACT = {
-    "/health", "/health/claude", "/health/runtime",
+    "/health", "/health/claude", "/health/runtime", "/health/openrouter",
     "/auth/login", "/auth/verify", "/auth/logout", "/auth/check",
     "/login", "/login.html",
     "/favicon.ico",
@@ -7299,10 +7450,57 @@ def runtime_health():
             "trades_24h":          _scalar("SELECT COUNT(*) FROM trades WHERE dry_run=0 AND time >= ?", (cutoff_24h,), 0),
             "filled_24h":          _scalar("SELECT COUNT(*) FROM trades WHERE dry_run=0 AND status IN ('filled','matched') AND time >= ?", (cutoff_24h,), 0),
             "open_positions":      _scalar("SELECT COUNT(*) FROM positions", (), 0),
+            # External-data-source health. Surfaced so the morning routine
+            # catches plan exhaustion / dead provider before edge degrades
+            # silently for days.
+            "tavily_ok":           bool(TAVILY_API_KEY) and (time.time() - bot._tavily_last_success_ts < 86400) and not bot._tavily_last_error,
+            "tavily_last_error":   bot._tavily_last_error or None,
+            "openrouter_configured": bool(OPENROUTER_API_KEY),
+            "openrouter_last_error": bot._openrouter_last_error or None,
         }
     except Exception as e:
         log.warning(f"/health/runtime error: {e}")
         return JSONResponse({"error": "internal error"}, status_code=500)
+
+
+@app.get("/health/openrouter")
+async def openrouter_health():
+    """Live probe of the OpenRouter key. Makes a tiny ~10-token Haiku call
+    via OpenRouter so the morning routine can verify the configured fallback
+    provider is actually reachable + paid up. Cheap (~$0.0001 per probe)."""
+    if not OPENROUTER_API_KEY:
+        return JSONResponse({"ok": False, "configured": False, "detail": "OPENROUTER_API_KEY not set"}, status_code=503)
+    try:
+        payload = json.dumps({
+            "model": "anthropic/claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "Reply OK."}],
+            "max_tokens": 5,
+        }).encode()
+        req = _ureq.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=payload,
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+        )
+        def _call():
+            with _ureq.urlopen(req, timeout=15) as r:
+                return json.loads(r.read())
+        data = await asyncio.to_thread(_call)
+        text  = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        usage = data.get("usage", {})
+        bot._openrouter_last_error = ""
+        bot._openrouter_last_success_ts = time.time()
+        return {
+            "ok":            True,
+            "configured":    True,
+            "reply":         text[:50],
+            "input_tokens":  usage.get("prompt_tokens"),
+            "output_tokens": usage.get("completion_tokens"),
+        }
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"[:200]
+        bot._openrouter_last_error = err
+        log.warning(f"OpenRouter health probe failed: {err}")
+        return JSONResponse({"ok": False, "configured": True, "detail": err}, status_code=503)
 
 
 @app.get("/health/claude")
