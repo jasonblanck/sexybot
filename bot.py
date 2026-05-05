@@ -129,7 +129,6 @@ FRED_API_KEY       = os.getenv("FRED_API_KEY", "")
 OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY", "")
 FMP_API_KEY        = os.getenv("FMP_API_KEY", "")
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
-TAVILY_API_KEY     = os.getenv("TAVILY_API_KEY", "")
 NEWS_API_KEY       = os.getenv("NEWS_API_KEY", "")
 ALCHEMY_API_KEY    = os.getenv("ALCHEMY_API_KEY", "")
 COINGECKO_API_KEY  = os.getenv("COINGECKO_API_KEY", "")
@@ -2187,10 +2186,8 @@ class PolymarketBot:
     # Arb-alert dedup — (token_id, peer_market) -> last_alert_ts. Suppresses
     # duplicate Telegrams while a price gap persists. 1-hr cooldown.
     _arb_alert_seen: dict = {}
-    # Tavily / OpenRouter health (surfaced in /health/runtime so the morning
+    # OpenRouter health (surfaced in /health/runtime so the morning
     # routine catches plan-exhaustion or a dead provider).
-    _tavily_last_error: str = ""
-    _tavily_last_success_ts: float = 0
     _openrouter_last_error: str = ""
     _openrouter_last_success_ts: float = 0
 
@@ -2400,32 +2397,6 @@ class PolymarketBot:
         except Exception as e:
             log.debug(f"NewsAPI error: {e}")
             return []
-
-    def get_tavily_research(self, query: str) -> str:
-        """Deep AI-optimized web research via Tavily."""
-        if not TAVILY_API_KEY:
-            return ""
-        try:
-            from tavily import TavilyClient
-            client = TavilyClient(api_key=TAVILY_API_KEY)
-            # search_depth="advanced" returns longer extracts (Tavily bills
-            # 2 credits/call instead of 1, but the extra context materially
-            # improves reasoning on legal/political/macro markets). 600
-            # chars/snippet × 3 results = ~1800 chars, which still fits
-            # comfortably inside Sonnet's context window.
-            result = client.search(query=query, search_depth="advanced", max_results=3)
-            snippets = [r.get("content","")[:600] for r in result.get("results", [])]
-            self._tavily_last_success_ts = time.time()
-            self._tavily_last_error = ""
-            return " | ".join(snippets)
-        except Exception as e:
-            # Bumped from log.debug to log.warning so plan-exhaustion / outage
-            # is visible in journalctl. Track in instance state so /health/runtime
-            # can surface it for the morning routine.
-            err_short = f"{type(e).__name__}: {e}"[:200]
-            self._tavily_last_error = err_short
-            log.warning(f"Tavily error: {err_short}")
-            return ""
 
     def get_orderbook_depth(self, token_id: str) -> dict:
         """Fetch order book depth, spread, liquidity, and OBI."""
@@ -3361,11 +3332,34 @@ class PolymarketBot:
     # the publicly-readable feeds. Source label distinguishes WSJ vs NPR
     # vs BBC in the prompt so Claude can weight them appropriately.
     _NEWS_RSS_FEEDS = (
-        ("WSJ-World",     "https://feeds.a.dj.com/rss/RSSWorldNews.xml"),
-        ("WSJ-Markets",   "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"),
-        ("WSJ-Business",  "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml"),
-        ("NPR",           "https://feeds.npr.org/1001/rss.xml"),
-        ("BBC",           "https://feeds.bbci.co.uk/news/rss.xml"),
+        # Premium / mainstream
+        ("WSJ-World",      "https://feeds.a.dj.com/rss/RSSWorldNews.xml"),
+        ("WSJ-Markets",    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"),
+        ("WSJ-Business",   "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml"),
+        ("NYT-Politics",   "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml"),
+        ("NYT-Business",   "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"),
+        ("NPR",            "https://feeds.npr.org/1001/rss.xml"),
+        ("BBC",            "https://feeds.bbci.co.uk/news/rss.xml"),
+        ("Guardian-World", "https://www.theguardian.com/world/rss"),
+        # Wire / aggregated (Google News mirrors — site:X with 1-day filter)
+        ("Reuters",        "https://news.google.com/rss/search?q=when:1d+site:reuters.com&hl=en-US&gl=US&ceid=US:en"),
+        ("AP",             "https://news.google.com/rss/search?q=when:1d+site:apnews.com&hl=en-US&gl=US&ceid=US:en"),
+        ("Bloomberg",      "https://news.google.com/rss/search?q=when:1d+site:bloomberg.com&hl=en-US&gl=US&ceid=US:en"),
+        ("FT",             "https://news.google.com/rss/search?q=when:1d+site:ft.com&hl=en-US&gl=US&ceid=US:en"),
+        # Politics-focused
+        ("Politico",       "https://rss.politico.com/politics-news.xml"),
+        ("Axios",          "https://api.axios.com/feed/"),
+        ("TheHill",        "https://thehill.com/feed/?feed=partnerfeed-news-feed&format=rss"),
+        ("Punchbowl",      "https://news.google.com/rss/search?q=when:1d+site:punchbowl.news&hl=en-US&gl=US&ceid=US:en"),
+        # Markets / finance
+        ("CNBC-Markets",   "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+        ("MarketWatch",    "http://feeds.marketwatch.com/marketwatch/topstories/"),
+        # Crypto
+        ("CoinDesk",       "https://www.coindesk.com/arc/outboundfeeds/rss"),
+        # Sports (NFL/NBA markets are frequent on Polymarket)
+        ("ESPN",           "https://www.espn.com/espn/rss/news"),
+        ("ESPN-NFL",       "https://www.espn.com/espn/rss/nfl/news"),
+        ("ESPN-NBA",       "https://www.espn.com/espn/rss/nba/news"),
     )
 
     def get_wsj_headlines(self) -> list:
@@ -3378,20 +3372,30 @@ class PolymarketBot:
         if time.time() - self._wsj_cache_time < 1800 and self._wsj_cache:
             return self._wsj_cache
         import xml.etree.ElementTree as _ET
-        rows = []
-        for section, url in self._NEWS_RSS_FEEDS:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        def _fetch_one(section: str, url: str):
             try:
                 req = _ureq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                 with _ureq.urlopen(req, timeout=6) as r:
                     root = _ET.fromstring(r.read())
+                out = []
                 for item in root.findall(".//item")[:20]:
                     title = (item.findtext("title") or "").strip()[:120]
                     desc  = (item.findtext("description") or "").strip()[:200]
                     pub   = (item.findtext("pubDate") or "").strip()[:31]
                     if title:
-                        rows.append({"section": section, "title": title, "desc": desc, "pub": pub})
+                        out.append({"section": section, "title": title, "desc": desc, "pub": pub})
+                return out
             except Exception as e:
                 log.warning(f"News RSS {section} failed: {e}")
+                return []
+        rows = []
+        # Parallelize fetch — 22 feeds × 6s serial worst-case is too long.
+        # 10 workers keep wall time ~1 batch (~6s) on cache refresh.
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = [pool.submit(_fetch_one, s, u) for s, u in self._NEWS_RSS_FEEDS]
+            for fut in as_completed(futures):
+                rows.extend(fut.result())
         # Only update cache if at least one feed succeeded — don't overwrite
         # good cached data with empty rows on a transient outage.
         if rows:
@@ -3785,12 +3789,6 @@ class PolymarketBot:
                     for g in rel_nhl[:5]:
                         score = "" if g.get("away_score") is None else f" {g.get('away_score','-')}-{g.get('home_score','-')}"
                         ctx_parts.append(f"  {g.get('away','?')} @ {g.get('home','?')}{score} [{g.get('state','')}] {g.get('start','')}")
-            tavily = research.get("tavily", "")
-            if tavily:
-                # Match the fetcher's 600-char-per-snippet × 3 snippets upper
-                # bound (~1800 chars + separators). Previously double-
-                # truncated to 500 here, cutting research mid-sentence.
-                ctx_parts.append(f"WEB RESEARCH: {tavily[:1800]}")
             court = research.get("court", "")
             if court:
                 ctx_parts.append(f"COURT DOCKETS: {court}")
@@ -5459,8 +5457,6 @@ class PolymarketBot:
         # External-API health (cheap status flags read from instance state).
         try:
             ext_flags = []
-            if TAVILY_API_KEY:
-                ext_flags.append("tavily=" + ("ok" if not self._tavily_last_error else "DOWN"))
             if THE_ODDS_API_KEY and self._oddsapi_remaining is not None:
                 ext_flags.append(f"oddsapi={self._oddsapi_remaining}/500")
             if OPENROUTER_API_KEY:
@@ -6419,8 +6415,6 @@ class PolymarketBot:
                                 # whose title/desc share keywords with the question.
                                 "wsj":       asyncio.to_thread(self.get_wsj_headlines),
                             }
-                            if TAVILY_API_KEY:
-                                _tasks["tavily"] = asyncio.to_thread(self.get_tavily_research, c["question"][:80])
                             if _is_legal:
                                 _tasks["court"] = asyncio.to_thread(self.get_courtlistener_data, c["question"][:60])
                             if _is_legislative:
@@ -6485,7 +6479,6 @@ class PolymarketBot:
                             _research = {"orderbook": ob}
                             for _kk, _vv in zip(_k, _v):
                                 _research[_kk] = "" if isinstance(_vv, Exception) else _vv
-                            _research.setdefault("tavily", "")
                             _research.setdefault("court", "")
                             _research.setdefault("govtrack", "")
                             # Cross-market arb detector — fire-and-forget
@@ -8034,7 +8027,6 @@ async def research_market(q: str = ""):
         yes_p = float(prices[0]) if prices else 0.5
     research = {
         "news":   bot.get_news_headlines(q[:60]),
-        "tavily": bot.get_tavily_research(q[:80]) if TAVILY_API_KEY else "no Tavily key",
         "crypto": bot.get_crypto_prices(),
         "fmp":    bot.get_fmp_market().get("_sentiment"),
         "macro":  bot.get_macro_context(),
@@ -8453,8 +8445,6 @@ def runtime_health():
             # External-data-source health. Surfaced so the morning routine
             # catches plan exhaustion / dead provider before edge degrades
             # silently for days.
-            "tavily_ok":           bool(TAVILY_API_KEY) and (time.time() - bot._tavily_last_success_ts < 86400) and not bot._tavily_last_error,
-            "tavily_last_error":   bot._tavily_last_error or None,
             "openrouter_configured": bool(OPENROUTER_API_KEY),
             "openrouter_last_error": bot._openrouter_last_error or None,
             "oddsapi_configured":    bool(THE_ODDS_API_KEY),
@@ -8500,8 +8490,6 @@ async def health_all(request: Request):
         }
         # External-API health (no extra calls — read instance state)
         ext = {
-            "tavily_ok":             bool(TAVILY_API_KEY) and not bot._tavily_last_error,
-            "tavily_last_error":     bot._tavily_last_error or None,
             "openrouter_configured": bool(OPENROUTER_API_KEY),
             "openrouter_last_error": bot._openrouter_last_error or None,
             "oddsapi_configured":    bool(THE_ODDS_API_KEY),
