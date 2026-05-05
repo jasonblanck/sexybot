@@ -2171,6 +2171,12 @@ class PolymarketBot:
     # WSJ public RSS (World/Markets/Business). Free headlines + descriptions.
     _wsj_cache: list = []
     _wsj_cache_time: float = 0
+    # Analyst upgrades/downgrades news (FMP grades-latest-news, 30-min TTL).
+    _grades_cache: list = []
+    _grades_cache_time: float = 0
+    # Earnings calendar next 7d (FMP earnings-calendar, 60-min TTL).
+    _earnings_cache: list = []
+    _earnings_cache_time: float = 0
     # SEC EDGAR — recent corporate filings (10-K, 8-K, S-1, etc).
     _sec_filings_cache: list = []
     _sec_filings_cache_time: float = 0
@@ -2397,6 +2403,74 @@ class PolymarketBot:
         except Exception as e:
             log.debug(f"NewsAPI error: {e}")
             return []
+
+    def get_analyst_grades_news(self) -> list:
+        """Latest analyst upgrades/downgrades via FMP grades-latest-news.
+        Returns the 10 most recent rated calls (limit capped by current
+        FMP plan tier). 30-min cache. Filter to relevance happens in the
+        prompt-context formatter, not here."""
+        if not FMP_API_KEY:
+            return []
+        if time.time() - self._grades_cache_time < 1800 and self._grades_cache:
+            return self._grades_cache
+        try:
+            import json as _j
+            url = f"https://financialmodelingprep.com/stable/grades-latest-news?limit=10&apikey={FMP_API_KEY}"
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0"})
+            with _ureq.urlopen(req, timeout=8) as r:
+                data = _j.loads(r.read())
+            rows = [{
+                "symbol":    a.get("symbol",""),
+                "title":     (a.get("newsTitle","") or "")[:200],
+                "action":    a.get("action",""),
+                "from":      a.get("previousGrade",""),
+                "to":        a.get("newGrade",""),
+                "company":   a.get("gradingCompany",""),
+                "published": (a.get("publishedDate","") or "")[:10],
+            } for a in data if isinstance(a, dict)]
+            if rows:
+                self._grades_cache = rows
+                self._grades_cache_time = time.time()
+            return rows or self._grades_cache or []
+        except Exception as e:
+            log.debug(f"FMP grades error: {e}")
+            return self._grades_cache or []
+
+    def get_earnings_week(self) -> list:
+        """Earnings calendar (next 7 days) via FMP earnings-calendar.
+        60-min cache. Per-row payload includes ticker, date, EPS estimate,
+        revenue estimate. Per-question filtering by ticker happens in the
+        prompt-context formatter."""
+        if not FMP_API_KEY:
+            return []
+        if time.time() - self._earnings_cache_time < 3600 and self._earnings_cache:
+            return self._earnings_cache
+        try:
+            import json as _j
+            from_d = datetime.utcnow().date().isoformat()
+            to_d   = (datetime.utcnow() + timedelta(days=7)).date().isoformat()
+            url = (f"https://financialmodelingprep.com/stable/earnings-calendar"
+                   f"?from={from_d}&to={to_d}&apikey={FMP_API_KEY}")
+            req = _ureq.Request(url, headers={"User-Agent": "polybot/1.0"})
+            with _ureq.urlopen(req, timeout=8) as r:
+                data = _j.loads(r.read())
+            rows = [{
+                "symbol":  a.get("symbol",""),
+                "date":    a.get("date",""),
+                "eps_est": a.get("epsEstimated"),
+                "rev_est": a.get("revenueEstimated"),
+            } for a in data if isinstance(a, dict)]
+            # Cap at 200 rows — full week can be 500+ across small caps; the
+            # prompt-side filter only surfaces rows whose ticker matches the
+            # question, so trimming here is safe and bounds memory.
+            rows = rows[:200]
+            if rows:
+                self._earnings_cache = rows
+                self._earnings_cache_time = time.time()
+            return rows or self._earnings_cache or []
+        except Exception as e:
+            log.debug(f"FMP earnings error: {e}")
+            return self._earnings_cache or []
 
     def get_orderbook_depth(self, token_id: str) -> dict:
         """Fetch order book depth, spread, liquidity, and OBI."""
@@ -3360,6 +3434,8 @@ class PolymarketBot:
         ("ESPN",           "https://www.espn.com/espn/rss/news"),
         ("ESPN-NFL",       "https://www.espn.com/espn/rss/nfl/news"),
         ("ESPN-NBA",       "https://www.espn.com/espn/rss/nba/news"),
+        # Regulatory / catalysts
+        ("FDA",            "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml"),
     )
 
     def get_wsj_headlines(self) -> list:
@@ -3760,9 +3836,27 @@ class PolymarketBot:
                 _q_words_lc = set(w for w in question.lower().split() if len(w) >= 4)
                 rel_wsj = [r for r in wsj if any(w in r.get("title","").lower() or w in r.get("desc","").lower() for w in _q_words_lc)]
                 if rel_wsj:
-                    ctx_parts.append("RSS NEWS (WSJ/NPR/BBC, relevant):")
+                    ctx_parts.append("RSS NEWS (relevant):")
                     for r in rel_wsj[:5]:
                         ctx_parts.append(f"  [{r.get('section','')}] {r.get('title','')}")
+            grades = research.get("grades") or []
+            if grades:
+                _q_words_lc = set(w for w in question.lower().split() if len(w) >= 4)
+                rel_g = [g for g in grades if g.get("symbol","").lower() in _q_words_lc
+                         or any(w in g.get("title","").lower() for w in _q_words_lc)]
+                if rel_g:
+                    ctx_parts.append("ANALYST CALLS (relevant, last 24h):")
+                    for g in rel_g[:5]:
+                        arrow = f"{g.get('from','?')}→{g.get('to','?')}"
+                        ctx_parts.append(f"  {g.get('symbol')}: {g.get('action','?')} ({arrow}) by {g.get('company','?')} — {g.get('title','')[:120]}")
+            earnings = research.get("earnings") or []
+            if earnings:
+                _q_words_lc = set(w for w in question.lower().split() if len(w) >= 4)
+                rel_e = [e for e in earnings if e.get("symbol","").lower() in _q_words_lc]
+                if rel_e:
+                    ctx_parts.append("UPCOMING EARNINGS (relevant, next 7d):")
+                    for e in rel_e[:5]:
+                        ctx_parts.append(f"  {e.get('symbol')} on {e.get('date')}: EPS est {e.get('eps_est')}, rev est {e.get('rev_est')}")
             sec_filings = research.get("sec_filings") or []
             if sec_filings:
                 _q_words_lc = set(w for w in question.lower().split() if len(w) >= 4)
@@ -6414,6 +6508,11 @@ class PolymarketBot:
                                 # filter in analyze_with_claude only surfaces items
                                 # whose title/desc share keywords with the question.
                                 "wsj":       asyncio.to_thread(self.get_wsj_headlines),
+                                # Analyst calls + earnings calendar (FMP).
+                                # Both are cache-aware (30/60-min TTL) so the
+                                # extra concurrent fetches are cheap when warm.
+                                "grades":    asyncio.to_thread(self.get_analyst_grades_news),
+                                "earnings":  asyncio.to_thread(self.get_earnings_week),
                             }
                             if _is_legal:
                                 _tasks["court"] = asyncio.to_thread(self.get_courtlistener_data, c["question"][:60])
