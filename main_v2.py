@@ -118,7 +118,8 @@ EXCLUDE_KEYWORDS      = [
 # (-$50.63 over 137 trades, 73.7% win rate but $5 losses dominate); set
 # BLOCK_INTERNAL_CATEGORIES=other to act on that finding.
 BLOCK_INTERNAL_CATEGORIES = [
-    c.strip() for c in os.getenv("BLOCK_INTERNAL_CATEGORIES", "").split(",") if c.strip()
+    c.strip().lower() for c in os.getenv("BLOCK_INTERNAL_CATEGORIES", "").split(",")
+    if c.strip()
 ]
 
 # Strategy selection

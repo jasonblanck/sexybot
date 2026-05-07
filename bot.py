@@ -530,7 +530,7 @@ class PolymarketBot:
         # threshold, place_market_order / place_limit_order short-circuit.
         # The tripped state is sticky for REJECT_BREAKER_COOLDOWN_S so the
         # bot doesn't immediately retry; it auto-clears after that elapses.
-        self._reject_history: deque = deque(maxlen=2000)
+        self._reject_history: deque[tuple[float, bool]] = deque(maxlen=2000)
         self._reject_breaker_tripped_at: Optional[float] = None
         # Weekly scheduled backtest task handle
         self._weekly_backtest_task: Optional[asyncio.Task] = None
