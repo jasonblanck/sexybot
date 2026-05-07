@@ -455,6 +455,13 @@ def _extract_tool_input(msg, tool_name: str) -> Optional[dict]:
     return None
 
 
+class BacktestNoReport(RuntimeError):
+    """Backtest finished without producing a usable report (Claude refused,
+    blew the token budget before calling submit_backtest_report, or hit an
+    unexpected error). Raised so /backtest/run surfaces a last_error on
+    /backtest/status instead of silently returning idle."""
+
+
 class PolymarketBot:
     def __init__(self):
         self.client: Optional[ClobClient] = None
@@ -4990,10 +4997,11 @@ class PolymarketBot:
             t0 = time.time()
             kwargs = {
                 "model": CLAUDE_MODEL,
-                # 8000 was hitting the cumulative limit across code_execution
-                # turns — Claude ran analysis but never got to submit the tool
-                # call, surfacing as "[BACKTEST] no submit_backtest_report".
-                "max_tokens": 16000,
+                # 16000 was still hitting the cumulative limit across
+                # code_execution turns — Claude ran analysis but never got to
+                # submit the tool call, surfacing as "[BACKTEST] no
+                # submit_backtest_report".
+                "max_tokens": 24000,
                 "system": system,
                 "messages": [{"role": "user", "content": ctx}],
                 "tools": [
@@ -5034,7 +5042,7 @@ class PolymarketBot:
 
             if getattr(msg, "stop_reason", None) == "refusal":
                 log.warning("[BACKTEST] Claude refused")
-                return None
+                raise BacktestNoReport("Claude refused the request")
 
             decision = _extract_tool_input(msg, _TOOL_BACKTEST["name"])
             if decision is None:
@@ -5044,7 +5052,9 @@ class PolymarketBot:
                     "[BACKTEST] no submit_backtest_report in response "
                     "(stop_reason=%s, usage=%s)", sr, usage,
                 )
-                return None
+                raise BacktestNoReport(
+                    f"no submit_backtest_report in response (stop_reason={sr})"
+                )
 
             summary   = str(decision.get("summary", ""))[:3000]
             findings  = decision.get("key_findings", []) or []
@@ -5087,9 +5097,11 @@ class PolymarketBot:
                 "trades_analyzed": len(rows),
                 "latency_s":       latency,
             }
+        except BacktestNoReport:
+            raise
         except Exception as e:
             log.warning(f"run_backtest_analysis error: {e}")
-            return None
+            raise BacktestNoReport(f"unexpected error: {e}") from e
 
     # ── Nightly strategy review (Claude Max) ───────────────────────────────
     # Once per 24h, feed Claude the day's trades, Brier calibration, regime
