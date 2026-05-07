@@ -2,6 +2,7 @@
 Polymarket Trading Bot — migrated to py_clob_client_v2 for CLOB V2 (Apr 28 2026)
 """
 import asyncio, json, logging, os, time, sqlite3, re as _re_mod
+from collections import deque
 from datetime import datetime, date, timedelta
 # Brier-score self-calibration helper. Reads historical predicted_prob vs
 # actual_outcome from brier_scores and shrinks future predictions toward
@@ -106,10 +107,10 @@ EXCLUDE_CATEGORIES = [
 # matches the same buckets the dashboard's category-attribution P&L
 # shows. The 2026-05-07 backtest flagged "other" as a chronic loser;
 # set BLOCK_INTERNAL_CATEGORIES=other in .env to act on that.
-BLOCK_INTERNAL_CATEGORIES = {
+BLOCK_INTERNAL_CATEGORIES = [
     c.strip().lower() for c in os.getenv("BLOCK_INTERNAL_CATEGORIES", "").split(",")
     if c.strip()
-}
+]
 import re as _re_kw
 _EXCLUDE_KW_RE = (
     _re_kw.compile(
@@ -529,8 +530,7 @@ class PolymarketBot:
         # threshold, place_market_order / place_limit_order short-circuit.
         # The tripped state is sticky for REJECT_BREAKER_COOLDOWN_S so the
         # bot doesn't immediately retry; it auto-clears after that elapses.
-        from collections import deque as _deque
-        self._reject_history: _deque = _deque(maxlen=2000)
+        self._reject_history: deque = deque(maxlen=2000)
         self._reject_breaker_tripped_at: Optional[float] = None
         # Weekly scheduled backtest task handle
         self._weekly_backtest_task: Optional[asyncio.Task] = None
