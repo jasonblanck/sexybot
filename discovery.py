@@ -191,6 +191,58 @@ def get_token_ids_for_slug(slug: str) -> Optional[dict[str, str]]:
     return {"yes": mkt.yes_token_id, "no": mkt.no_token_id}
 
 
+# Internal coarse-category classifier. Polymarket's own `category` field is
+# unreliable (most political markets come back as "other"), so we run a
+# rule-based bucketer over the question text. Used both for trade attribution
+# in bot.py and for the BLOCK_INTERNAL_CATEGORIES filter below — keeping the
+# rules in one place means the operator-facing blocklist matches what the
+# attribution dashboard shows.
+_INTERNAL_CATEGORY_KEYWORDS = {
+    "politics": ["election","senate","congress","president","presidential","vp","governor",
+                 "senator","mayor","prime minister","pm ","parliament","republican","democrat",
+                 "gop ","liberal","conservative","campaign","primary","caucus","cabinet",
+                 "house of representatives","supreme court","impeach"],
+    "crypto":   ["bitcoin","ethereum","btc","eth","solana","sol ","crypto","blockchain",
+                 "polygon","matic","usdt","usdc","defi","nft","stablecoin","altcoin",
+                 "dogecoin","xrp","cardano","ada ","chainlink","link "],
+    "sports":   ["super bowl","world cup","world series","nba","nfl","mlb","nhl","mls",
+                 "champions league","playoffs","tournament","olympics","formula 1","f1 ",
+                 "boxing","mma","ufc","grand slam","open championship","masters","fifa",
+                 "quarterback","qb ","team "],
+    "macro":    ["fed ","federal reserve","fomc","interest rate","rate hike","rate cut",
+                 "cpi","ppi","inflation","gdp","recession","jobs report","unemployment",
+                 "nonfarm payroll","payrolls","jobless","labor market","dollar index",
+                 "dxy","yield curve","treasury","bond","tariff","trade war","pce"],
+    "legal":    ["indicted","indictment","trial","court","lawsuit","ruling","judge",
+                 "convicted","charged","plea","verdict","sentenced","supreme court",
+                 "appellate","docket","hearing","prosecutor","defendant"],
+    "weather":  ["hurricane","tornado","earthquake","storm","snowfall","rainfall",
+                 "temperature","heat wave","flood","wildfire","drought","meteorologic",
+                 "degrees","°f","°c","inches of rain","inches of snow","high temp",
+                 "low temp","precipitation","hail","blizzard","heatwave","climate",
+                 "noaa","nws","weather service"],
+}
+
+
+def classify_internal_category(question: str) -> str:
+    """Return coarse market category ('politics', 'crypto', 'sports',
+    'macro', 'legal', 'weather', or 'other'). Case-insensitive substring
+    match against curated keyword lists. Legal is checked before politics
+    because 'Supreme Court' matches both, but court-ruling markets are more
+    usefully bucketed as legal."""
+    if not question:
+        return "other"
+    q = question.lower()
+    if any(k in q for k in _INTERNAL_CATEGORY_KEYWORDS["legal"]):
+        return "legal"
+    for cat, kws in _INTERNAL_CATEGORY_KEYWORDS.items():
+        if cat == "legal":
+            continue
+        if any(k in q for k in kws):
+            return cat
+    return "other"
+
+
 class MarketFilter:
     def __init__(self, markets: list[PolyMarket]):
         self._markets = list(markets)
@@ -226,6 +278,21 @@ class MarketFilter:
         self._markets = [
             m for m in self._markets
             if not any(c in (m.category or "").lower() for c in lowered)
+        ]
+        return self
+
+    def exclude_internal_categories(self, cats: list[str]) -> "MarketFilter":
+        """Drop markets whose *internal* classification (per
+        classify_internal_category) is in the blocklist. Distinct from
+        exclude_categories which uses Polymarket's raw category field —
+        backtest attribution is keyed on the internal classifier, so the
+        operator's blocklist needs to match what the dashboard shows."""
+        lowered = {c.strip().lower() for c in cats if c and c.strip()}
+        if not lowered:
+            return self
+        self._markets = [
+            m for m in self._markets
+            if classify_internal_category(m.question or "") not in lowered
         ]
         return self
 

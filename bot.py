@@ -7,6 +7,7 @@ from datetime import datetime, date, timedelta
 # actual_outcome from brier_scores and shrinks future predictions toward
 # the realized base rate. Silent no-op until there are ≥30 resolved rows.
 from calibrator import Calibrator
+from discovery import classify_internal_category
 from typing import Optional
 from dotenv import load_dotenv
 import urllib.request as _ureq
@@ -66,7 +67,7 @@ API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "")
 STRATEGY       = os.getenv("STRATEGY", "momentum")
 MAX_ORDER_SIZE = float(os.getenv("MAX_ORDER_SIZE", "10"))
 DRY_RUN        = os.getenv("DRY_RUN", "true").lower() != "false"
-DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "500"))
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "50"))
 # Same env var as risk.py ExecutionGate — kept in sync so the dashboard path
 # and the main_v2.py pipeline share one underdog-guard threshold.
 MIN_YES_BUY_PRICE = float(os.getenv("MIN_YES_BUY_PRICE", "0.30"))
@@ -98,6 +99,17 @@ EXCLUDE_CATEGORIES = [
     c.strip().lower() for c in os.getenv("EXCLUDE_CATEGORIES", "crypto").split(",")
     if c.strip()
 ]
+# Internal coarse-category blocklist (politics, crypto, sports, macro,
+# legal, weather, other). Distinct from EXCLUDE_CATEGORIES which filters
+# Polymarket's raw category field — this filter uses the rule-based
+# classify_internal_category() classifier so the operator's blocklist
+# matches the same buckets the dashboard's category-attribution P&L
+# shows. The 2026-05-07 backtest flagged "other" as a chronic loser;
+# set BLOCK_INTERNAL_CATEGORIES=other in .env to act on that.
+BLOCK_INTERNAL_CATEGORIES = {
+    c.strip().lower() for c in os.getenv("BLOCK_INTERNAL_CATEGORIES", "").split(",")
+    if c.strip()
+}
 import re as _re_kw
 _EXCLUDE_KW_RE = (
     _re_kw.compile(
@@ -226,6 +238,12 @@ MAX_ENTRY_PRICE          = float(os.getenv("MAX_ENTRY_PRICE", "0.97"))
 # transient "no_match" book has time to heal, short enough that a market
 # can re-enter the universe within the trading day.
 ERROR_COOLDOWN_SEC       = float(os.getenv("ERROR_COOLDOWN_SEC", "1800"))
+# Order-rejection circuit breaker thresholds. See PolymarketBot
+# _record_order_outcome / _reject_breaker_blocks for behavior.
+REJECT_BREAKER_WINDOW_S    = float(os.getenv("REJECT_BREAKER_WINDOW_S",    "300"))   # 5 min
+REJECT_BREAKER_MIN_SAMPLES = int(  os.getenv("REJECT_BREAKER_MIN_SAMPLES", "10"))
+REJECT_BREAKER_THRESHOLD   = float(os.getenv("REJECT_BREAKER_THRESHOLD",   "0.50"))  # 50% rejection
+REJECT_BREAKER_COOLDOWN_S  = float(os.getenv("REJECT_BREAKER_COOLDOWN_S",  "600"))   # 10 min sticky trip
 # Startup safety: cancel any orders left open on Polymarket from a previous
 # bot incarnation. Without this, a crash/restart leaves orphan orders that
 # can fill silently while the bot has no memory of placing them — exactly
@@ -505,6 +523,15 @@ class PolymarketBot:
         # 2026-04-29: same Clavicular pregnancy market errored 4 times in
         # 2 hours). Map: token_id -> unix timestamp at which cooldown ends.
         self._error_cooldown: dict[str, float] = {}
+        # Order-rejection circuit breaker. The 2026-04-09 incident saw ~460
+        # orders fail in 82 minutes against an empty wallet — pure operational
+        # waste. When the rejection rate over a rolling window exceeds the
+        # threshold, place_market_order / place_limit_order short-circuit.
+        # The tripped state is sticky for REJECT_BREAKER_COOLDOWN_S so the
+        # bot doesn't immediately retry; it auto-clears after that elapses.
+        from collections import deque as _deque
+        self._reject_history: _deque = _deque(maxlen=2000)
+        self._reject_breaker_tripped_at: Optional[float] = None
         # Weekly scheduled backtest task handle
         self._weekly_backtest_task: Optional[asyncio.Task] = None
         # On-demand backtest task + status (polled by the dashboard so the
@@ -848,57 +875,13 @@ class PolymarketBot:
             log.warning(f"DB transaction failed: {e}")
 
     # ── Market category classifier ─────────────────────────────────────────
-    # Heuristic classifier mapping a market question to a coarse category.
-    # Intentionally rule-based (not AI) so every trade gets categorized
-    # instantly and deterministically — tying Claude to this would add
-    # latency and cost on every signal. The categories are designed to
-    # partition Polymarket cleanly enough that attribution queries show
-    # real patterns without being so fine-grained that each bucket has one
-    # trade.
-    _CATEGORY_KEYWORDS = {
-        "politics": ["election","senate","congress","president","presidential","vp","governor",
-                     "senator","mayor","prime minister","pm ","parliament","republican","democrat",
-                     "gop ","liberal","conservative","campaign","primary","caucus","cabinet",
-                     "house of representatives","supreme court","impeach"],
-        "crypto":   ["bitcoin","ethereum","btc","eth","solana","sol ","crypto","blockchain",
-                     "polygon","matic","usdt","usdc","defi","nft","stablecoin","altcoin",
-                     "dogecoin","xrp","cardano","ada ","chainlink","link "],
-        "sports":   ["super bowl","world cup","world series","nba","nfl","mlb","nhl","mls",
-                     "champions league","playoffs","tournament","olympics","formula 1","f1 ",
-                     "boxing","mma","ufc","grand slam","open championship","masters","fifa",
-                     "quarterback","qb ","team "],
-        "macro":    ["fed ","federal reserve","fomc","interest rate","rate hike","rate cut",
-                     "cpi","ppi","inflation","gdp","recession","jobs report","unemployment",
-                     "nonfarm payroll","payrolls","jobless","labor market","dollar index",
-                     "dxy","yield curve","treasury","bond","tariff","trade war","pce"],
-        "legal":    ["indicted","indictment","trial","court","lawsuit","ruling","judge",
-                     "convicted","charged","plea","verdict","sentenced","supreme court",
-                     "appellate","docket","hearing","prosecutor","defendant"],
-        "weather":  ["hurricane","tornado","earthquake","storm","snowfall","rainfall",
-                     "temperature","heat wave","flood","wildfire","drought","meteorologic",
-                     "degrees","°f","°c","inches of rain","inches of snow","high temp",
-                     "low temp","precipitation","hail","blizzard","heatwave","climate",
-                     "noaa","nws","weather service"],
-    }
-
+    # Thin wrapper around discovery.classify_internal_category so existing
+    # call sites keep working. The actual rules live in discovery.py so the
+    # operator-facing BLOCK_INTERNAL_CATEGORIES filter uses the same buckets
+    # as the trade-attribution dashboard.
     @classmethod
     def classify_market(cls, question: str) -> str:
-        """Return coarse market category ('politics', 'crypto', 'sports',
-        'macro', 'legal', 'weather', or 'other'). Case-insensitive substring
-        match against curated keyword lists."""
-        if not question:
-            return "other"
-        q = question.lower()
-        # Legal checks before politics — "Supreme Court" matches both lists,
-        # but a court-ruling market is more usefully bucketed as legal.
-        if any(k in q for k in cls._CATEGORY_KEYWORDS["legal"]):
-            return "legal"
-        for cat, kws in cls._CATEGORY_KEYWORDS.items():
-            if cat == "legal":
-                continue
-            if any(k in q for k in kws):
-                return cat
-        return "other"
+        return classify_internal_category(question)
 
     @classmethod
     def _is_temp_threshold_market(cls, question: str) -> bool:
@@ -1055,15 +1038,20 @@ class PolymarketBot:
             # leaked into the analyzer despite being in the env exclusion list,
             # because the filter only existed in main_v2.py's discovery path.
             # Keep the original ordering (volume-desc) — slice to limit at end.
-            if not EXCLUDE_KEYWORDS and not EXCLUDE_CATEGORIES:
+            if (not EXCLUDE_KEYWORDS and not EXCLUDE_CATEGORIES
+                    and not BLOCK_INTERNAL_CATEGORIES):
                 return raw[:limit]
             kept = []
             for m in raw:
                 cat = (m.get("category") or "").lower()
                 if any(c in cat for c in EXCLUDE_CATEGORIES):
                     continue
-                hay = (m.get("question") or "") + " " + (m.get("slug") or "")
+                question = m.get("question") or ""
+                hay = question + " " + (m.get("slug") or "")
                 if _EXCLUDE_KW_RE is not None and _EXCLUDE_KW_RE.search(hay):
+                    continue
+                if BLOCK_INTERNAL_CATEGORIES and \
+                        classify_internal_category(question) in BLOCK_INTERNAL_CATEGORIES:
                     continue
                 kept.append(m)
                 if len(kept) >= limit:
@@ -1097,6 +1085,49 @@ class PolymarketBot:
             return None
 
     # ── Orders ────────────────────────────────────────────────────────────────
+
+    def _record_order_outcome(self, *, rejected: bool) -> None:
+        """Append an order attempt outcome to the sliding window and trip the
+        breaker if the recent rejection rate crosses the threshold. Caller is
+        responsible for filtering out pre-flight skips (cooldown, price
+        ceiling, dry-run) — only true execution outcomes feed the breaker."""
+        now = time.time()
+        self._reject_history.append((now, rejected))
+        cutoff = now - REJECT_BREAKER_WINDOW_S
+        while self._reject_history and self._reject_history[0][0] < cutoff:
+            self._reject_history.popleft()
+
+        n = len(self._reject_history)
+        if n < REJECT_BREAKER_MIN_SAMPLES:
+            return
+        nrej = sum(1 for _, r in self._reject_history if r)
+        rate = nrej / n
+        if rate >= REJECT_BREAKER_THRESHOLD and self._reject_breaker_tripped_at is None:
+            self._reject_breaker_tripped_at = now
+            self._log(
+                f"REJECT BREAKER TRIPPED — rate={rate*100:.0f}% ({nrej}/{n}) over "
+                f"{int(REJECT_BREAKER_WINDOW_S)}s — blocking new orders for "
+                f"{int(REJECT_BREAKER_COOLDOWN_S)}s",
+                "error",
+            )
+
+    def _reject_breaker_blocks(self) -> Optional[str]:
+        """Returns an error string if the breaker is tripped and cooldown
+        hasn't elapsed; None when orders are allowed. Auto-clears once the
+        cooldown passes."""
+        tripped_at = self._reject_breaker_tripped_at
+        if tripped_at is None:
+            return None
+        elapsed = time.time() - tripped_at
+        if elapsed >= REJECT_BREAKER_COOLDOWN_S:
+            self._log(f"REJECT BREAKER cleared after {int(elapsed)}s cooldown")
+            self._reject_breaker_tripped_at = None
+            self._reject_history.clear()
+            return None
+        return (
+            f"reject breaker tripped {int(elapsed)}s ago — blocked for "
+            f"another {int(REJECT_BREAKER_COOLDOWN_S - elapsed)}s"
+        )
 
     def place_market_order(
         self,
@@ -1133,6 +1164,17 @@ class PolymarketBot:
                       "ai_risk","regime_at_entry"):
                 if k in attribution and attribution[k] is not None:
                     result[k] = attribution[k]
+        # Reject-rate circuit breaker — short-circuit all order attempts when
+        # recent rejection rate has spiked. Catches the empty-wallet retry
+        # storm pattern (2026-04-09: ~460 rejects in 82min) before it burns
+        # more cycles. Pre-flight skip; doesn't feed the breaker itself.
+        if not DRY_RUN:
+            breaker_msg = self._reject_breaker_blocks()
+            if breaker_msg is not None:
+                result["status"] = "skip_reject_breaker"
+                self._bump_skip("exec_reject_breaker")
+                self._log(f"REJECT BREAKER [bot]: {breaker_msg}")
+                return result
         # Error cooldown gate. If this token errored recently, refuse to
         # re-attempt — structurally thin books take time to heal and the
         # strategy loop will otherwise pile up identical FOK rejects.
@@ -1225,12 +1267,15 @@ class PolymarketBot:
                 if str(result["status"]).lower() in bad_resp_statuses:
                     self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
                     self._bump_skip(f"exec_bad_{str(result['status']).lower()}")
+                    self._record_order_outcome(rejected=True)
                 else:
                     self._bump_skip("exec_ok")
+                    self._record_order_outcome(rejected=False)
             except Exception as e:
                 result["status"] = "error"
                 self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
                 self._bump_skip("exec_exception")
+                self._record_order_outcome(rejected=True)
                 self._log(
                     f"Order failed (token={token_id[:16]}… side={side} amt={amount_usdc}): "
                     f"{e} — cooldown {int(ERROR_COOLDOWN_SEC)}s",
@@ -1271,6 +1316,14 @@ class PolymarketBot:
                       "ai_risk","regime_at_entry"):
                 if k in attribution and attribution[k] is not None:
                     result[k] = attribution[k]
+        # Reject-rate breaker — mirror of place_market_order.
+        if not DRY_RUN:
+            breaker_msg = self._reject_breaker_blocks()
+            if breaker_msg is not None:
+                result["status"] = "skip_reject_breaker"
+                self._bump_skip("exec_reject_breaker")
+                self._log(f"REJECT BREAKER [bot LIMIT]: {breaker_msg}")
+                return result
         # Error cooldown gate (mirror of place_market_order).
         cd_until = self._error_cooldown.get(token_id, 0.0)
         if not DRY_RUN and cd_until > time.time():
@@ -1332,12 +1385,15 @@ class PolymarketBot:
                 if str(result["status"]).lower() in bad_resp_statuses:
                     self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
                     self._bump_skip(f"exec_bad_{str(result['status']).lower()}")
+                    self._record_order_outcome(rejected=True)
                 else:
                     self._bump_skip("exec_ok")
+                    self._record_order_outcome(rejected=False)
             except Exception as e:
                 result["status"] = "error"
                 self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
                 self._bump_skip("exec_exception")
+                self._record_order_outcome(rejected=True)
                 self._log(
                     f"Limit order failed (token={token_id[:16]}… side={side} "
                     f"price={price} size={size}): {e} — cooldown {int(ERROR_COOLDOWN_SEC)}s",

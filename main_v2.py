@@ -109,6 +109,17 @@ EXCLUDE_KEYWORDS      = [
         "hormuz,houthi,tehran,kremlin,gaza,israel,hamas,hezbollah"
     ).split(",") if k.strip()
 ]
+# Comma-separated list of *internal* coarse-category buckets to skip at
+# discovery (politics, crypto, sports, macro, legal, weather, other). This
+# uses bot.classify_market's rule-based classifier so the blocklist matches
+# the same buckets the dashboard's category-attribution P&L is keyed on.
+# Distinct from EXCLUDE_CATEGORIES, which filters Polymarket's raw category
+# field. The 2026-05-07 backtest flagged "other" as a chronic loser
+# (-$50.63 over 137 trades, 73.7% win rate but $5 losses dominate); set
+# BLOCK_INTERNAL_CATEGORIES=other to act on that finding.
+BLOCK_INTERNAL_CATEGORIES = [
+    c.strip() for c in os.getenv("BLOCK_INTERNAL_CATEGORIES", "").split(",") if c.strip()
+]
 
 # Strategy selection
 # STRATEGY=momentum  (default) — directional momentum + OBI signals
@@ -465,6 +476,7 @@ async def strategy_loop(
                     .price_range(0.08, 0.92)
                     .exclude_categories(EXCLUDE_CATEGORIES)
                     .exclude_keywords(EXCLUDE_KEYWORDS)
+                    .exclude_internal_categories(BLOCK_INTERNAL_CATEGORIES)
                     .top(20, key="volume_24h")
                     .results()
                 )
@@ -812,12 +824,14 @@ async def main() -> None:
         .price_range(0.08, 0.92)
         .exclude_categories(EXCLUDE_CATEGORIES)
         .exclude_keywords(EXCLUDE_KEYWORDS)
+        .exclude_internal_categories(BLOCK_INTERNAL_CATEGORIES)
         .top(20, key="volume_24h")
         .results()
     )
     log.info(
-        "Watching %d markets (excluding categories: %s; keywords: %s)",
+        "Watching %d markets (excluding categories: %s; keywords: %s; internal: %s)",
         len(markets), EXCLUDE_CATEGORIES or "none", EXCLUDE_KEYWORDS or "none",
+        BLOCK_INTERNAL_CATEGORIES or "none",
     )
 
     if not markets:
