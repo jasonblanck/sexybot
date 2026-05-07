@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -56,6 +58,19 @@ NEG_RISK_CTF = "0xC5d563A36AE78145C45a50134d48A1215220f80a"  # used in _parse_ba
 # upstream gate already rejected. SELLs are not gated; closing a winning
 # position at high price is exactly what we want.
 MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0.97"))
+
+# Order-rejection circuit breaker. The 2026-04-09 incident saw ~460 orders
+# fail in 82 minutes against an empty wallet — pure operational waste with
+# no positions taken. When the rejection rate over a rolling window exceeds
+# the threshold, place_limit_order short-circuits and returns an error
+# instead of submitting more orders. The tripped state is sticky for
+# REJECT_BREAKER_COOLDOWN_S so the bot doesn't immediately retry; the
+# operator can clear it by restarting sexybot or by calling
+# ClobExecutor.reset_reject_breaker().
+REJECT_BREAKER_WINDOW_S    = float(os.getenv("REJECT_BREAKER_WINDOW_S",    "300"))   # 5 min
+REJECT_BREAKER_MIN_SAMPLES = int(  os.getenv("REJECT_BREAKER_MIN_SAMPLES", "10"))
+REJECT_BREAKER_THRESHOLD   = float(os.getenv("REJECT_BREAKER_THRESHOLD",   "0.50"))  # 50% rejection
+REJECT_BREAKER_COOLDOWN_S  = float(os.getenv("REJECT_BREAKER_COOLDOWN_S",  "600"))   # 10 min sticky trip
 
 
 def _make_client(private_key: str, funder_address: Optional[str] = None) -> ClobClient:
@@ -152,7 +167,65 @@ class ClobExecutor:
         self._gate    = gate or ExecutionGate()
         self._dry_run = dry_run
 
+        # Order-rejection circuit breaker state. Each entry is (ts, rejected_bool).
+        # Older entries get pruned lazily inside _record_order_outcome.
+        self._reject_history: deque[tuple[float, bool]] = deque(maxlen=2000)
+        self._reject_breaker_tripped_at: Optional[float] = None
+
         log.info("ClobExecutor ready | address=%s dry_run=%s", self._client.get_address(), dry_run)
+
+    # ── Order-rejection circuit breaker ───────────────────────────────────────
+
+    def _record_order_outcome(self, *, rejected: bool) -> None:
+        """Append the outcome of an order attempt to the sliding window and
+        evaluate whether the breaker should trip. We only consider true
+        execution rejections from Polymarket (post_order/create_order errors,
+        'not enough balance', 'no match', etc.) — pre-flight gate skips and
+        dry-run successes are filtered out by the caller."""
+        now = time.time()
+        self._reject_history.append((now, rejected))
+        cutoff = now - REJECT_BREAKER_WINDOW_S
+        while self._reject_history and self._reject_history[0][0] < cutoff:
+            self._reject_history.popleft()
+
+        n     = len(self._reject_history)
+        nrej  = sum(1 for _, r in self._reject_history if r)
+        if n < REJECT_BREAKER_MIN_SAMPLES:
+            return
+        rate = nrej / n
+        if rate >= REJECT_BREAKER_THRESHOLD and self._reject_breaker_tripped_at is None:
+            self._reject_breaker_tripped_at = now
+            log.error(
+                "REJECT BREAKER TRIPPED | rate=%.0f%% (%d/%d) over last %.0fs — "
+                "blocking new orders for %.0fs",
+                rate * 100, nrej, n, REJECT_BREAKER_WINDOW_S, REJECT_BREAKER_COOLDOWN_S,
+            )
+
+    def _reject_breaker_blocks(self) -> Optional[str]:
+        """Returns an error string when the breaker is tripped and cooldown
+        hasn't elapsed; None when orders are allowed. Auto-clears once the
+        cooldown passes — operator doesn't need to do anything."""
+        tripped_at = self._reject_breaker_tripped_at
+        if tripped_at is None:
+            return None
+        elapsed = time.time() - tripped_at
+        if elapsed >= REJECT_BREAKER_COOLDOWN_S:
+            log.info("REJECT BREAKER cleared after %.0fs cooldown", elapsed)
+            self._reject_breaker_tripped_at = None
+            self._reject_history.clear()
+            return None
+        return (
+            f"reject breaker tripped {int(elapsed)}s ago — "
+            f"orders blocked for another {int(REJECT_BREAKER_COOLDOWN_S - elapsed)}s"
+        )
+
+    def reset_reject_breaker(self) -> None:
+        """Manually clear the breaker and history. Surfaced for the dashboard
+        so the operator can resume trading immediately after fixing whatever
+        triggered the rejection storm (e.g. topping up the wallet)."""
+        self._reject_breaker_tripped_at = None
+        self._reject_history.clear()
+        log.info("REJECT BREAKER manually reset")
 
     # ── Public ─────────────────────────────────────────────────────────────────
 
@@ -202,6 +275,12 @@ class ClobExecutor:
                          HTTP round-trip; if None, a fresh call is made.
         """
         token_id_str = str(token_id)
+
+        # 0. Reject-rate circuit breaker — short-circuit before doing any
+        # work if recent rejections have crossed the threshold.
+        breaker_msg = self._reject_breaker_blocks()
+        if breaker_msg is not None:
+            return OrderResult(success=False, error=breaker_msg)
 
         # 1. Live book
         book = self._books.get_book(token_id_str)
@@ -301,6 +380,7 @@ class ClobExecutor:
                 signed = self._client.create_order(args)
         except Exception as exc:
             log.error("create_order failed: %s", exc)
+            self._record_order_outcome(rejected=True)
             return OrderResult(success=False, error=str(exc))
 
         # 6. Submit
@@ -308,10 +388,12 @@ class ClobExecutor:
             resp = self._client.post_order(signed, OrderType.GTC)
         except Exception as exc:
             log.error("post_order failed: %s", exc)
+            self._record_order_outcome(rejected=True)
             return OrderResult(success=False, error=str(exc))
 
         order_id = resp.get("orderID") or resp.get("order_id") or resp.get("id", "")
         status   = resp.get("status", "unknown")
+        self._record_order_outcome(rejected=False)
         log.info("ORDER PLACED | id=%s status=%s token=%s…", order_id, status, token_id_str[:14])
         return OrderResult(
             success=True, order_id=order_id, status=status,

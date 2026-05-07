@@ -7,6 +7,7 @@ from datetime import datetime, date, timedelta
 # actual_outcome from brier_scores and shrinks future predictions toward
 # the realized base rate. Silent no-op until there are ≥30 resolved rows.
 from calibrator import Calibrator
+from discovery import classify_internal_category
 from typing import Optional
 from dotenv import load_dotenv
 import urllib.request as _ureq
@@ -66,7 +67,7 @@ API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "")
 STRATEGY       = os.getenv("STRATEGY", "momentum")
 MAX_ORDER_SIZE = float(os.getenv("MAX_ORDER_SIZE", "10"))
 DRY_RUN        = os.getenv("DRY_RUN", "true").lower() != "false"
-DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "500"))
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "50"))
 # Same env var as risk.py ExecutionGate — kept in sync so the dashboard path
 # and the main_v2.py pipeline share one underdog-guard threshold.
 MIN_YES_BUY_PRICE = float(os.getenv("MIN_YES_BUY_PRICE", "0.30"))
@@ -848,57 +849,13 @@ class PolymarketBot:
             log.warning(f"DB transaction failed: {e}")
 
     # ── Market category classifier ─────────────────────────────────────────
-    # Heuristic classifier mapping a market question to a coarse category.
-    # Intentionally rule-based (not AI) so every trade gets categorized
-    # instantly and deterministically — tying Claude to this would add
-    # latency and cost on every signal. The categories are designed to
-    # partition Polymarket cleanly enough that attribution queries show
-    # real patterns without being so fine-grained that each bucket has one
-    # trade.
-    _CATEGORY_KEYWORDS = {
-        "politics": ["election","senate","congress","president","presidential","vp","governor",
-                     "senator","mayor","prime minister","pm ","parliament","republican","democrat",
-                     "gop ","liberal","conservative","campaign","primary","caucus","cabinet",
-                     "house of representatives","supreme court","impeach"],
-        "crypto":   ["bitcoin","ethereum","btc","eth","solana","sol ","crypto","blockchain",
-                     "polygon","matic","usdt","usdc","defi","nft","stablecoin","altcoin",
-                     "dogecoin","xrp","cardano","ada ","chainlink","link "],
-        "sports":   ["super bowl","world cup","world series","nba","nfl","mlb","nhl","mls",
-                     "champions league","playoffs","tournament","olympics","formula 1","f1 ",
-                     "boxing","mma","ufc","grand slam","open championship","masters","fifa",
-                     "quarterback","qb ","team "],
-        "macro":    ["fed ","federal reserve","fomc","interest rate","rate hike","rate cut",
-                     "cpi","ppi","inflation","gdp","recession","jobs report","unemployment",
-                     "nonfarm payroll","payrolls","jobless","labor market","dollar index",
-                     "dxy","yield curve","treasury","bond","tariff","trade war","pce"],
-        "legal":    ["indicted","indictment","trial","court","lawsuit","ruling","judge",
-                     "convicted","charged","plea","verdict","sentenced","supreme court",
-                     "appellate","docket","hearing","prosecutor","defendant"],
-        "weather":  ["hurricane","tornado","earthquake","storm","snowfall","rainfall",
-                     "temperature","heat wave","flood","wildfire","drought","meteorologic",
-                     "degrees","°f","°c","inches of rain","inches of snow","high temp",
-                     "low temp","precipitation","hail","blizzard","heatwave","climate",
-                     "noaa","nws","weather service"],
-    }
-
+    # Thin wrapper around discovery.classify_internal_category so existing
+    # call sites keep working. The actual rules live in discovery.py so the
+    # operator-facing BLOCK_INTERNAL_CATEGORIES filter uses the same buckets
+    # as the trade-attribution dashboard.
     @classmethod
     def classify_market(cls, question: str) -> str:
-        """Return coarse market category ('politics', 'crypto', 'sports',
-        'macro', 'legal', 'weather', or 'other'). Case-insensitive substring
-        match against curated keyword lists."""
-        if not question:
-            return "other"
-        q = question.lower()
-        # Legal checks before politics — "Supreme Court" matches both lists,
-        # but a court-ruling market is more usefully bucketed as legal.
-        if any(k in q for k in cls._CATEGORY_KEYWORDS["legal"]):
-            return "legal"
-        for cat, kws in cls._CATEGORY_KEYWORDS.items():
-            if cat == "legal":
-                continue
-            if any(k in q for k in kws):
-                return cat
-        return "other"
+        return classify_internal_category(question)
 
     @classmethod
     def _is_temp_threshold_market(cls, question: str) -> bool:
