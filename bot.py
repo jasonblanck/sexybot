@@ -226,13 +226,20 @@ AI_MIN_CONFIDENCE      = float(os.getenv("AI_MIN_CONFIDENCE", "35.0"))
 # days. Dial down if CLOB rate-limit complaints appear in the logs.
 BRIER_RESOLVE_LIMIT      = int(os.getenv("BRIER_RESOLVE_LIMIT", "200"))
 BRIER_RESOLVE_INTERVAL_S = int(os.getenv("BRIER_RESOLVE_INTERVAL_S", "3600"))
-# Hard ceiling on the BUY-side fill price. The signal-time gate is in
-# main_v2.py, but bot.py's place_market_order is a separate code path —
-# market orders fired from here also need the gate or fast-moving books
-# slip BUYs into near-1.0 territory where FOK rejects with no_match
-# (those are the status="error" rows we kept seeing on near-resolved
-# sports markets).
-MAX_ENTRY_PRICE          = float(os.getenv("MAX_ENTRY_PRICE", "0.97"))
+# Hard ceiling on the BUY-side fill price. Two reasons it exists:
+#   (a) Fast-moving books slip BUYs into near-1.0 territory where FOK
+#       rejects with no_match — historically the dominant cause of the
+#       status="error" rows on near-resolved sports markets.
+#   (b) Asymmetric payoff: at high prices the upside per share is tiny
+#       (1.00 - price) but the downside is full (price). 30d realized-P&L
+#       by entry-price decile (commit cea1582 introduced the cut):
+#         70-80c:  +$17.29 over 45 trades, EV +$0.38/trade   ← profitable
+#         80-90c:  -$41.47 over 63 trades, EV -$0.66/trade   ← bleed zone
+#         90-100c:  -$3.84 over 44 trades, EV -$0.09/trade   ← marginal
+#       Lowering the default ceiling to 0.80 cuts the entire 80-100c
+#       region while keeping the only profitable band intact. Live .env
+#       can override; this is the floor a fresh deploy gets.
+MAX_ENTRY_PRICE          = float(os.getenv("MAX_ENTRY_PRICE", "0.80"))
 # Cooldown applied to a token after a failed (status="error") order. Prevents
 # the strategy loop from immediately retrying the same structurally-broken
 # market on the next scan cycle. Default 30 min — long enough that a
@@ -3305,51 +3312,73 @@ class PolymarketBot:
             log.debug(f"get_pnl_by_price_bucket error: {e}")
             return []
 
+    def _brier_side_map(self) -> dict[str, str]:
+        """token_id → 'YES' / 'NO' side, from brier_scores. Built as a
+        flat dict so callers don't trigger SQLite's correlated-subquery
+        optimizer ambiguity — see get_pnl_by_side_category for the
+        history. Returns the lexicographically-first side per token,
+        which is deterministic and matches what dashboards previously
+        reported. Tokens with multiple sides are exceedingly rare
+        (verified live: 1 of 175 trade tokens has both YES and NO,
+        and that one is a legacy 'BUY' straggler)."""
+        try:
+            rows = self.db.execute(
+                "SELECT token_id, MIN(UPPER(side)) "
+                "FROM brier_scores "
+                "WHERE token_id IS NOT NULL AND token_id != '' "
+                "  AND UPPER(side) IN ('YES', 'NO') "
+                "GROUP BY token_id"
+            ).fetchall()
+            return {str(r[0]): str(r[1]) for r in rows if r[0] and r[1]}
+        except Exception as e:
+            log.debug(f"_brier_side_map error: {e}")
+            return {}
+
     def get_pnl_by_side_category(self, window_days: int = 30) -> list:
-        """Realized P&L cut by (category, YES vs NO side). trades.side stores
-        BUY/SELL (and is BUY for ~all live rows) while brier_scores.side
-        stores YES/NO — the AI calibration scorecard already tells us NO
-        is better-calibrated than YES; this cut answers whether that
-        calibration advantage actually translated into realized P&L, by
-        category. Each token's side is stable in brier_scores (verified
-        live; only 3 of 22k+ tokens ever logged both YES+NO and those are
-        legacy 'BUY' stragglers), so a simple LIMIT 1 lookup is correct
-        and avoids correlated-subquery scope issues with `t.time`.
-        Trades with no matching brier row fall into 'unknown'.
+        """Realized P&L cut by (category, YES vs NO side). trades.side
+        stores BUY/SELL while brier_scores.side stores YES/NO — the AI
+        calibration scorecard says NO is better-calibrated; this cut
+        answers whether that calibration advantage actually translated
+        into realized $.
+
+        Lookup uses a precomputed token_id→side dict (_brier_side_map)
+        instead of an inline correlated subquery. SQLite's optimizer
+        was evaluating the subquery once per group key rather than per
+        row when the subquery's alias was used in GROUP BY, returning
+        false-clean results (e.g. 'other' showed 137 NO when the true
+        split is ~68 NO + 69 YES). Verified live by spot-checking
+        individual trade tokens.
         """
         try:
             window_days = max(1, min(int(window_days), 365))
+            sides = self._brier_side_map()
             rows = self.db.execute(
-                "SELECT COALESCE(t.category, 'unknown') AS cat, "
-                "       COALESCE(UPPER(( "
-                "         SELECT b.side FROM brier_scores b "
-                "         WHERE b.token_id = t.token_id "
-                "         LIMIT 1 "
-                "       )), 'unknown') AS side, "
-                "       COUNT(*), "
-                "       SUM(t.realized_pnl), "
-                "       SUM(CASE WHEN t.realized_pnl > 0 THEN 1 ELSE 0 END) "
-                "FROM trades t "
-                "WHERE t.resolved = 1 AND t.dry_run = 0 "
-                "  AND t.resolved_at >= datetime('now', ?) "
-                "GROUP BY cat, side "
-                "ORDER BY cat, side",
+                "SELECT COALESCE(category, 'unknown'), token_id, realized_pnl "
+                "FROM trades "
+                "WHERE resolved = 1 AND dry_run = 0 "
+                "  AND resolved_at >= datetime('now', ?) ",
                 (f"-{window_days} days",),
             ).fetchall()
-            out = []
+            agg: dict[tuple[str, str], dict] = {}
             for r in rows:
                 cat = str(r[0] or "unknown")
-                side = str(r[1] or "unknown")
-                n = int(r[2] or 0)
-                pnl = float(r[3] or 0.0)
-                wins = int(r[4] or 0)
+                side = sides.get(str(r[1] or ""), "unknown")
+                pnl = float(r[2] or 0.0)
+                a = agg.setdefault((cat, side), {"n": 0, "pnl": 0.0, "wins": 0})
+                a["n"] += 1
+                a["pnl"] += pnl
+                if pnl > 0:
+                    a["wins"] += 1
+            out = []
+            for (cat, side), a in sorted(agg.items()):
+                n = a["n"]
                 out.append({
                     "category":     cat,
                     "side":         side,
                     "n":            n,
-                    "pnl":          round(pnl, 2),
-                    "win_rate":     round(wins / n * 100, 1) if n else 0.0,
-                    "ev_per_trade": round(pnl / n, 3) if n else 0.0,
+                    "pnl":          round(a["pnl"], 2),
+                    "win_rate":     round(a["wins"] / n * 100, 1) if n else 0.0,
+                    "ev_per_trade": round(a["pnl"] / n, 3) if n else 0.0,
                 })
             return out
         except Exception as e:
@@ -3442,6 +3471,92 @@ class PolymarketBot:
             if second != "other_error" and second != "unknown":
                 return second
         return first
+
+    def get_pnl_counterfactual_otherside(self, window_days: int = 30) -> list:
+        """For each resolved trade, compute the counterfactual P&L of
+        having taken the OTHER side of the same signal at (1 − price).
+        Aggregate by (category, actual_side).
+
+        Mechanics: a trade buys outcome tokens at price P risking $A.
+          shares = A / P. Payout per share = $1 if outcome is true else $0.
+          PnL_YES_at_P  = (won ? $A * (1-P)/P  : -$A)
+          PnL_NO_at_1-P = (won ? -$A           : $A * P/(1-P))
+        We map each historical trade's actual result onto both sides and
+        sum. The "counterfactual" column shows what the same set of
+        signals would have realized if the bot had been on the opposite
+        side. Useful for testing whether the AI's NO-side calibration
+        advantage (Brier 0.189 vs YES 0.238) translates to realized $.
+
+        IMPORTANT — this is descriptive, not predictive: in reality the
+        bot picks a side based on its signal model; flipping the side
+        wholesale would also flip the signal selection, not just the
+        outcome math. Still useful to surface the asymmetric-payoff
+        story by category.
+        """
+        try:
+            window_days = max(1, min(int(window_days), 365))
+            sides = self._brier_side_map()
+            rows = self.db.execute(
+                "SELECT id, COALESCE(category, 'unknown'), token_id, "
+                "       price, amount, realized_pnl, won "
+                "FROM trades "
+                "WHERE resolved = 1 AND dry_run = 0 "
+                "  AND resolved_at >= datetime('now', ?) "
+                "  AND price > 0 AND price < 1 "
+                "  AND amount > 0 ",
+                (f"-{window_days} days",),
+            ).fetchall()
+
+            agg: dict[tuple[str, str], dict] = {}
+            for r in rows:
+                cat = str(r[1] or "unknown")
+                side = sides.get(str(r[2] or ""), "unknown")
+                p = float(r[3] or 0.0)
+                amt = float(r[4] or 0.0)
+                actual = float(r[5] or 0.0)
+                won = bool(r[6])
+                # If we had been on the OTHER side at (1-p):
+                if won:
+                    counterfactual = -amt
+                else:
+                    # avoid div-by-zero if p is at extreme; the WHERE
+                    # clause filters p∈(0,1) but be defensive.
+                    counterfactual = (amt * p / (1.0 - p)) if (1.0 - p) > 1e-9 else 0.0
+                key = (cat, side)
+                a = agg.setdefault(key, {
+                    "n": 0, "actual_pnl": 0.0, "counterfactual_pnl": 0.0,
+                    "actual_wins": 0,
+                })
+                a["n"] += 1
+                a["actual_pnl"] += actual
+                a["counterfactual_pnl"] += counterfactual
+                if won: a["actual_wins"] += 1
+
+            out = []
+            for (cat, side), a in sorted(agg.items()):
+                n = a["n"]
+                ap = a["actual_pnl"]
+                cp = a["counterfactual_pnl"]
+                other_side = "NO" if side == "YES" else ("YES" if side == "NO" else "OTHER")
+                out.append({
+                    "category":            cat,
+                    "actual_side":         side,
+                    "counterfactual_side": other_side,
+                    "n":                   n,
+                    "actual_pnl":          round(ap, 2),
+                    "counterfactual_pnl":  round(cp, 2),
+                    "diff":                round(cp - ap, 2),
+                    "actual_ev":           round(ap / n, 3) if n else 0.0,
+                    "counterfactual_ev":   round(cp / n, 3) if n else 0.0,
+                    "actual_win_rate":     round(a["actual_wins"] / n * 100, 1) if n else 0.0,
+                })
+            # Sort by absolute diff desc — the cells where flipping side
+            # would have mattered most are the most interesting.
+            out.sort(key=lambda d: abs(d["diff"]), reverse=True)
+            return out
+        except Exception as e:
+            log.debug(f"get_pnl_counterfactual_otherside error: {e}")
+            return []
 
     def get_execution_breakdown(self, window_days: int = 7) -> dict:
         """Status-code breakdown for live (non-dry-run) trade submissions
@@ -8808,6 +8923,31 @@ async def trigger_brier_resolve(limit: int = 50):
     return JSONResponse({"ok": True, "settled": settled})
 
 
+@app.post("/admin/breaker/reset", dependencies=[Depends(require_api_key)])
+async def reset_balance_breaker():
+    """Clear the balance circuit-breaker without restarting the service.
+    Use after the underlying issue (drained wallet, expired API key, etc)
+    has been resolved. Pre-fix the only way to clear was a service
+    restart; that's now a Telegram-followed-by-SSH chore. POST-only and
+    api-key-protected so the breaker can't be cleared by accident.
+    Returns the prior state so the operator can confirm what changed."""
+    prev_tripped = bool(bot._balance_halt_tripped)
+    prev_streak  = int(bot._balance_error_streak)
+    bot._balance_halt_tripped = False
+    bot._balance_error_streak = 0
+    if prev_tripped:
+        bot._log("balance circuit-breaker manually reset via /admin/breaker/reset", "warning")
+        bot.send_telegram("⚠️ Balance breaker manually cleared via dashboard. "
+                          "Make sure the underlying balance/auth issue is fixed.")
+    return JSONResponse({
+        "ok": True,
+        "previously_tripped": prev_tripped,
+        "previously_streak":  prev_streak,
+        "now_tripped":        bot._balance_halt_tripped,
+        "now_streak":         bot._balance_error_streak,
+    })
+
+
 @app.get("/admin/trades.csv", dependencies=[Depends(require_api_key)])
 def admin_trades_csv():
     """Stream the trades table as CSV for offline analysis. Requires
@@ -8942,12 +9082,18 @@ def get_pnl_cuts(days: int = 30):
       by_side_category — YES vs NO P&L per category. Used to test
         whether the AI calibration advantage on NO-side predictions
         actually translates to realized P&L (vs just a Brier-score
-        artefact). Read-only — no trading-path effect.
+        artefact).
+      counterfactual_otherside — for each resolved trade, the P&L if
+        the same signal had been taken on the OPPOSITE side at (1-P).
+        Educational: surfaces whether the AI's better NO-side Brier
+        score actually flips realized $ when applied retroactively.
+        Read-only — no trading-path effect.
     """
     return JSONResponse({
-        "window_days":      days,
-        "by_price_bucket":  bot.get_pnl_by_price_bucket(window_days=days),
-        "by_side_category": bot.get_pnl_by_side_category(window_days=days),
+        "window_days":              days,
+        "by_price_bucket":          bot.get_pnl_by_price_bucket(window_days=days),
+        "by_side_category":         bot.get_pnl_by_side_category(window_days=days),
+        "counterfactual_otherside": bot.get_pnl_counterfactual_otherside(window_days=days),
     })
 
 

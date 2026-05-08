@@ -769,6 +769,11 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
         <div id="pnl-sidecat-body" style="font-size:10px;padding:4px 0"></div>
         <div style="color:var(--text3);font-size:9px;line-height:1.4;margin-top:4px">AI calibration is better on NO-side; this cut tests whether that translates to realized $.</div>
       </div>
+      <div id="pnl-cfactual-wrap" style="display:none;margin-top:12px;border-top:1px solid var(--border2);padding-top:10px">
+        <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px">Counterfactual · what if we had taken the OTHER side?</div>
+        <div id="pnl-cfactual-body" style="font-size:10px;padding:4px 0"></div>
+        <div style="color:var(--text3);font-size:9px;line-height:1.4;margin-top:4px">For each resolved trade, applies the same outcome to a counterfactual (1 − P) bet on the opposite side. <span style="color:var(--orange)">∆ &gt; 0</span> = the OTHER side would have won more. Educational — flipping signal selection in production would also change which trades fire.</div>
+      </div>
       <div style="color:var(--text3);font-size:9px;line-height:1.4;margin-top:6px">
         CLAIMED = AI's avg predicted win % · ACTUAL = how often it was right · GAP &gt; 0 = overconfident · BRIER lower is better (0 = perfect, 0.25 = coin flip). P&amp;L sections come from resolved trades only (n &lt; 5 = thin sample).
       </div>
@@ -2392,7 +2397,40 @@ async function fetchPnlCuts(){
     const d=await r.json();
     renderPriceBucket(d.by_price_bucket||[]);
     renderSideCategory(d.by_side_category||[]);
+    renderCounterfactual(d.counterfactual_otherside||[]);
   }catch(e){}
+}
+function renderCounterfactual(rows){
+  const wrap=document.getElementById('pnl-cfactual-wrap');
+  const body=document.getElementById('pnl-cfactual-body');
+  if(!wrap||!body) return;
+  const filt=(rows||[]).filter(r=>(r.n||0)>0);
+  if(filt.length===0){wrap.style.display='none';return;}
+  wrap.style.display='';
+  const hdr=`<div style="display:grid;grid-template-columns:.9fr .5fr .4fr .65fr .65fr .55fr;gap:4px;color:var(--text3);font-size:9px;padding:4px 0;border-bottom:1px solid var(--border2)">
+    <span>CATEGORY</span><span>WAS</span><span style="text-align:right">N</span><span style="text-align:right">ACTUAL</span><span style="text-align:right">IF→OTHER</span><span style="text-align:right">∆</span>
+  </div>`;
+  const html=filt.map(r=>{
+    const cat=safeHtml(String(r.category||''));
+    const side=safeHtml(String(r.actual_side||''));
+    const oth=safeHtml(String(r.counterfactual_side||''));
+    const n=r.n||0, ap=parseFloat(r.actual_pnl)||0, cp=parseFloat(r.counterfactual_pnl)||0, df=parseFloat(r.diff)||0;
+    const apc=ap>=0?'var(--green)':'var(--red)';
+    const cpc=cp>=0?'var(--green)':'var(--red)';
+    const dfc=df>=0?'var(--orange)':'var(--text3)';   // diff>0 means flipping would have helped
+    const sign=v=>v>=0?'+':'−';
+    const sideCls=side==='YES'?'var(--green)':(side==='NO'?'var(--orange)':'var(--text3)');
+    const nWarn=n<5?'<span style="color:var(--orange);font-size:9px"> ⚠</span>':'';
+    return `<div style="display:grid;grid-template-columns:.9fr .5fr .4fr .65fr .65fr .55fr;gap:4px;padding:3px 0;font-family:var(--mono);font-size:10px;border-bottom:1px dashed var(--border2)">
+      <span style="color:var(--text)">${cat}${nWarn}</span>
+      <span style="color:${sideCls}">${side}→${oth}</span>
+      <span style="text-align:right;color:var(--text2)">${n}</span>
+      <span style="text-align:right;color:${apc}">${sign(ap)}$${Math.abs(ap).toFixed(2)}</span>
+      <span style="text-align:right;color:${cpc}">${sign(cp)}$${Math.abs(cp).toFixed(2)}</span>
+      <span style="text-align:right;color:${dfc};font-weight:600">${sign(df)}$${Math.abs(df).toFixed(2)}</span>
+    </div>`;
+  }).join('');
+  body.innerHTML=hdr+html;
 }
 function renderPriceBucket(rows){
   const wrap=document.getElementById('pnl-pricebucket-wrap');

@@ -73,7 +73,10 @@ MIN_BOOK_DEPTH_USDC = float(os.getenv("MIN_BOOK_DEPTH_USDC", "200"))  # skip thr
 # remaining ask side of the book is typically empty or dust, so FOK BUYs
 # reject ("no_match") and pile up as status="error" trades. There is also
 # almost no upside to buying at 0.99 — best case ~1c, worst case −99c.
-MAX_ENTRY_PRICE  = float(os.getenv("MAX_ENTRY_PRICE", "0.97"))
+# Default lowered from 0.97 to 0.80 after the entry-price-decile cut
+# (commit cea1582) showed 80-100c was -$45 over 107 trades in 30d, with
+# only the 70-80c band positive. See bot.py for the full data table.
+MAX_ENTRY_PRICE  = float(os.getenv("MAX_ENTRY_PRICE", "0.80"))
 
 # Position management
 TRADE_COOLDOWN_SEC    = 300   # seconds before re-buying the same token

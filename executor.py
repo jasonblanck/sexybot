@@ -57,7 +57,10 @@ NEG_RISK_CTF = "0xC5d563A36AE78145C45a50134d48A1215220f80a"  # used in _parse_ba
 # signal evaluation and order placement, letting trades through that the
 # upstream gate already rejected. SELLs are not gated; closing a winning
 # position at high price is exactly what we want.
-MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0.97"))
+# Default lowered from 0.97 to 0.80 — the 80-100c price region was a -$45
+# bleeder over 30d while 70-80c was the only profitable band. See bot.py
+# at the MAX_ENTRY_PRICE constant for the data table.
+MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0.80"))
 
 # Order-rejection circuit breaker. The 2026-04-09 incident saw ~460 orders
 # fail in 82 minutes against an empty wallet — pure operational waste with
