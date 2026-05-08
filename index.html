@@ -759,8 +759,44 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
         <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px">Realized P&amp;L · by regime at entry</div>
         <div id="pnl-regime-body" style="font-size:10px;padding:4px 0"></div>
       </div>
+      <div id="pnl-pricebucket-wrap" style="display:none;margin-top:12px;border-top:1px solid var(--border2);padding-top:10px">
+        <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px">Realized P&amp;L · by entry-price decile</div>
+        <div id="pnl-pricebucket-body" style="font-size:10px;padding:4px 0"></div>
+        <div style="color:var(--text3);font-size:9px;line-height:1.4;margin-top:4px">Asymmetric-payoff diagnostic. High-price buckets (80c+) cap the upside but pay full $5 on a loss — if EV is negative there, win-rate is misleading.</div>
+      </div>
+      <div id="pnl-sidecat-wrap" style="display:none;margin-top:12px;border-top:1px solid var(--border2);padding-top:10px">
+        <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px">Realized P&amp;L · YES vs NO by category</div>
+        <div id="pnl-sidecat-body" style="font-size:10px;padding:4px 0"></div>
+        <div style="color:var(--text3);font-size:9px;line-height:1.4;margin-top:4px">AI calibration is better on NO-side; this cut tests whether that translates to realized $.</div>
+      </div>
       <div style="color:var(--text3);font-size:9px;line-height:1.4;margin-top:6px">
         CLAIMED = AI's avg predicted win % · ACTUAL = how often it was right · GAP &gt; 0 = overconfident · BRIER lower is better (0 = perfect, 0.25 = coin flip). P&amp;L sections come from resolved trades only (n &lt; 5 = thin sample).
+      </div>
+    </div>
+    <div class="panel" id="exec-health-panel">
+      <div class="panel-title">EXECUTION HEALTH (7D)</div>
+      <div style="display:flex;gap:14px;margin-bottom:8px;font-size:11px;flex-wrap:wrap">
+        <div><span style="color:var(--text3);font-size:9px">SUCCESS</span><br><span id="exec-success" style="color:var(--green);font-weight:700;font-size:18px;font-family:var(--mono)">—</span></div>
+        <div><span style="color:var(--text3);font-size:9px">FAILURE</span><br><span id="exec-failure" style="color:var(--red);font-weight:700;font-size:18px;font-family:var(--mono)">—</span></div>
+        <div><span style="color:var(--text3);font-size:9px">PENDING</span><br><span id="exec-pending" style="color:var(--orange);font-weight:700;font-size:18px;font-family:var(--mono)">—</span></div>
+        <div><span style="color:var(--text3);font-size:9px">SKIPPED</span><br><span id="exec-skipped" style="color:var(--text2);font-weight:700;font-size:18px;font-family:var(--mono)">—</span></div>
+        <div style="flex:1"></div>
+        <div style="align-self:flex-end"><span id="exec-fail-rate" style="color:var(--text3);font-size:11px">—</span></div>
+      </div>
+      <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">By status</div>
+      <div id="exec-status-body" style="font-size:10px;padding:4px 0">
+        <div style="color:var(--text3);font-size:10px">No live submissions yet.</div>
+      </div>
+      <div id="exec-cat-wrap" style="display:none;margin-top:10px;border-top:1px solid var(--border2);padding-top:8px">
+        <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">Failure rate · by category</div>
+        <div id="exec-cat-body" style="font-size:10px;padding:4px 0"></div>
+      </div>
+      <div id="exec-recent-wrap" style="display:none;margin-top:10px;border-top:1px solid var(--border2);padding-top:8px">
+        <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">Recent failures</div>
+        <div id="exec-recent-body" style="font-size:10px;padding:4px 0;max-height:220px;overflow-y:auto"></div>
+      </div>
+      <div style="color:var(--text3);font-size:9px;line-height:1.4;margin-top:6px">
+        success = matched/filled · pending = delayed/live (sat on book) · failure = no_match, insufficient_balance, auth_error, signature_error, etc · skipped = pre-submit gate aborts.
       </div>
     </div>
     <div class="panel" id="pretrade-panel">
@@ -2346,6 +2382,184 @@ function renderPnlBreakdown(idPrefix, dict){
   }).join('');
   body.innerHTML=hdr+rows;
 }
+/* ── DEEPER P&L CUTS ──
+   Fetches /pnl/cuts and renders two sub-sections:
+   - Entry-price decile (asymmetric-payoff diagnostic)
+   - YES vs NO × category (calibration → realized check)
+   Both hidden when empty so a fresh deploy doesn't show stubs. */
+async function fetchPnlCuts(){
+  try{
+    const r=await fetch(`${BOT}/pnl/cuts?days=30`);if(!r.ok)return;
+    const d=await r.json();
+    renderPriceBucket(d.by_price_bucket||[]);
+    renderSideCategory(d.by_side_category||[]);
+  }catch(e){}
+}
+function renderPriceBucket(rows){
+  const wrap=document.getElementById('pnl-pricebucket-wrap');
+  const body=document.getElementById('pnl-pricebucket-body');
+  if(!wrap||!body) return;
+  const filt=(rows||[]).filter(r=>(r.n||0)>0);
+  if(filt.length===0){wrap.style.display='none';return;}
+  wrap.style.display='';
+  const hdr=`<div style="display:grid;grid-template-columns:.7fr .4fr .7fr .55fr .55fr .55fr;gap:4px;color:var(--text3);font-size:9px;padding:4px 0;border-bottom:1px solid var(--border2)">
+    <span>BUCKET</span><span style="text-align:right">N</span><span style="text-align:right">P&amp;L</span><span style="text-align:right">WIN%</span><span style="text-align:right">AVG L</span><span style="text-align:right">EV/TR</span>
+  </div>`;
+  const html=filt.map(r=>{
+    const n=r.n||0, p=parseFloat(r.pnl)||0, wr=parseFloat(r.win_rate)||0;
+    const al=r.avg_loss==null?'—':('−$'+Math.abs(parseFloat(r.avg_loss)).toFixed(2));
+    const ev=parseFloat(r.ev_per_trade)||0;
+    const pcls=p>=0?'var(--green)':'var(--red)';
+    const psign=p>=0?'+':'−';
+    const evcls=ev>=0?'var(--green)':'var(--red)';
+    const evsign=ev>=0?'+':'−';
+    const nWarn=n<5?'<span style="color:var(--orange);font-size:9px"> ⚠</span>':'';
+    return `<div style="display:grid;grid-template-columns:.7fr .4fr .7fr .55fr .55fr .55fr;gap:4px;padding:3px 0;font-family:var(--mono);font-size:10px;border-bottom:1px dashed var(--border2)">
+      <span style="color:var(--text)">${safeHtml(r.bucket||'')}${nWarn}</span>
+      <span style="text-align:right;color:var(--text2)">${n}</span>
+      <span style="text-align:right;color:${pcls}">${psign}$${Math.abs(p).toFixed(2)}</span>
+      <span style="text-align:right;color:var(--text2)">${wr.toFixed(0)}%</span>
+      <span style="text-align:right;color:var(--text3)">${al}</span>
+      <span style="text-align:right;color:${evcls}">${evsign}$${Math.abs(ev).toFixed(2)}</span>
+    </div>`;
+  }).join('');
+  body.innerHTML=hdr+html;
+}
+function renderSideCategory(rows){
+  const wrap=document.getElementById('pnl-sidecat-wrap');
+  const body=document.getElementById('pnl-sidecat-body');
+  if(!wrap||!body) return;
+  const filt=(rows||[]).filter(r=>(r.n||0)>0);
+  if(filt.length===0){wrap.style.display='none';return;}
+  wrap.style.display='';
+  // Sort by |pnl| desc so the biggest movers float up.
+  filt.sort((a,b)=>Math.abs(parseFloat(b.pnl)||0)-Math.abs(parseFloat(a.pnl)||0));
+  const hdr=`<div style="display:grid;grid-template-columns:.9fr .5fr .4fr .7fr .55fr .55fr;gap:4px;color:var(--text3);font-size:9px;padding:4px 0;border-bottom:1px solid var(--border2)">
+    <span>CATEGORY</span><span>SIDE</span><span style="text-align:right">N</span><span style="text-align:right">P&amp;L</span><span style="text-align:right">WIN%</span><span style="text-align:right">EV/TR</span>
+  </div>`;
+  const html=filt.map(r=>{
+    const cat=safeHtml(String(r.category||'')); const side=safeHtml(String(r.side||''));
+    const n=r.n||0, p=parseFloat(r.pnl)||0, wr=parseFloat(r.win_rate)||0;
+    const ev=parseFloat(r.ev_per_trade)||0;
+    const pcls=p>=0?'var(--green)':'var(--red)';
+    const psign=p>=0?'+':'−';
+    const evcls=ev>=0?'var(--green)':'var(--red)';
+    const evsign=ev>=0?'+':'−';
+    const sideCls=side==='YES'?'var(--green)':(side==='NO'?'var(--orange)':'var(--text3)');
+    const nWarn=n<5?'<span style="color:var(--orange);font-size:9px"> ⚠</span>':'';
+    return `<div style="display:grid;grid-template-columns:.9fr .5fr .4fr .7fr .55fr .55fr;gap:4px;padding:3px 0;font-family:var(--mono);font-size:10px;border-bottom:1px dashed var(--border2)">
+      <span style="color:var(--text)">${cat}${nWarn}</span>
+      <span style="color:${sideCls}">${side}</span>
+      <span style="text-align:right;color:var(--text2)">${n}</span>
+      <span style="text-align:right;color:${pcls}">${psign}$${Math.abs(p).toFixed(2)}</span>
+      <span style="text-align:right;color:var(--text2)">${wr.toFixed(0)}%</span>
+      <span style="text-align:right;color:${evcls}">${evsign}$${Math.abs(ev).toFixed(2)}</span>
+    </div>`;
+  }).join('');
+  body.innerHTML=hdr+html;
+}
+/* ── EXECUTION HEALTH ──
+   Reads /health/execution and renders the failure-mode breakdown that
+   the backtest's "193/500 unmatched" headline obscures. The status
+   field has heterogeneous values (clean codes for recent rows, full
+   error strings for older ones) — server-side normalization buckets
+   them into matched / delayed / no_match / insufficient_balance /
+   auth_error / etc. */
+async function fetchExecHealth(){
+  try{
+    const r=await fetch(`${BOT}/health/execution?days=7`);if(!r.ok)return;
+    const d=await r.json();
+    const b=d.buckets||{};
+    const set=(id,v,colorOk,colorBad)=>{const el=document.getElementById(id);if(el){el.textContent=Number(v||0).toLocaleString();}};
+    set('exec-success',  b.success);
+    set('exec-failure',  b.failure);
+    set('exec-pending',  b.pending);
+    set('exec-skipped',  b.skipped);
+    const fr=document.getElementById('exec-fail-rate');
+    if(fr){
+      const total=Number(d.total||0);
+      if(total>0){
+        const rate=Number(d.failure_rate||0);
+        const rateColor=rate<10?'var(--green)':(rate<25?'var(--orange)':'var(--red)');
+        fr.innerHTML=`<span style="color:var(--text3)">${total} live submissions · </span><span style="color:${rateColor};font-weight:600">${rate.toFixed(1)}% fail</span>`;
+      } else {
+        fr.textContent='No live submissions in window';
+      }
+    }
+    // By-status breakdown — show all normalized codes with counts.
+    const sb=document.getElementById('exec-status-body');
+    const list=(d.by_status||[]).filter(r=>(r.n||0)>0);
+    if(sb){
+      if(list.length===0){
+        sb.innerHTML='<div style="color:var(--text3);font-size:10px">No live submissions yet.</div>';
+      } else {
+        const total=list.reduce((a,r)=>a+(r.n||0),0);
+        sb.innerHTML=list.map(r=>{
+          const pct=total>0?(r.n/total*100):0;
+          const isFail=['no_match','insufficient_balance','auth_error','signature_error','no_orderbook','service_not_ready','price_out_of_range','rejected','other_error'].includes(r.status);
+          const isOk=r.status==='matched';
+          const isPending=r.status==='delayed';
+          const c=isOk?'var(--green)':(isFail?'var(--red)':(isPending?'var(--orange)':'var(--text2)'));
+          return `<div style="display:grid;grid-template-columns:1.6fr .5fr .5fr;gap:6px;padding:3px 0;font-family:var(--mono);font-size:10px;border-bottom:1px dashed var(--border2)">
+            <span style="color:${c}">${safeHtml(r.status||'unknown')}</span>
+            <span style="text-align:right;color:var(--text2)">${(r.n||0).toLocaleString()}</span>
+            <span style="text-align:right;color:var(--text3)">${pct.toFixed(1)}%</span>
+          </div>`;
+        }).join('');
+      }
+    }
+    // Per-category failure-rate
+    const cw=document.getElementById('exec-cat-wrap');
+    const cb=document.getElementById('exec-cat-body');
+    const cats=(d.by_category||[]).filter(r=>(r.n||0)>0);
+    if(cw && cb){
+      if(cats.length<=1){cw.style.display='none';}
+      else {
+        cw.style.display='';
+        cb.innerHTML=cats.map(r=>{
+          const rate=Number(r.failure_rate||0);
+          const rc=rate<10?'var(--green)':(rate<25?'var(--orange)':'var(--red)');
+          return `<div style="display:grid;grid-template-columns:1.4fr .5fr .5fr .6fr;gap:6px;padding:3px 0;font-family:var(--mono);font-size:10px;border-bottom:1px dashed var(--border2)">
+            <span style="color:var(--text)">${safeHtml(r.category||'unknown')}</span>
+            <span style="text-align:right;color:var(--text2)">${(r.n||0).toLocaleString()}</span>
+            <span style="text-align:right;color:var(--text3)">${(r.failures||0).toLocaleString()}</span>
+            <span style="text-align:right;color:${rc}">${rate.toFixed(1)}%</span>
+          </div>`;
+        }).join('');
+      }
+    }
+    // Recent failures sample
+    const rw=document.getElementById('exec-recent-wrap');
+    const rb=document.getElementById('exec-recent-body');
+    const recent=(d.recent_failures||[]);
+    if(rw && rb){
+      if(recent.length===0){rw.style.display='none';}
+      else {
+        rw.style.display='';
+        rb.innerHTML=recent.map(e=>{
+          const mkt=safeHtml((e.market||'').slice(0,60));
+          const when=safeHtml((e.time||'').replace('T',' ').slice(0,16));
+          const status=safeHtml(e.status||'');
+          const raw=safeHtml((e.status_raw||'').slice(0,140));
+          const cat=safeHtml(e.category||'unknown');
+          const amt=Number(e.amount||0).toFixed(2);
+          const px=Number(e.price||0).toFixed(3);
+          return `<div style="padding:4px 0;border-bottom:1px dashed var(--border2)">
+            <div style="display:flex;justify-content:space-between;gap:8px">
+              <span style="color:var(--text2)">${mkt}</span>
+              <span style="font-family:var(--mono);color:var(--text3);font-size:9px">${when}</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;gap:8px;margin-top:2px">
+              <span style="color:var(--red);font-family:var(--mono);font-size:9px">${status}</span>
+              <span style="color:var(--text3);font-size:9px">${cat} · $${amt} @ ${px}</span>
+            </div>
+            <div style="color:var(--text3);font-size:9px;margin-top:2px;line-height:1.3;word-break:break-all">${raw}</div>
+          </div>`;
+        }).join('');
+      }
+    }
+  }catch(e){}
+}
 /* ── PRE-TRADE catches (Claude gate) ── */
 async function fetchPretrade(){
   try{
@@ -2571,7 +2785,7 @@ async function applyReview(reviewId,idx,btn){
   }
 }
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchActivity();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchDeep();fetchBacktest();_pollBacktestStatus();fetchClaudeMax();fetchCalibration();fetchSpend();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchActivity();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchPnlCuts();fetchExecHealth();fetchDeep();fetchBacktest();_pollBacktestStatus();fetchClaudeMax();fetchCalibration();fetchSpend();
 setInterval(fetchBot,15000);
 setInterval(fetchActivity,30000);
 setInterval(fetchPortfolio,30000);
@@ -2589,6 +2803,8 @@ setInterval(fetchPretrade,90000);
 setInterval(fetchCalibration,600000);  // 10 min — data only changes when Brier resolver fires (every 6h)
 setInterval(fetchSpend,60000);          // 1 min — Claude spend can move fast during heavy scanning
 setInterval(fetchRealizedPnl,180000);
+setInterval(fetchPnlCuts,180000);     // 3 min — same cadence as headline P&L
+setInterval(fetchExecHealth,60000);   // 1 min — execution failures should surface fast
 setInterval(fetchDeep,120000);
 setInterval(fetchClaudeMax,60000);
 connectWS();

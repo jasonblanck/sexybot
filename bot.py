@@ -3201,6 +3201,301 @@ class PolymarketBot:
             log.debug(f"get_realized_pnl_summary error: {e}")
             return {}
 
+    def get_pnl_by_price_bucket(self, window_days: int = 30) -> list:
+        """Realized P&L bucketed by entry-price decile (0-10c, 10-20c, ...,
+        90-100c). Surfaces the asymmetric-payoff structure: when the bot
+        buys high (e.g. 0.85+), the upside is capped at a few cents per
+        share and a single $5 loss undoes many wins. The headline P&L by
+        category obscures this — every category looks like a win-rate
+        lottery until you see the price-bucket cut.
+
+        Returns rows of:
+          bucket          # '0-10', '10-20', ..., '90-100'
+          n               # resolved trades in bucket
+          pnl             # SUM(realized_pnl)
+          win_rate        # % of trades with realized_pnl > 0
+          avg_win         # mean realized_pnl when > 0
+          avg_loss        # mean realized_pnl when <= 0
+          ev_per_trade    # SUM(realized_pnl) / n
+        """
+        try:
+            window_days = max(1, min(int(window_days), 365))
+            # Bucket index = floor(price * 10), clamped to [0, 9] in Python so
+            # the rare price=1.0 row falls into the 90-100c bucket rather than
+            # spawning a phantom bucket 10.
+            rows = self.db.execute(
+                "SELECT "
+                "  CASE WHEN CAST(price * 10 AS INTEGER) > 9 THEN 9 "
+                "       WHEN CAST(price * 10 AS INTEGER) < 0 THEN 0 "
+                "       ELSE CAST(price * 10 AS INTEGER) END AS bucket, "
+                "  COUNT(*), "
+                "  SUM(realized_pnl), "
+                "  SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), "
+                "  AVG(CASE WHEN realized_pnl > 0 THEN realized_pnl END), "
+                "  AVG(CASE WHEN realized_pnl <= 0 THEN realized_pnl END) "
+                "FROM trades "
+                "WHERE resolved=1 AND dry_run=0 "
+                "  AND resolved_at >= datetime('now', ?) "
+                "  AND price > 0 AND price <= 1 "
+                "GROUP BY bucket "
+                "ORDER BY bucket",
+                (f"-{window_days} days",),
+            ).fetchall()
+            out = []
+            for r in rows:
+                idx = int(r[0] or 0)
+                lo, hi = idx * 10, (idx + 1) * 10
+                n = int(r[1] or 0)
+                pnl = float(r[2] or 0.0)
+                wins = int(r[3] or 0)
+                avg_win = float(r[4]) if r[4] is not None else None
+                avg_loss = float(r[5]) if r[5] is not None else None
+                out.append({
+                    "bucket":       f"{lo}-{hi}c",
+                    "lo":           lo / 100.0,
+                    "hi":           hi / 100.0,
+                    "n":            n,
+                    "pnl":          round(pnl, 2),
+                    "win_rate":     round(wins / n * 100, 1) if n else 0.0,
+                    "avg_win":      round(avg_win, 2) if avg_win is not None else None,
+                    "avg_loss":     round(avg_loss, 2) if avg_loss is not None else None,
+                    "ev_per_trade": round(pnl / n, 3) if n else 0.0,
+                })
+            return out
+        except Exception as e:
+            log.debug(f"get_pnl_by_price_bucket error: {e}")
+            return []
+
+    def get_pnl_by_side_category(self, window_days: int = 30) -> list:
+        """Realized P&L cut by (category, YES vs NO side). trades.side stores
+        BUY/SELL (and is BUY for ~all live rows) while brier_scores.side
+        stores YES/NO — the AI calibration scorecard already tells us NO
+        is better-calibrated than YES; this cut answers whether that
+        calibration advantage actually translated into realized P&L, by
+        category. Each token's side is stable in brier_scores (verified
+        live; only 3 of 22k+ tokens ever logged both YES+NO and those are
+        legacy 'BUY' stragglers), so a simple LIMIT 1 lookup is correct
+        and avoids correlated-subquery scope issues with `t.time`.
+        Trades with no matching brier row fall into 'unknown'.
+        """
+        try:
+            window_days = max(1, min(int(window_days), 365))
+            rows = self.db.execute(
+                "SELECT COALESCE(t.category, 'unknown') AS cat, "
+                "       COALESCE(UPPER(( "
+                "         SELECT b.side FROM brier_scores b "
+                "         WHERE b.token_id = t.token_id "
+                "         LIMIT 1 "
+                "       )), 'unknown') AS side, "
+                "       COUNT(*), "
+                "       SUM(t.realized_pnl), "
+                "       SUM(CASE WHEN t.realized_pnl > 0 THEN 1 ELSE 0 END) "
+                "FROM trades t "
+                "WHERE t.resolved = 1 AND t.dry_run = 0 "
+                "  AND t.resolved_at >= datetime('now', ?) "
+                "GROUP BY cat, side "
+                "ORDER BY cat, side",
+                (f"-{window_days} days",),
+            ).fetchall()
+            out = []
+            for r in rows:
+                cat = str(r[0] or "unknown")
+                side = str(r[1] or "unknown")
+                n = int(r[2] or 0)
+                pnl = float(r[3] or 0.0)
+                wins = int(r[4] or 0)
+                out.append({
+                    "category":     cat,
+                    "side":         side,
+                    "n":            n,
+                    "pnl":          round(pnl, 2),
+                    "win_rate":     round(wins / n * 100, 1) if n else 0.0,
+                    "ev_per_trade": round(pnl / n, 3) if n else 0.0,
+                })
+            return out
+        except Exception as e:
+            log.debug(f"get_pnl_by_side_category error: {e}")
+            return []
+
+    @staticmethod
+    def _normalize_exec_status(raw: str) -> str:
+        """Normalize the heterogeneous trades.status field into a small set
+        of buckets the operator can reason about. Older trades stored the
+        full polyapiexception text as status (e.g. 'error: polyapiexception
+        [status_code=400, error_message=...not enough balance...]'); newer
+        code stores clean codes like 'matched'/'delayed'/'error'. Both
+        coexist in the table, so the normalizer matches on substrings.
+        Returns one of:
+          matched, delayed, no_match, insufficient_balance, auth_error,
+          signature_error, no_orderbook, service_not_ready,
+          price_out_of_range, rejected, other_error,
+          skip_error_cooldown, skip_price_ceiling, skip_other,
+          unknown
+        """
+        s = (raw or "").lower().strip()
+        if not s:
+            return "unknown"
+        if s in ("matched", "filled"):
+            return "matched"
+        if s in ("delayed", "live"):
+            return "delayed"
+        if s == "unmatched" or "no match" in s or s == "no_match":
+            return "no_match"
+        if "not enough balance" in s or "balance is not enough" in s:
+            return "insufficient_balance"
+        if "unauthorized" in s or "invalid api key" in s:
+            return "auth_error"
+        if "invalid signature" in s:
+            return "signature_error"
+        if "no orderbook" in s:
+            return "no_orderbook"
+        if "service not ready" in s or "status_code=425" in s:
+            return "service_not_ready"
+        if "min:" in s and "max:" in s:
+            return "price_out_of_range"
+        if s == "rejected":
+            return "rejected"
+        if s.startswith("skip_error_cooldown"):
+            return "skip_error_cooldown"
+        if s.startswith("skip_price_ceiling"):
+            return "skip_price_ceiling"
+        if s.startswith("skip"):
+            return "skip_other"
+        if s.startswith("error"):
+            return "other_error"
+        return s
+
+    _EXEC_BUCKETS = {
+        "matched":             "success",
+        "delayed":             "pending",
+        "no_match":            "failure",
+        "insufficient_balance":"failure",
+        "auth_error":          "failure",
+        "signature_error":     "failure",
+        "no_orderbook":        "failure",
+        "service_not_ready":   "failure",
+        "price_out_of_range":  "failure",
+        "rejected":            "failure",
+        "other_error":         "failure",
+        "skip_error_cooldown": "skipped",
+        "skip_price_ceiling":  "skipped",
+        "skip_other":          "skipped",
+    }
+
+    def get_execution_breakdown(self, window_days: int = 7) -> dict:
+        """Status-code breakdown for live (non-dry-run) trade submissions
+        over the window, with per-category failure rate and a recent-
+        failure sample. Pure observability — does not change order
+        behavior. The status field is heterogeneous (see
+        _normalize_exec_status) so normalization happens in Python.
+        """
+        try:
+            window_days = max(1, min(int(window_days), 90))
+            rows = self.db.execute(
+                "SELECT LOWER(COALESCE(status, 'unknown')) AS s, COUNT(*) "
+                "FROM trades "
+                "WHERE time >= datetime('now', ?) AND dry_run = 0 "
+                "GROUP BY s",
+                (f"-{window_days} days",),
+            ).fetchall()
+
+            buckets = {"success": 0, "pending": 0, "failure": 0, "skipped": 0, "other": 0}
+            by_status: dict[str, int] = {}
+            for r in rows:
+                norm = self._normalize_exec_status(str(r[0] or ""))
+                n = int(r[1] or 0)
+                by_status[norm] = by_status.get(norm, 0) + n
+                bucket = self._EXEC_BUCKETS.get(norm, "other")
+                buckets[bucket] += n
+            by_status_list = sorted(
+                ({"status": k, "n": v} for k, v in by_status.items()),
+                key=lambda d: d["n"], reverse=True,
+            )
+
+            total = sum(buckets.values())
+            failure_rate = round(buckets["failure"] / total * 100, 1) if total else 0.0
+            success_rate = round(buckets["success"] / total * 100, 1) if total else 0.0
+
+            # Per-category failure rate — which markets keep choking? Need
+            # to normalize per-row in Python here too, because the failure
+            # match must catch the long polyapiexception strings.
+            cat_rows = self.db.execute(
+                "SELECT COALESCE(category, 'unknown') AS cat, "
+                "       LOWER(COALESCE(status, 'unknown')) AS s, "
+                "       COUNT(*) "
+                "FROM trades "
+                "WHERE time >= datetime('now', ?) AND dry_run = 0 "
+                "GROUP BY cat, s",
+                (f"-{window_days} days",),
+            ).fetchall()
+            cat_agg: dict[str, dict] = {}
+            for r in cat_rows:
+                cat = str(r[0] or "unknown")
+                norm = self._normalize_exec_status(str(r[1] or ""))
+                n = int(r[2] or 0)
+                bucket = self._EXEC_BUCKETS.get(norm, "other")
+                d = cat_agg.setdefault(cat, {"n": 0, "failures": 0})
+                d["n"] += n
+                if bucket == "failure":
+                    d["failures"] += n
+            by_category = [
+                {
+                    "category":     cat,
+                    "n":            d["n"],
+                    "failures":     d["failures"],
+                    "failure_rate": round(d["failures"] / d["n"] * 100, 1) if d["n"] else 0.0,
+                }
+                for cat, d in sorted(
+                    cat_agg.items(),
+                    key=lambda kv: kv[1]["failures"], reverse=True,
+                )
+            ]
+
+            # Recent failure sample for the operator to eyeball — pull a
+            # generous slice and filter to failure-bucket statuses in Python
+            # so we catch the long-string error rows too.
+            recent_rows = self.db.execute(
+                "SELECT time, market, side, amount, price, status, category "
+                "FROM trades "
+                "WHERE dry_run = 0 "
+                "  AND time >= datetime('now', ?) "
+                "  AND LOWER(COALESCE(status,'')) NOT IN ('matched','delayed','live','filled','simulated') "
+                "  AND COALESCE(status,'') NOT LIKE 'skip%' "
+                "ORDER BY time DESC LIMIT 60",
+                (f"-{window_days} days",),
+            ).fetchall()
+            recent = []
+            for r in recent_rows:
+                norm = self._normalize_exec_status(str(r[5] or ""))
+                if self._EXEC_BUCKETS.get(norm, "other") != "failure":
+                    continue
+                recent.append({
+                    "time":            str(r[0] or ""),
+                    "market":          str(r[1] or "")[:80],
+                    "side":            str(r[2] or ""),
+                    "amount":          float(r[3] or 0.0),
+                    "price":           float(r[4] or 0.0),
+                    "status":          norm,
+                    "status_raw":      str(r[5] or "")[:200],
+                    "category":        str(r[6] or "unknown"),
+                })
+                if len(recent) >= 15:
+                    break
+
+            return {
+                "window_days":     window_days,
+                "total":           total,
+                "buckets":         buckets,
+                "failure_rate":    failure_rate,
+                "success_rate":    success_rate,
+                "by_status":       by_status_list,
+                "by_category":     by_category,
+                "recent_failures": recent,
+            }
+        except Exception as e:
+            log.debug(f"get_execution_breakdown error: {e}")
+            return {}
+
     def get_courtlistener_data(self, query: str) -> str:
         """Search CourtListener for relevant court dockets/opinions (free API)."""
         try:
@@ -8564,6 +8859,35 @@ def get_realized_pnl():
     whose markets have resolved. Computed from (payout − cost) per
     resolved position."""
     return JSONResponse(bot.get_realized_pnl_summary())
+
+
+@app.get("/pnl/cuts")
+def get_pnl_cuts(days: int = 30):
+    """Deeper P&L analysis cuts that the headline by-category breakdown
+    obscures. Returns:
+      by_price_bucket — entry-price decile breakdown; surfaces the
+        asymmetric-payoff structure (capped wins, full $5 losses) that's
+        the actual driver of EV, not the category.
+      by_side_category — YES vs NO P&L per category. Used to test
+        whether the AI calibration advantage on NO-side predictions
+        actually translates to realized P&L (vs just a Brier-score
+        artefact). Read-only — no trading-path effect.
+    """
+    return JSONResponse({
+        "window_days":      days,
+        "by_price_bucket":  bot.get_pnl_by_price_bucket(window_days=days),
+        "by_side_category": bot.get_pnl_by_side_category(window_days=days),
+    })
+
+
+@app.get("/health/execution")
+def get_execution_health(days: int = 7):
+    """Execution-layer status breakdown over the last N days. Buckets
+    every live order into success / pending / failure / skipped, plus
+    per-category failure rate and a recent-failure sample. Pure
+    observability — no behavior change. Use to triage the 'why is
+    38% of submissions unmatched' problem from the backtest."""
+    return JSONResponse(bot.get_execution_breakdown(window_days=days))
 
 
 @app.post("/pnl/resolve", dependencies=[Depends(require_api_key)])
