@@ -778,7 +778,6 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <div style="display:flex;gap:14px;margin-bottom:8px;font-size:11px;flex-wrap:wrap">
         <div><span style="color:var(--text3);font-size:9px">SUCCESS</span><br><span id="exec-success" style="color:var(--green);font-weight:700;font-size:18px;font-family:var(--mono)">—</span></div>
         <div><span style="color:var(--text3);font-size:9px">FAILURE</span><br><span id="exec-failure" style="color:var(--red);font-weight:700;font-size:18px;font-family:var(--mono)">—</span></div>
-        <div><span style="color:var(--text3);font-size:9px">PENDING</span><br><span id="exec-pending" style="color:var(--orange);font-weight:700;font-size:18px;font-family:var(--mono)">—</span></div>
         <div><span style="color:var(--text3);font-size:9px">SKIPPED</span><br><span id="exec-skipped" style="color:var(--text2);font-weight:700;font-size:18px;font-family:var(--mono)">—</span></div>
         <div style="flex:1"></div>
         <div style="align-self:flex-end"><span id="exec-fail-rate" style="color:var(--text3);font-size:11px">—</span></div>
@@ -796,7 +795,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
         <div id="exec-recent-body" style="font-size:10px;padding:4px 0;max-height:220px;overflow-y:auto"></div>
       </div>
       <div style="color:var(--text3);font-size:9px;line-height:1.4;margin-top:6px">
-        success = matched/filled · pending = delayed/live (sat on book) · failure = no_match, insufficient_balance, auth_error, signature_error, etc · skipped = pre-submit gate aborts.
+        success = matched + delayed (V2 CLOB delays accepted orders briefly; verified to settle with P&amp;L) · failure = no_match, insufficient_balance, auth_error, signature_error, etc · skipped = pre-submit gate aborts.
       </div>
     </div>
     <div class="panel" id="pretrade-panel">
@@ -2473,7 +2472,6 @@ async function fetchExecHealth(){
     const set=(id,v,colorOk,colorBad)=>{const el=document.getElementById(id);if(el){el.textContent=Number(v||0).toLocaleString();}};
     set('exec-success',  b.success);
     set('exec-failure',  b.failure);
-    set('exec-pending',  b.pending);
     set('exec-skipped',  b.skipped);
     const fr=document.getElementById('exec-fail-rate');
     if(fr){
@@ -2497,9 +2495,8 @@ async function fetchExecHealth(){
         sb.innerHTML=list.map(r=>{
           const pct=total>0?(r.n/total*100):0;
           const isFail=['no_match','insufficient_balance','auth_error','signature_error','no_orderbook','service_not_ready','price_out_of_range','rejected','other_error'].includes(r.status);
-          const isOk=r.status==='matched';
-          const isPending=r.status==='delayed';
-          const c=isOk?'var(--green)':(isFail?'var(--red)':(isPending?'var(--orange)':'var(--text2)'));
+          const isOk=r.status==='matched'||r.status==='delayed';   // delayed is V2 CLOB normal-success
+          const c=isOk?'var(--green)':(isFail?'var(--red)':'var(--text2)');
           return `<div style="display:grid;grid-template-columns:1.6fr .5fr .5fr;gap:6px;padding:3px 0;font-family:var(--mono);font-size:10px;border-bottom:1px dashed var(--border2)">
             <span style="color:${c}">${safeHtml(r.status||'unknown')}</span>
             <span style="text-align:right;color:var(--text2)">${(r.n||0).toLocaleString()}</span>

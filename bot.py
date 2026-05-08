@@ -645,6 +645,16 @@ class PolymarketBot:
                 "ALTER TABLE trades ADD COLUMN ai_confidence INTEGER",
                 "ALTER TABLE trades ADD COLUMN ai_risk TEXT",
                 "ALTER TABLE trades ADD COLUMN regime_at_entry TEXT",
+                # status_detail captures the raw exception text on a failed
+                # submission. Apr 10's "no exception leakage to clients"
+                # cleanup (commit d891423) dropped the polyapiexception
+                # text from result['status'] — making the balance circuit
+                # breaker (commit e3f20d3) silently broken because it
+                # looks for 'not enough balance' in the result, which is
+                # now empty. Re-persisting the raw text in a dedicated
+                # column restores the breaker AND lets /health/execution
+                # classify failures properly instead of all "other_error".
+                "ALTER TABLE trades ADD COLUMN status_detail TEXT",
             ):
                 try:
                     self.db.execute(_col_ddl)
@@ -828,7 +838,15 @@ class PolymarketBot:
         say 'momentum is losing, volumeSpike is winning' or 'crypto trades
         outperform political ones'. The caller is expected to populate them
         on the trade dict before save; missing values default to sensible
-        nulls so legacy callers don't break."""
+        nulls so legacy callers don't break.
+
+        status_detail captures the raw exception text on failed
+        submissions (truncated to 500 chars). The clean status code stays
+        in `status` for the dashboard / breaker; the detail column lets
+        us classify error families (insufficient_balance / auth_error /
+        signature_error / no_orderbook / etc.) and keeps the balance
+        circuit-breaker functional after the d891423 cleanup."""
+        detail = trade.get("error") or trade.get("status_detail")
         return (
             trade.get("market", ""), trade.get("side", ""),
             trade.get("amount_usdc", trade.get("amount", 0)),
@@ -843,13 +861,15 @@ class PolymarketBot:
             trade.get("ai_confidence"),
             trade.get("ai_risk"),
             trade.get("regime_at_entry"),
+            (str(detail)[:500] if detail else None),
         )
 
     _TRADE_INSERT_SQL = (
         "INSERT INTO trades "
         "(market,side,amount,price,shares,order_type,status,order_id,dry_run,time,"
-        "token_id,strategy,category,ai_probability,ai_confidence,ai_risk,regime_at_entry) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        "token_id,strategy,category,ai_probability,ai_confidence,ai_risk,regime_at_entry,"
+        "status_detail) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     )
 
     def save_trade(self, trade: dict):
@@ -1272,13 +1292,27 @@ class PolymarketBot:
                     self._bump_skip("exec_ok")
                     self._record_order_outcome(rejected=False)
             except Exception as e:
+                # Preserve the raw exception text so:
+                #   1. _is_balance_error can match on 'not enough balance'
+                #      etc — the d891423 cleanup dropped this from the
+                #      `status` column, silently disabling the circuit
+                #      breaker (e3f20d3). The breaker checks result['error'].
+                #   2. /health/execution can classify the failure family
+                #      (insufficient_balance / auth_error / signature_error
+                #      / no_orderbook / service_not_ready / ...) instead of
+                #      lumping every exception into 'other_error'.
+                #   3. The dashboard's recent-failures pane shows the
+                #      actual reason instead of a bare "error".
+                err_text = str(e)
                 result["status"] = "error"
+                result["error"] = err_text
+                result["status_detail"] = err_text[:500]
                 self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
                 self._bump_skip("exec_exception")
                 self._record_order_outcome(rejected=True)
                 self._log(
                     f"Order failed (token={token_id[:16]}… side={side} amt={amount_usdc}): "
-                    f"{e} — cooldown {int(ERROR_COOLDOWN_SEC)}s",
+                    f"{err_text} — cooldown {int(ERROR_COOLDOWN_SEC)}s",
                     "error",
                 )
         self.trades.append(result)
@@ -1390,13 +1424,18 @@ class PolymarketBot:
                     self._bump_skip("exec_ok")
                     self._record_order_outcome(rejected=False)
             except Exception as e:
+                # Same rationale as place_market_order — preserve raw text
+                # so the balance breaker and failure-family classifier work.
+                err_text = str(e)
                 result["status"] = "error"
+                result["error"] = err_text
+                result["status_detail"] = err_text[:500]
                 self._error_cooldown[token_id] = time.time() + ERROR_COOLDOWN_SEC
                 self._bump_skip("exec_exception")
                 self._record_order_outcome(rejected=True)
                 self._log(
                     f"Limit order failed (token={token_id[:16]}… side={side} "
-                    f"price={price} size={size}): {e} — cooldown {int(ERROR_COOLDOWN_SEC)}s",
+                    f"price={price} size={size}): {err_text} — cooldown {int(ERROR_COOLDOWN_SEC)}s",
                     "error",
                 )
         self.trades.append(result)
@@ -3366,8 +3405,15 @@ class PolymarketBot:
         return s
 
     _EXEC_BUCKETS = {
+        # `delayed` is a normal V2 CLOB success path: the order is
+        # accepted and matched on a slight delay. Verified live: every
+        # `delayed` row in the last 7d has resolved=1 with realized_pnl
+        # populated, meaning the trade outcome resolver saw the position
+        # settle. Treating it as "pending" understates the real success
+        # rate by ~2-3x (e.g. 7d had 17 matched + 51 delayed = 68/109
+        # successful, not 17/109).
         "matched":             "success",
-        "delayed":             "pending",
+        "delayed":             "success",
         "no_match":            "failure",
         "insufficient_balance":"failure",
         "auth_error":          "failure",
@@ -3382,28 +3428,51 @@ class PolymarketBot:
         "skip_other":          "skipped",
     }
 
+    @classmethod
+    def _normalize_status_with_detail(cls, status: str, detail: str) -> str:
+        """Two-pass normalization: try the clean `status` field first,
+        but if it normalizes to bare 'other_error' (i.e. status='error'
+        with no useful info), fall back to `status_detail`. After commit
+        d891423, recent error rows have status='error' and the actual
+        polyapiexception text in status_detail (or nowhere, for legacy
+        rows pre-fix). This restores per-failure-family visibility."""
+        first = cls._normalize_exec_status(status)
+        if first == "other_error" and detail:
+            second = cls._normalize_exec_status(detail)
+            if second != "other_error" and second != "unknown":
+                return second
+        return first
+
     def get_execution_breakdown(self, window_days: int = 7) -> dict:
         """Status-code breakdown for live (non-dry-run) trade submissions
         over the window, with per-category failure rate and a recent-
         failure sample. Pure observability — does not change order
-        behavior. The status field is heterogeneous (see
-        _normalize_exec_status) so normalization happens in Python.
+        behavior. The status field is heterogeneous (older rows store
+        the full polyapiexception text directly; newer rows store a
+        clean code in `status` and the raw text in `status_detail`),
+        so normalization happens in Python and consults both columns.
         """
         try:
             window_days = max(1, min(int(window_days), 90))
             rows = self.db.execute(
-                "SELECT LOWER(COALESCE(status, 'unknown')) AS s, COUNT(*) "
+                "SELECT LOWER(COALESCE(status, 'unknown')) AS s, "
+                "       LOWER(COALESCE(status_detail, '')) AS d, "
+                "       COUNT(*) "
                 "FROM trades "
                 "WHERE time >= datetime('now', ?) AND dry_run = 0 "
-                "GROUP BY s",
+                "GROUP BY s, d",
                 (f"-{window_days} days",),
             ).fetchall()
 
+            # `pending` retained in the response shape for backward
+            # compatibility with the dashboard JSON, but always 0 now —
+            # `delayed` was reclassified into success after verifying
+            # those rows resolve with realized P&L.
             buckets = {"success": 0, "pending": 0, "failure": 0, "skipped": 0, "other": 0}
             by_status: dict[str, int] = {}
             for r in rows:
-                norm = self._normalize_exec_status(str(r[0] or ""))
-                n = int(r[1] or 0)
+                norm = self._normalize_status_with_detail(str(r[0] or ""), str(r[1] or ""))
+                n = int(r[2] or 0)
                 by_status[norm] = by_status.get(norm, 0) + n
                 bucket = self._EXEC_BUCKETS.get(norm, "other")
                 buckets[bucket] += n
@@ -3416,23 +3485,22 @@ class PolymarketBot:
             failure_rate = round(buckets["failure"] / total * 100, 1) if total else 0.0
             success_rate = round(buckets["success"] / total * 100, 1) if total else 0.0
 
-            # Per-category failure rate — which markets keep choking? Need
-            # to normalize per-row in Python here too, because the failure
-            # match must catch the long polyapiexception strings.
+            # Per-category failure rate.
             cat_rows = self.db.execute(
                 "SELECT COALESCE(category, 'unknown') AS cat, "
                 "       LOWER(COALESCE(status, 'unknown')) AS s, "
+                "       LOWER(COALESCE(status_detail, '')) AS d, "
                 "       COUNT(*) "
                 "FROM trades "
                 "WHERE time >= datetime('now', ?) AND dry_run = 0 "
-                "GROUP BY cat, s",
+                "GROUP BY cat, s, d",
                 (f"-{window_days} days",),
             ).fetchall()
             cat_agg: dict[str, dict] = {}
             for r in cat_rows:
                 cat = str(r[0] or "unknown")
-                norm = self._normalize_exec_status(str(r[1] or ""))
-                n = int(r[2] or 0)
+                norm = self._normalize_status_with_detail(str(r[1] or ""), str(r[2] or ""))
+                n = int(r[3] or 0)
                 bucket = self._EXEC_BUCKETS.get(norm, "other")
                 d = cat_agg.setdefault(cat, {"n": 0, "failures": 0})
                 d["n"] += n
@@ -3455,7 +3523,8 @@ class PolymarketBot:
             # generous slice and filter to failure-bucket statuses in Python
             # so we catch the long-string error rows too.
             recent_rows = self.db.execute(
-                "SELECT time, market, side, amount, price, status, category "
+                "SELECT time, market, side, amount, price, status, category, "
+                "       status_detail "
                 "FROM trades "
                 "WHERE dry_run = 0 "
                 "  AND time >= datetime('now', ?) "
@@ -3466,9 +3535,11 @@ class PolymarketBot:
             ).fetchall()
             recent = []
             for r in recent_rows:
-                norm = self._normalize_exec_status(str(r[5] or ""))
+                norm = self._normalize_status_with_detail(str(r[5] or ""), str(r[7] or ""))
                 if self._EXEC_BUCKETS.get(norm, "other") != "failure":
                     continue
+                # Prefer status_detail when status is the bare 'error'.
+                raw = str(r[7] or r[5] or "")
                 recent.append({
                     "time":            str(r[0] or ""),
                     "market":          str(r[1] or "")[:80],
@@ -3476,7 +3547,7 @@ class PolymarketBot:
                     "amount":          float(r[3] or 0.0),
                     "price":           float(r[4] or 0.0),
                     "status":          norm,
-                    "status_raw":      str(r[5] or "")[:200],
+                    "status_raw":      raw[:200],
                     "category":        str(r[6] or "unknown"),
                 })
                 if len(recent) >= 15:
