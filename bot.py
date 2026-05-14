@@ -293,6 +293,14 @@ MOMENTUM_SL_CENTS            = float(os.getenv("MOMENTUM_SL_CENTS",             
 MOMENTUM_TRAIL_TRIGGER_CENTS = float(os.getenv("MOMENTUM_TRAIL_TRIGGER_CENTS",  "6.0"))
 MOMENTUM_TRAIL_DROP_CENTS    = float(os.getenv("MOMENTUM_TRAIL_DROP_CENTS",     "4.0"))
 MOMENTUM_TIMEOUT_H           = float(os.getenv("MOMENTUM_TIMEOUT_H",            "6.0"))
+# AI call guards — save tokens on structurally-bad markets.
+#   MAX_OB_SPREAD_FOR_AI: skip AI entirely if best_ask - best_bid exceeds this
+#     (0-1 scale, same as book prices). 0.60 catches "ghost" markets with
+#     bid=0.001/ask=0.999 that Claude always rejects for the same reason.
+#   AI_SKIP_CACHE_TTL_S: seconds to remember a SKIP decision. Markets that
+#     Claude rejects won't be re-analyzed until the cache expires.
+MAX_OB_SPREAD_FOR_AI  = float(os.getenv("MAX_OB_SPREAD_FOR_AI",  "0.60"))
+AI_SKIP_CACHE_TTL_S   = float(os.getenv("AI_SKIP_CACHE_TTL_S",   "1800"))  # 30 min
 # Auto-apply: after a nightly review, auto-apply recommendations that are
 # (a) on safelisted params, (b) within a conservative bound of the current
 # value, and (c) high enough confidence. Everything else still requires
@@ -1568,6 +1576,11 @@ class PolymarketBot:
     # ── Momentum trailing-stop state ──────────────────────────────────────────
     # token_id → highest midprice seen since entry (reset when position closes)
     _momentum_position_peaks: dict = {}
+
+    # ── AI SKIP cache ─────────────────────────────────────────────────────────
+    # token_id → (timestamp, reason_str). Prevents re-analyzing markets that
+    # Claude just rejected; expires after AI_SKIP_CACHE_TTL_S (default 30 min).
+    _ai_skip_cache: dict = {}
     _trade_rate_history: dict = {}      # condition_id → [(ts, trades_per_min)]
     _managed_positions: dict = {}       # token_id → position dict for TP/SL/timeout
 
@@ -7025,7 +7038,7 @@ class PolymarketBot:
                             self._daily_loss_attenuation = 1.0
 
                 _ai_failures = 0  # circuit breaker: disable AI mid-cycle after 3 consecutive failures
-                markets = await asyncio.to_thread(self.get_markets, 50)
+                markets = await asyncio.to_thread(self.get_markets, 100)
                 self._bump_skip("markets_scanned", len(markets))
                 self._log(f"Scanning {len(markets)} markets…")
 
@@ -7168,6 +7181,35 @@ class PolymarketBot:
                         ob = {}
                     ai_res = None
                     if ai_enabled and float(c["signal"].get("confidence", 0)) >= AI_MIN_CONFIDENCE:
+                        # ── Fast pre-filters (no additional I/O) ─────────────
+                        # 1. Spread filter: books with bid≈0 / ask≈1 are
+                        #    effectively untradeable — Claude always rejects
+                        #    them for the same reason. Skip the AI call and all
+                        #    research fetches (saves ~$0.01-0.05 per occurrence).
+                        _ob_spread = ob.get("spread", 1.0)
+                        if _ob_spread > MAX_OB_SPREAD_FOR_AI:
+                            self._bump_skip("ai_spread_too_wide")
+                            ai_res = {
+                                "action": "SKIP", "probability": None, "confidence": 0,
+                                "reasoning": (
+                                    f"book spread {_ob_spread:.3f} > "
+                                    f"{MAX_OB_SPREAD_FOR_AI:.2f} — market illiquid"
+                                ),
+                            }
+                        # 2. AI SKIP cache: skip re-analysis of recently-rejected markets.
+                        elif tid and tid in self._ai_skip_cache:
+                            _cached_ts, _cached_reason = self._ai_skip_cache[tid]
+                            if time.time() - _cached_ts < AI_SKIP_CACHE_TTL_S:
+                                age_m = int((time.time() - _cached_ts) / 60)
+                                self._bump_skip("ai_skip_cached")
+                                ai_res = {
+                                    "action": "SKIP", "probability": None, "confidence": 0,
+                                    "reasoning": f"[cached {age_m}min ago] {_cached_reason}",
+                                }
+                            else:
+                                self._ai_skip_cache.pop(tid, None)  # expired
+                        if ai_res is not None:
+                            return ob, ai_res
                         try:
                             _q_lower = c["question"].lower()
                             _is_legal = any(x in _q_lower for x in ["indicted","trial","court","lawsuit","ruling","judge","convicted","charged","plea","verdict","sentenced"])
@@ -7290,6 +7332,13 @@ class PolymarketBot:
                                 except Exception as _arb_e:
                                     log.debug(f"arb detector error: {_arb_e}")
                             ai_res = await self.analyze_with_claude(c["mkt"], c["yes_p"], _research)
+                            # Cache SKIP decisions so the same market isn't
+                            # re-analyzed every cycle until the TTL expires.
+                            if ai_res and ai_res.get("action") == "SKIP" and tid:
+                                self._ai_skip_cache[tid] = (
+                                    time.time(),
+                                    (ai_res.get("reasoning") or "")[:200],
+                                )
                         except Exception as _e:
                             log.debug(f"enrich candidate error: {_e}")
                             ai_res = None
