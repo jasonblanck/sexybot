@@ -1072,16 +1072,26 @@ class PolymarketBot:
     def get_markets(self, limit: int = 20) -> list:
         try:
             import urllib.request, json as _j
-            fetch_n = limit
-            url = f"https://gamma-api.polymarket.com/markets?active=true&closed=false&limit={fetch_n}&order=volume24hr&ascending=false"
-            req = urllib.request.Request(url, headers={"User-Agent": "polybot/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as r:
-                raw = _j.loads(r.read())
-            # Apply EXCLUDE_KEYWORDS / EXCLUDE_CATEGORIES at the source. Without
-            # this, geopolitical markets like "Strait of Hormuz traffic returns"
-            # leaked into the analyzer despite being in the env exclusion list,
-            # because the filter only existed in main_v2.py's discovery path.
-            # Keep the original ordering (volume-desc) — slice to limit at end.
+            # Gamma API caps at 100 per page; paginate to reach the desired limit.
+            PAGE = 100
+            raw: list = []
+            offset = 0
+            while len(raw) < limit:
+                want = min(PAGE, limit - len(raw))
+                url = (
+                    f"https://gamma-api.polymarket.com/markets"
+                    f"?active=true&closed=false&limit={want}&offset={offset}"
+                    f"&order=volume24hr&ascending=false"
+                )
+                req = urllib.request.Request(url, headers={"User-Agent": "polybot/1.0"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    page = _j.loads(r.read())
+                if not page:
+                    break
+                raw.extend(page)
+                if len(page) < want:
+                    break  # API returned fewer than requested — no more pages
+                offset += len(page)
             if (not EXCLUDE_KEYWORDS and not EXCLUDE_CATEGORIES
                     and not BLOCK_INTERNAL_CATEGORIES):
                 return raw[:limit]
