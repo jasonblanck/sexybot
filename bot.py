@@ -2086,7 +2086,7 @@ class PolymarketBot:
         except Exception as e:
             log.warning(f"FRED CPIAUCSL fetch failed, using fallback 3.0: {e}")
             cpi = 3.0
-        # VIX (updated daily by FRED — good enough for volatility scoring)
+        # VIX — try FRED first, fall back to Yahoo Finance if FRED fails.
         vix = None
         try:
             url3 = f"https://api.stlouisfed.org/fred/series/observations?series_id=VIXCLS&api_key={FRED_API_KEY}&sort_order=desc&limit=1&file_type=json"
@@ -2096,7 +2096,22 @@ class PolymarketBot:
                 if obs3:
                     vix = float(obs3[0]["value"])
         except Exception as e:
-            log.warning(f"FRED VIXCLS fetch failed, vix=None: {e}")
+            log.warning(f"FRED VIXCLS fetch failed ({e}); trying Yahoo Finance fallback")
+        if vix is None:
+            try:
+                req_yf = _ureq.Request(
+                    "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1d&range=1d",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                with _ureq.urlopen(req_yf, timeout=5) as r:
+                    d_yf = _j.loads(r.read())
+                    close = (d_yf.get("chart", {}).get("result") or [{}])[0] \
+                                 .get("meta", {}).get("regularMarketPrice")
+                    if close:
+                        vix = float(close)
+                        log.info(f"VIX fallback via Yahoo Finance: {vix}")
+            except Exception as e2:
+                log.warning(f"Yahoo Finance VIX fallback failed: {e2}")
         self._macro_cache = {"fed_rate": rate, "cpi": cpi, "vix": vix}
         self._macro_cache_time = time.time()
         return self._macro_cache
