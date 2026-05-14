@@ -4788,7 +4788,7 @@ class PolymarketBot:
             _analyze_tool_cached = {**_TOOL_ANALYZE, "cache_control": {"type": "ephemeral"}}
             api_kwargs = {
                 "model": CLAUDE_MODEL,
-                "max_tokens": int(os.getenv("ANALYZE_MAX_TOKENS", "1200")),
+                "max_tokens": int(os.getenv("ANALYZE_MAX_TOKENS", "2000")),
                 "system": [{
                     "type": "text",
                     "text": system_prompt,
