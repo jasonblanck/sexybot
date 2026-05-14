@@ -301,6 +301,15 @@ MOMENTUM_TIMEOUT_H           = float(os.getenv("MOMENTUM_TIMEOUT_H",            
 #     Claude rejects won't be re-analyzed until the cache expires.
 MAX_OB_SPREAD_FOR_AI  = float(os.getenv("MAX_OB_SPREAD_FOR_AI",  "0.60"))
 AI_SKIP_CACHE_TTL_S   = float(os.getenv("AI_SKIP_CACHE_TTL_S",   "1800"))  # 30 min
+# Late-resolution fade: sell NO on near-certain but not-yet-resolved markets.
+#   YES priced 93-99%: someone won't sell at 97¢ (anchoring), leaving mispriced NO.
+#   Minimum hours left ensures the market still has uncertainty to fade.
+LATE_RES_MIN_YES_P  = float(os.getenv("LATE_RES_MIN_YES_P",  "0.93"))
+LATE_RES_MAX_YES_P  = float(os.getenv("LATE_RES_MAX_YES_P",  "0.99"))
+LATE_RES_MIN_HOURS  = float(os.getenv("LATE_RES_MIN_HOURS",  "12.0"))
+LATE_RES_MAX_HOURS  = float(os.getenv("LATE_RES_MAX_HOURS",  "168.0"))
+# Volume spike: follow smart money when $VOLUME_SPIKE_MIN_DELTA flows in 60s.
+VOLUME_SPIKE_MIN_DELTA = float(os.getenv("VOLUME_SPIKE_MIN_DELTA", "500.0"))  # USD in one cycle
 # Auto-apply: after a nightly review, auto-apply recommendations that are
 # (a) on safelisted params, (b) within a conservative bound of the current
 # value, and (c) high enough confidence. Everything else still requires
@@ -1582,6 +1591,8 @@ class PolymarketBot:
     # ── Momentum trailing-stop state ──────────────────────────────────────────
     # token_id → highest midprice seen since entry (reset when position closes)
     _momentum_position_peaks: dict = {}
+    # market_id → last-seen volume24hr for spike detection (updated each analyze() call)
+    _volume_cache: dict = {}
 
     # ── AI SKIP cache ─────────────────────────────────────────────────────────
     # token_id → (timestamp, reason_str). Prevents re-analyzing markets that
@@ -6543,6 +6554,39 @@ class PolymarketBot:
         # ── Universal pre-filter: skip markets Claude can't trade profitably ──
         liq = float(market.get("liquidity", market.get("liquidityNum", 0)) or 0)
         vol = float(market.get("volume24hr", 0) or 0)
+
+        # ── Late-resolution fade (runs before NEAR_DECIDED_BAND filter) ──────────
+        # Markets at 93-99% YES still carry meaningful NO value due to anchoring
+        # (sellers won't accept 97¢ "just in case"). The NEAR_DECIDED_BAND would
+        # normally skip these — we intercept first and return a NO signal instead.
+        if (STRATEGY == "momentum"
+                and LATE_RES_MIN_YES_P <= yes_p <= LATE_RES_MAX_YES_P
+                and no_id and liq >= 5_000 and vol >= 200):
+            _end_str = market.get("endDate") or ""
+            if _end_str:
+                try:
+                    from datetime import datetime as _dt, timezone as _tz
+                    _end = _dt.fromisoformat(_end_str.replace("Z", "+00:00"))
+                    _hours_left = (_end - _dt.now(_tz.utc)).total_seconds() / 3600
+                    if LATE_RES_MIN_HOURS <= _hours_left <= LATE_RES_MAX_HOURS:
+                        _no_price = round(1.0 - yes_p, 4)
+                        _lr_conf  = round((yes_p - LATE_RES_MIN_YES_P) / (1.0 - LATE_RES_MIN_YES_P) * 80, 1)
+                        self._log(
+                            f"LATE-RES FADE: {question[:60]} "
+                            f"YES={yes_p:.3f} NO@{_no_price:.3f} {_hours_left:.0f}h left"
+                        )
+                        return {
+                            "strategy": "momentum",
+                            "signal": f"BUY NO (late-res fade, {_hours_left:.0f}h left)",
+                            "token_id": no_id,
+                            "price": _no_price,
+                            "confidence": _lr_conf,
+                            "market": question,
+                            "amount": min(MAX_ORDER_SIZE, MAX_ORDER_SIZE * 0.5),
+                        }
+                except Exception:
+                    pass
+
         # Skip near-decided markets — no momentum edge, just burns Anthropic API
         # credits on already-decided outcomes. NEAR_DECIDED_BAND defaults to 0.08
         # (so we skip yes_p ≤ 0.08 OR ≥ 0.92). Was 0.02 / 0.98 previously, which
@@ -6572,6 +6616,36 @@ class PolymarketBot:
             return None
 
         if STRATEGY == "momentum":
+            # ── Volume spike: follow unusual 60-second flow ───────────────────────
+            # volume24hr is a rolling 24h total. Delta since last cycle ≈ volume
+            # added in the past 60s. A large delta means a whale just entered.
+            # We follow their direction (price side that's deviating from 0.5).
+            _mkt_id = str(market.get("id") or market.get("conditionId", ""))
+            if _mkt_id:
+                _last_vol = self._volume_cache.get(_mkt_id)
+                _vol_delta = (vol - _last_vol) if _last_vol is not None and vol >= _last_vol else 0
+                self._volume_cache[_mkt_id] = vol
+                if _vol_delta >= VOLUME_SPIKE_MIN_DELTA:
+                    _dev_vs = abs(yes_p - 0.5)
+                    if _dev_vs > 0.02 and no_id:
+                        _side_vs  = "YES" if yes_p > 0.5 else "NO"
+                        _tid_vs   = yes_id if yes_p > 0.5 else no_id
+                        _price_vs = yes_p if yes_p > 0.5 else (1 - yes_p)
+                        _conf_vs  = min(85.0, 25.0 + _vol_delta / 200)
+                        self._log(
+                            f"VOL SPIKE: {question[:60]} "
+                            f"+${_vol_delta:,.0f} in 60s → {_side_vs}@{_price_vs:.3f}"
+                        )
+                        return {
+                            "strategy": "momentum",
+                            "signal": f"BUY {_side_vs} (vol spike +${_vol_delta:,.0f})",
+                            "token_id": _tid_vs,
+                            "price": _price_vs,
+                            "confidence": round(_conf_vs, 1),
+                            "market": question,
+                            "amount": min(MAX_ORDER_SIZE, max(MAX_ORDER_SIZE * 0.3,
+                                          MAX_ORDER_SIZE * _vol_delta / 5000)),
+                        }
             dev = abs(yes_p - 0.5)
             if dev > 0.05:
                 macro = self.get_macro_context()
