@@ -282,6 +282,17 @@ DEEP_ANALYZE_TIMEOUT_S = float(os.getenv("DEEP_ANALYZE_TIMEOUT_S", "45.0"))
 CONSENSUS_ENABLED      = os.getenv("CONSENSUS_ENABLED", "true").lower() == "true"
 CONSENSUS_MODEL        = os.getenv("CONSENSUS_MODEL", "openai/gpt-5-mini")
 CONSENSUS_TIMEOUT_S    = float(os.getenv("CONSENSUS_TIMEOUT_S", "20.0"))
+# Momentum position exit thresholds.
+#   TP_CENTS:            flat take-profit — exit when gain ≥ this many cents
+#   SL_CENTS:            flat stop-loss — exit when loss ≥ this many cents
+#   TRAIL_TRIGGER_CENTS: trailing stop activates once peak gain reaches this
+#   TRAIL_DROP_CENTS:    exit if price drops this many cents below peak
+#   TIMEOUT_H:           max hold time before forced exit regardless of P&L
+MOMENTUM_TP_CENTS            = float(os.getenv("MOMENTUM_TP_CENTS",            "15.0"))
+MOMENTUM_SL_CENTS            = float(os.getenv("MOMENTUM_SL_CENTS",             "7.0"))
+MOMENTUM_TRAIL_TRIGGER_CENTS = float(os.getenv("MOMENTUM_TRAIL_TRIGGER_CENTS",  "6.0"))
+MOMENTUM_TRAIL_DROP_CENTS    = float(os.getenv("MOMENTUM_TRAIL_DROP_CENTS",     "4.0"))
+MOMENTUM_TIMEOUT_H           = float(os.getenv("MOMENTUM_TIMEOUT_H",            "6.0"))
 # Auto-apply: after a nightly review, auto-apply recommendations that are
 # (a) on safelisted params, (b) within a conservative bound of the current
 # value, and (c) high enough confidence. Everything else still requires
@@ -508,6 +519,7 @@ class PolymarketBot:
             "assessed_at": None,
         }
         self._regime_cache_time: float = 0.0
+        self._regime_fail_streak: int = 0   # consecutive Claude failures; resets to normal after threshold
         # Brier-score calibrator — self-corrects predicted_prob bias learned
         # from resolved history. source='default' reads ALL rows in brier_scores
         # (including pre-migration rows with NULL source) so the bot starts
@@ -968,6 +980,7 @@ class PolymarketBot:
                 with self.db:  # all deletes commit atomically or all roll back
                     for tid in to_remove:
                         self.db.execute("DELETE FROM positions WHERE token_id=?", (tid,))
+                        self._momentum_position_peaks.pop(tid, None)
                 self._log(f"Cleared {len(to_remove)} resolved position(s) from DB")
         except Exception as e:
             log.debug(f"sync_positions error: {e}")
@@ -1551,6 +1564,10 @@ class PolymarketBot:
     # ── EconFlow state ────────────────────────────────────────────────────────
     _watched_econ_markets: list = []    # filtered economic markets (5-min cache)
     _watched_markets_time: float = 0
+
+    # ── Momentum trailing-stop state ──────────────────────────────────────────
+    # token_id → highest midprice seen since entry (reset when position closes)
+    _momentum_position_peaks: dict = {}
     _trade_rate_history: dict = {}      # condition_id → [(ts, trades_per_min)]
     _managed_positions: dict = {}       # token_id → position dict for TP/SL/timeout
 
@@ -1899,75 +1916,149 @@ class PolymarketBot:
 
     async def position_monitor_loop(self):
         """
-        Separate background task — fires every 30 seconds.
-        Checks every EconFlow managed position for exit conditions:
-          • Take profit : price moved +8¢ in our direction
-          • Stop loss   : price moved -5¢ against us
-          • Timeout     : position held > 30 minutes
-        Exits are executed via _execute_order(side="SELL").
+        Background task — fires every 30 seconds.
+
+        Two exit managers in one loop:
+
+        1. EconFlow (_managed_positions in-memory dict):
+           • Take profit : +8¢ gain
+           • Stop loss   : -5¢ loss
+           • Timeout     : 30 min
+
+        2. Momentum (positions DB table, all non-EconFlow rows):
+           • Take profit : +MOMENTUM_TP_CENTS gain (default 15¢)
+           • Stop loss   : -MOMENTUM_SL_CENTS loss (default 7¢)
+           • Trailing stop: once peak gain ≥ MOMENTUM_TRAIL_TRIGGER_CENTS,
+             exit if price drops MOMENTUM_TRAIL_DROP_CENTS from that peak.
+             Locks in profit on a winner instead of giving it all back.
+           • Timeout     : MOMENTUM_TIMEOUT_H hours (default 6h)
         """
         if self._monitor_active:
             self._log("[ECON FLOW] Position monitor already running — skipping duplicate start")
             return
         self._monitor_active = True
-        self._log("[ECON FLOW] Position monitor started")
+        self._log("[POSITION MONITOR] Started (EconFlow TP/SL + Momentum trailing stops)")
         try:
             while self.running:
                 await asyncio.sleep(30)
-                if not self._managed_positions:
+                now = time.time()
+
+                # ── 1. EconFlow managed positions ────────────────────────────
+                if self._managed_positions:
+                    exits = []
+                    for token_id, pos in list(self._managed_positions.items()):
+                        try:
+                            mid = await asyncio.to_thread(self.get_midpoint, token_id)
+                            if mid is None:
+                                continue
+                            entry_p  = pos["entry_price"]
+                            age_min  = (now - pos["entry_time"]) / 60
+                            side     = pos["side"]   # "YES" or "NO"
+                            # mid and entry_p are both on the same token —
+                            # no side-flip needed (inverting for NO would mix
+                            # YES-implied mid vs NO-side entry_price, ~3× error).
+                            current_p = mid
+                            pnl_c     = (current_p - entry_p) * 100
+                            reason = None
+                            if pnl_c >= 8.0:
+                                reason = f"TP +{pnl_c:.1f}¢"
+                            elif pnl_c <= -5.0:
+                                reason = f"SL {pnl_c:.1f}¢"
+                            elif age_min >= 30.0:
+                                reason = f"timeout {age_min:.0f}min (PnL {pnl_c:+.1f}¢)"
+                            if reason:
+                                exits.append((token_id, pos, reason))
+                        except Exception as e:
+                            log.debug(f"position_monitor check error ({token_id[:16]}): {e}")
+
+                    for token_id, pos, reason in exits:
+                        try:
+                            mkt  = pos.get("market", "")
+                            side = pos["side"]
+                            self._log(f"[ECON FLOW] EXIT {side} {mkt[:40]} — {reason}")
+                            shares = pos.get("shares", 0)
+                            amt    = shares if shares > 0 else pos.get("amount_usdc", 1.0)
+                            await self._execute_order(token_id, "SELL", amt, mkt, "market")
+                            self._managed_positions.pop(token_id, None)
+                            self._momentum_position_peaks.pop(token_id, None)
+                            asyncio.create_task(
+                                asyncio.to_thread(self.send_telegram,
+                                                  f"Exit {side} {mkt[:40]}: {reason}"))
+                        except Exception as e:
+                            log.warning(f"position_monitor exit failed ({token_id[:16]}): {e}")
+
+                # ── 2. Momentum trailing-stop exits ──────────────────────────
+                # Skip in paper mode — the paper engine doesn't support SELL.
+                if PAPER_MODE:
+                    continue
+                try:
+                    db_rows = self.db.execute(
+                        "SELECT token_id, market, side, shares, cost, time FROM positions"
+                    ).fetchall()
+                except Exception as _db_e:
+                    log.debug(f"position_monitor DB read error: {_db_e}")
                     continue
 
-                now  = time.time()
-                exits = []
-
-                for token_id, pos in list(self._managed_positions.items()):
+                momentum_exits = []
+                for token_id, market, side, shares, cost, entry_time_str in db_rows:
+                    # EconFlow positions are already handled above; skip them.
+                    if token_id in self._managed_positions:
+                        continue
                     try:
+                        if not shares or shares <= 0 or not cost or cost <= 0:
+                            continue
+                        entry_price = cost / shares
+                        if not (0.01 < entry_price < 0.99):
+                            continue
                         mid = await asyncio.to_thread(self.get_midpoint, token_id)
                         if mid is None:
                             continue
 
-                        entry_p  = pos["entry_price"]
-                        age_min  = (now - pos["entry_time"]) / 60
-                        side     = pos["side"]   # "YES" or "NO"
+                        # Update the in-memory high-water mark.
+                        peak = self._momentum_position_peaks.get(token_id, entry_price)
+                        if mid > peak:
+                            peak = mid
+                            self._momentum_position_peaks[token_id] = peak
 
-                        # mid and entry_p are both measured on the token we hold
-                        # (get_midpoint(token_id) returns that token's own midpoint
-                        # and result["price"] recorded at entry was the same).
-                        # So no side-flip is needed — inverting for NO used to mix
-                        # YES-implied mid against a NO-side entry_price and
-                        # reported ~3x the true P&L, firing TP/SL prematurely.
-                        current_p = mid
-                        pnl_c     = (current_p - entry_p) * 100   # cents
+                        pnl_c      = (mid - entry_price) * 100
+                        peak_gain_c = (peak - entry_price) * 100
+                        drop_from_peak_c = (peak - mid) * 100
+
+                        # Age check
+                        try:
+                            from datetime import timezone as _tz
+                            et = datetime.fromisoformat(entry_time_str).replace(tzinfo=_tz.utc)
+                            age_h = (datetime.now(_tz.utc) - et).total_seconds() / 3600
+                        except Exception:
+                            age_h = 0.0
 
                         reason = None
-                        if pnl_c >= 8.0:
+                        if pnl_c >= MOMENTUM_TP_CENTS:
                             reason = f"TP +{pnl_c:.1f}¢"
-                        elif pnl_c <= -5.0:
+                        elif pnl_c <= -MOMENTUM_SL_CENTS:
                             reason = f"SL {pnl_c:.1f}¢"
-                        elif age_min >= 30.0:
-                            reason = f"timeout {age_min:.0f}min (PnL {pnl_c:+.1f}¢)"
+                        elif (peak_gain_c >= MOMENTUM_TRAIL_TRIGGER_CENTS
+                              and drop_from_peak_c >= MOMENTUM_TRAIL_DROP_CENTS):
+                            reason = (f"TRAIL peak+{peak_gain_c:.1f}¢ → "
+                                      f"now{pnl_c:+.1f}¢ (↓{drop_from_peak_c:.1f}¢)")
+                        elif age_h >= MOMENTUM_TIMEOUT_H:
+                            reason = f"timeout {age_h:.1f}h (PnL {pnl_c:+.1f}¢)"
 
                         if reason:
-                            exits.append((token_id, pos, reason))
+                            momentum_exits.append((token_id, market, side, shares, reason))
                     except Exception as e:
-                        log.debug(f"position_monitor check error ({token_id[:16]}): {e}")
+                        log.debug(f"momentum exit check error ({token_id[:16]}): {e}")
 
-                for token_id, pos, reason in exits:
+                for token_id, market, side_str, shares, reason in momentum_exits:
                     try:
-                        mkt  = pos.get("market", "")
-                        side = pos["side"]
-                        self._log(f"[ECON FLOW] EXIT {side} {mkt[:40]} — {reason}")
-
-                        shares = pos.get("shares", 0)
-                        amt    = shares if shares > 0 else pos.get("amount_usdc", 1.0)
-                        await self._execute_order(token_id, "SELL", amt, mkt, "market")
-
-                        self._managed_positions.pop(token_id, None)
+                        self._log(f"[MOMENTUM EXIT] {side_str} {market[:40]} — {reason}")
+                        await self._execute_order(token_id, "SELL", shares, market, "market")
+                        self._momentum_position_peaks.pop(token_id, None)
                         asyncio.create_task(
                             asyncio.to_thread(self.send_telegram,
-                                              f"Exit {side} {mkt[:40]}: {reason}"))
+                                              f"[Momentum] Exit {side_str} {market[:40]}: {reason}"))
                     except Exception as e:
-                        log.warning(f"position_monitor exit failed ({token_id[:16]}): {e}")
+                        log.warning(f"momentum exit failed ({token_id[:16]}): {e}")
         finally:
             self._monitor_active = False
 
@@ -3148,6 +3239,7 @@ class PolymarketBot:
                     # resolved. The only safe time to drop a position is
                     # right when we settle its trade outcome here.
                     self.db.execute("DELETE FROM positions WHERE token_id=?", (token_id,))
+                    self._momentum_position_peaks.pop(token_id, None)
                 settled += 1
             if settled:
                 self._log(f"[TRADE OUTCOMES] Settled {settled} trade(s) this pass")
@@ -4108,15 +4200,32 @@ class PolymarketBot:
             return None
         if poly_p <= 0 or poly_p >= 1:
             return None
-        q_words = set(w for w in question.lower().split() if len(w) >= 4)
-        if not q_words:
+        _ARB_STOPWORDS = {
+            "will","does","have","been","that","from","with","this","than",
+            "when","where","what","which","there","their","about","would",
+            "could","should","after","before","over","under","more","most",
+            "ever","next","last","year","2024","2025","2026","2027","first",
+            "least","many","some","much","make","take","come","also","just",
+        }
+        q_words = set(
+            w.strip("?.,!") for w in question.lower().split()
+            if len(w.strip("?.,!")) >= 4 and w.strip("?.,!") not in _ARB_STOPWORDS
+        )
+        if len(q_words) < 2:
             return None
+
+        def _topic_match(title: str) -> bool:
+            t_words = set(
+                w.strip("?.,!") for w in title.lower().split()
+                if len(w.strip("?.,!")) >= 4 and w.strip("?.,!") not in _ARB_STOPWORDS
+            )
+            return len(q_words & t_words) >= 2
 
         candidates: list = []
         # Kalshi yes_bid/yes_ask in cents → convert to dollars.
         for m in (kalshi or []):
             title = (m.get("title") or "").lower()
-            if not any(w in title for w in q_words):
+            if not _topic_match(title):
                 continue
             bid, ask = m.get("yes_bid"), m.get("yes_ask")
             if bid is None or ask is None:
@@ -4126,7 +4235,7 @@ class PolymarketBot:
         # Predictit lastTradePrice in dollars.
         for r in (predictit or []):
             text = ((r.get("market") or "") + " " + (r.get("contract") or "")).lower()
-            if not any(w in text for w in q_words):
+            if not _topic_match(text):
                 continue
             last = r.get("last")
             if last is None:
@@ -4135,7 +4244,7 @@ class PolymarketBot:
         # Manifold probability already 0.0-1.0.
         for m in (manifold or []):
             title = (m.get("question") or "").lower()
-            if not any(w in title for w in q_words):
+            if not _topic_match(title):
                 continue
             p = m.get("prob")
             if p is None:
@@ -4982,6 +5091,7 @@ class PolymarketBot:
                 "assessed_at":      datetime.utcnow().isoformat(),
             }
             self._regime_cache_time = time.time()
+            self._regime_fail_streak = 0
             # Telegram alert on *transition* to hostile. Only on the edge, not
             # repeated every assessment, so the operator isn't spammed during
             # sustained hostile periods. Also alert on transition OUT of
@@ -5017,7 +5127,24 @@ class PolymarketBot:
             return self._regime_cache
         except Exception as e:
             log.warning(f"assess_market_regime error: {e}")
-            return self._regime_cache   # return last good value; never block trading on Claude outage
+            self._regime_fail_streak += 1
+            # If Claude has been down for >4h and the cached regime is non-normal,
+            # revert to neutral so a stale cautious/hostile assessment can't
+            # silently suppress trading indefinitely.
+            stale = self._regime_cache_time > 0 and (time.time() - self._regime_cache_time) > 4 * 3600
+            if stale and self._regime_fail_streak >= 3 and self._regime_cache.get("regime") != "normal":
+                log.warning(
+                    "assess_market_regime: cache is %.1fh old and Claude has been unreachable "
+                    "for %d consecutive attempts — reverting to NORMAL to unblock trading",
+                    (time.time() - self._regime_cache_time) / 3600,
+                    self._regime_fail_streak,
+                )
+                self._regime_cache = {
+                    "regime": "normal", "kelly_multiplier": 1.0, "min_edge_add": 0.0,
+                    "reasoning": "auto-reverted: Claude outage >4h, stale non-normal cache cleared",
+                    "assessed_at": datetime.utcnow().isoformat(),
+                }
+            return self._regime_cache
 
     # ── Pre-trade sanity check (Claude Max) ────────────────────────────────
     # Fast Haiku call right before a real order. Reads the current OBI + spread
@@ -6412,7 +6539,7 @@ class PolymarketBot:
 
         if STRATEGY == "momentum":
             dev = abs(yes_p - 0.5)
-            if dev > 0.08:
+            if dev > 0.05:
                 macro = self.get_macro_context()
                 weather = self.get_weather_context()
                 fmp = self.get_fmp_market()
@@ -6508,7 +6635,7 @@ class PolymarketBot:
         # ── "both" also runs momentum as a fallback ─────────────────────────────
         if STRATEGY == "both":
             dev = abs(yes_p - 0.5)
-            if dev > 0.08:
+            if dev > 0.05:
                 macro   = self.get_macro_context()
                 fmp     = self.get_fmp_market()
                 sentiment = fmp.get("_sentiment", {})
@@ -8014,9 +8141,8 @@ async def lifespan(app_: FastAPI):
         if PAPER_MODE and _PAPER_AVAILABLE and bot.paper:
             bot.start_paper_oracle()
             log.info("[PAPER] Resolution oracle started (5 min interval)")
-        if STRATEGY in ("econFlow", "both"):
-            asyncio.create_task(bot.position_monitor_loop())
-            log.info("[ECON FLOW] Position monitor started (30s interval)")
+        asyncio.create_task(bot.position_monitor_loop())
+        log.info("[POSITION MONITOR] Started (EconFlow TP/SL + Momentum trailing stops, 30s interval)")
         # Nightly strategy review — runs daily at ~00:05 UTC.
         if NIGHTLY_REVIEW_ENABLED and ANTHROPIC_API_KEY:
             bot._nightly_review_task = asyncio.create_task(bot._nightly_review_loop())
@@ -8493,9 +8619,8 @@ async def start_bot(interval: Optional[float] = None):
         if bot.paper:
             bot.start_paper_oracle()
             log.info("[PAPER] Resolution oracle restarted")
-    if STRATEGY in ("econFlow", "both"):
-        asyncio.create_task(bot.position_monitor_loop())
-        log.info("[ECON FLOW] Position monitor restarted")
+    asyncio.create_task(bot.position_monitor_loop())
+    log.info("[POSITION MONITOR] Restarted (EconFlow TP/SL + Momentum trailing stops)")
     return {"ok": True, "message": "Bot started"}
 
 
