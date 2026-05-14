@@ -218,7 +218,7 @@ PRETRADE_TIMEOUT_S     = float(os.getenv("PRETRADE_TIMEOUT_S", "4.0"))
 #                      (default 35 — skips weak signals that rarely turn
 #                      into trades anyway and saves ~50% of AI calls)
 SCAN_INTERVAL_S        = float(os.getenv("SCAN_INTERVAL_S",   "60.0"))
-AI_MIN_CONFIDENCE      = float(os.getenv("AI_MIN_CONFIDENCE", "35.0"))
+AI_MIN_CONFIDENCE      = float(os.getenv("AI_MIN_CONFIDENCE", "20.0"))
 # Brier-score resolver throughput. The original 50/6h was a 200/day ceiling
 # that fell behind whenever resolved-market volume spiked (we observed an
 # 11.5k pending backlog on 2026-04-27, starving the calibrator of training
@@ -2202,7 +2202,7 @@ class PolymarketBot:
         # Signal 2: Gas multiplier
         gas_mult = self._gas_cache.get("multiplier", 1.0)
         if gas_mult >= 4.0:   score += 3
-        elif gas_mult >= 2.5: score += 2
+        elif gas_mult >= 2.5: score += 1
         elif gas_mult >= 1.5: score += 1
 
         # Signal 3: Price velocity across scanned markets
@@ -6883,7 +6883,7 @@ class PolymarketBot:
                             self._daily_loss_attenuation = 1.0
 
                 _ai_failures = 0  # circuit breaker: disable AI mid-cycle after 3 consecutive failures
-                markets = await asyncio.to_thread(self.get_markets, 30)
+                markets = await asyncio.to_thread(self.get_markets, 50)
                 self._bump_skip("markets_scanned", len(markets))
                 self._log(f"Scanning {len(markets)} markets…")
 
