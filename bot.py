@@ -1072,11 +1072,7 @@ class PolymarketBot:
     def get_markets(self, limit: int = 20) -> list:
         try:
             import urllib.request, json as _j
-            # Fetch a larger pool than `limit` so the keyword/category filter
-            # below has room to drop excluded markets without starving the
-            # downstream signal loop. 3x is enough headroom — exclusion on the
-            # historical default list filters ~10-30% of the volume-sorted top.
-            fetch_n = max(limit, 60)
+            fetch_n = limit
             url = f"https://gamma-api.polymarket.com/markets?active=true&closed=false&limit={fetch_n}&order=volume24hr&ascending=false"
             req = urllib.request.Request(url, headers={"User-Agent": "polybot/1.0"})
             with urllib.request.urlopen(req, timeout=10) as r:
@@ -7038,7 +7034,7 @@ class PolymarketBot:
                             self._daily_loss_attenuation = 1.0
 
                 _ai_failures = 0  # circuit breaker: disable AI mid-cycle after 3 consecutive failures
-                markets = await asyncio.to_thread(self.get_markets, 100)
+                markets = await asyncio.to_thread(self.get_markets, 300)
                 self._bump_skip("markets_scanned", len(markets))
                 self._log(f"Scanning {len(markets)} markets…")
 
