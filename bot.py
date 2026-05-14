@@ -3975,9 +3975,9 @@ class PolymarketBot:
         # Crypto
         ("CoinDesk",       "https://www.coindesk.com/arc/outboundfeeds/rss"),
         # Sports (NFL/NBA markets are frequent on Polymarket)
-        ("ESPN",           "https://www.espn.com/espn/rss/news"),
-        ("ESPN-NFL",       "https://www.espn.com/espn/rss/nfl/news"),
-        ("ESPN-NBA",       "https://www.espn.com/espn/rss/nba/news"),
+        ("ESPN",           "https://news.google.com/rss/search?q=when:1d+site:espn.com&hl=en-US&gl=US&ceid=US:en"),
+        ("ESPN-NFL",       "https://news.google.com/rss/search?q=when:1d+NFL+site:espn.com&hl=en-US&gl=US&ceid=US:en"),
+        ("ESPN-NBA",       "https://news.google.com/rss/search?q=when:1d+NBA+site:espn.com&hl=en-US&gl=US&ceid=US:en"),
         # Regulatory / catalysts
         ("FDA",            "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml"),
     )
