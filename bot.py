@@ -3,7 +3,7 @@ Polymarket Trading Bot — migrated to py_clob_client_v2 for CLOB V2 (Apr 28 202
 """
 import asyncio, json, logging, os, time, sqlite3, re as _re_mod
 from collections import deque
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 # Brier-score self-calibration helper. Reads historical predicted_prob vs
 # actual_outcome from brier_scores and shrinks future predictions toward
 # the realized base rate. Silent no-op until there are ≥30 resolved rows.
@@ -6565,9 +6565,8 @@ class PolymarketBot:
             _end_str = market.get("endDate") or ""
             if _end_str:
                 try:
-                    from datetime import datetime as _dt, timezone as _tz
-                    _end = _dt.fromisoformat(_end_str.replace("Z", "+00:00"))
-                    _hours_left = (_end - _dt.now(_tz.utc)).total_seconds() / 3600
+                    _end = datetime.fromisoformat(_end_str.replace("Z", "+00:00"))
+                    _hours_left = (_end - datetime.now(timezone.utc)).total_seconds() / 3600
                     if LATE_RES_MIN_HOURS <= _hours_left <= LATE_RES_MAX_HOURS:
                         _no_price = round(1.0 - yes_p, 4)
                         _lr_conf  = round((yes_p - LATE_RES_MIN_YES_P) / (1.0 - LATE_RES_MIN_YES_P) * 80, 1)
@@ -6622,30 +6621,37 @@ class PolymarketBot:
             # We follow their direction (price side that's deviating from 0.5).
             _mkt_id = str(market.get("id") or market.get("conditionId", ""))
             if _mkt_id:
+                # Bound cache: when over 10k entries, drop ~half. Cheaper than
+                # tracking resolved markets and prevents slow memory growth
+                # from accumulated entries across weeks of running.
+                if len(self._volume_cache) > 10_000:
+                    for _k in list(self._volume_cache.keys())[:5_000]:
+                        self._volume_cache.pop(_k, None)
                 _last_vol = self._volume_cache.get(_mkt_id)
                 _vol_delta = (vol - _last_vol) if _last_vol is not None and vol >= _last_vol else 0
                 self._volume_cache[_mkt_id] = vol
                 if _vol_delta >= VOLUME_SPIKE_MIN_DELTA:
                     _dev_vs = abs(yes_p - 0.5)
-                    if _dev_vs > 0.02 and no_id:
+                    if _dev_vs > 0.02:
                         _side_vs  = "YES" if yes_p > 0.5 else "NO"
                         _tid_vs   = yes_id if yes_p > 0.5 else no_id
                         _price_vs = yes_p if yes_p > 0.5 else (1 - yes_p)
-                        _conf_vs  = min(85.0, 25.0 + _vol_delta / 200)
-                        self._log(
-                            f"VOL SPIKE: {question[:60]} "
-                            f"+${_vol_delta:,.0f} in 60s → {_side_vs}@{_price_vs:.3f}"
-                        )
-                        return {
-                            "strategy": "momentum",
-                            "signal": f"BUY {_side_vs} (vol spike +${_vol_delta:,.0f})",
-                            "token_id": _tid_vs,
-                            "price": _price_vs,
-                            "confidence": round(_conf_vs, 1),
-                            "market": question,
-                            "amount": min(MAX_ORDER_SIZE, max(MAX_ORDER_SIZE * 0.3,
-                                          MAX_ORDER_SIZE * _vol_delta / 5000)),
-                        }
+                        if _tid_vs:
+                            _conf_vs  = min(85.0, 25.0 + _vol_delta / 200)
+                            self._log(
+                                f"VOL SPIKE: {question[:60]} "
+                                f"+${_vol_delta:,.0f} in 60s → {_side_vs}@{_price_vs:.3f}"
+                            )
+                            return {
+                                "strategy": "momentum",
+                                "signal": f"BUY {_side_vs} (vol spike +${_vol_delta:,.0f})",
+                                "token_id": _tid_vs,
+                                "price": _price_vs,
+                                "confidence": round(_conf_vs, 1),
+                                "market": question,
+                                "amount": min(MAX_ORDER_SIZE, max(MAX_ORDER_SIZE * 0.3,
+                                              MAX_ORDER_SIZE * _vol_delta / 5000)),
+                            }
             dev = abs(yes_p - 0.5)
             if dev > 0.05:
                 macro = self.get_macro_context()
