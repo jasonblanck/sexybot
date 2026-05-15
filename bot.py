@@ -1264,6 +1264,21 @@ class PolymarketBot:
                 f">= {MAX_ENTRY_PRICE:.2f} — refused"
             )
             return result
+        # Polymarket CLOB rejects market orders that would settle outside
+        # [0.01, 0.99] with "invalid price" — but winning positions trading
+        # at 0.995+ will hit exactly that case. Fall back to a limit order
+        # at the boundary so trailing-stop / take-profit exits still fire.
+        if (not DRY_RUN and str(side).upper() == "SELL"
+                and (price > 0.99 or price < 0.01)):
+            capped = 0.99 if price > 0.99 else 0.01
+            self._log(
+                f"PRICE CLAMP [bot]: SELL midpoint {price:.4f} outside "
+                f"[0.01, 0.99] — converting to limit @ {capped}"
+            )
+            # amount_usdc here is actually shares for SELL (caller convention).
+            return self.place_limit_order(
+                token_id, "SELL", capped, amount_usdc, attribution=attribution,
+            )
         if DRY_RUN:
             result["status"] = "simulated"
             self._log(f"[DRY RUN] {side} ${amount_usdc:.2f} @ {price:.4f} — token {token_id[:16]}…")
