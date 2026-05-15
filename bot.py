@@ -7795,7 +7795,13 @@ class PolymarketBot:
                                     total_exp = sum(exp_map.values())
                                     new_total = total_exp + amt
                                     new_cat_pct = (cat_exp + amt) / new_total if new_total > 0 else 0.0
-                                    if new_cat_pct > MAX_CATEGORY_EXPOSURE_PCT:
+                                    # Bootstrap exemption: when the book is essentially empty
+                                    # (total exposure under $20), the first trade is always
+                                    # 100% of its category by definition. Skip the cap so we
+                                    # can ever open a first position; once a few trades exist,
+                                    # the cap engages normally.
+                                    _bootstrap = total_exp < 20.0
+                                    if new_cat_pct > MAX_CATEGORY_EXPOSURE_PCT and not _bootstrap:
                                         self._log(
                                             f"[CONCENTRATION] skip {cat!r}: would be "
                                             f"{new_cat_pct*100:.1f}% of book (cap "
