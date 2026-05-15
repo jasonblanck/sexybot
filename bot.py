@@ -2736,11 +2736,24 @@ class PolymarketBot:
                 return getattr(obj, key, default)
             bids = _attr(book, "bids", []) or []
             asks = _attr(book, "asks", []) or []
-            best_bid = float(_attr(bids[0], "price", 0)) if bids else 0
-            best_ask = float(_attr(asks[0], "price", 1)) if asks else 1
+            # Polymarket CLOB returns bids sorted ascending (lowest price first)
+            # and asks sorted descending (highest price first), so the BEST
+            # quotes sit at the tail of each list. Reading bids[0]/asks[0]
+            # gave us the dust orders at 0.001/0.999 and produced a fake 0.98
+            # spread on every market — single biggest reason the bot stopped
+            # trading. Use max/min explicitly so this stays correct even if
+            # the SDK ever changes its sort order.
+            bid_prices = [float(_attr(b, "price", 0)) for b in bids]
+            ask_prices = [float(_attr(a, "price", 1)) for a in asks]
+            best_bid = max(bid_prices) if bid_prices else 0
+            best_ask = min(ask_prices) if ask_prices else 1
             spread = round(best_ask - best_bid, 4)
-            bid_depth = sum(float(_attr(b, "size", 0)) for b in bids[:5])
-            ask_depth = sum(float(_attr(a, "size", 0)) for a in asks[:5])
+            # Depth uses the best-priced 5 levels on each side. Sort first so
+            # the same bug can't smuggle dust sizes into the depth metric.
+            bids_sorted = sorted(bids, key=lambda b: float(_attr(b, "price", 0)), reverse=True)
+            asks_sorted = sorted(asks, key=lambda a: float(_attr(a, "price", 1)))
+            bid_depth = sum(float(_attr(b, "size", 0)) for b in bids_sorted[:5])
+            ask_depth = sum(float(_attr(a, "size", 0)) for a in asks_sorted[:5])
             total_depth = bid_depth + ask_depth
             obi = round((bid_depth - ask_depth) / total_depth, 3) if total_depth > 0 else 0
             return {
