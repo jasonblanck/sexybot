@@ -8323,8 +8323,14 @@ class PolymarketBot:
         return self._pnl_cache
 
     def get_state(self) -> dict:
-        cash = self.get_balance()
-        positions = self.get_positions_value()
+        # Read cached values only — never trigger a network fetch from this
+        # path. The cache_warmer background task refreshes balance/positions
+        # every 45s, so /status always returns within a few ms. Previously
+        # get_balance()/get_positions_value() could block here for up to 8s
+        # on a cold cache, saturating the FastAPI threadpool and 504'ing the
+        # dashboard.
+        cash = self._balance_cache if self._balance_cache is not None else 0.0
+        positions = self._positions_cache if self._positions_cache else 0.0
         now = time.time()
         active_cooldowns = sum(1 for ts in self._error_cooldown.values() if ts > now)
         d = {
@@ -8471,6 +8477,21 @@ async def lifespan(app_: FastAPI):
             log.info("[PAPER] Resolution oracle started (5 min interval)")
         asyncio.create_task(bot.position_monitor_loop())
         log.info("[POSITION MONITOR] Started (EconFlow TP/SL + Momentum trailing stops, 30s interval)")
+        # Background cache warmer — keeps balance/positions_value caches hot
+        # so the /status handler never has to do a blocking urllib fetch.
+        # Without this, the FIRST /status call after restart triggers ~8s of
+        # synchronous network I/O on the threadpool, queueing other requests
+        # behind it (root cause of the 504 storms we saw on the dashboard).
+        async def _cache_warmer():
+            while True:
+                try:
+                    await asyncio.to_thread(bot.get_balance, True)
+                    await asyncio.to_thread(bot.get_positions_value, True)
+                except Exception as _w_e:
+                    log.debug(f"cache_warmer error: {_w_e}")
+                await asyncio.sleep(45)
+        asyncio.create_task(_cache_warmer())
+        log.info("[CACHE WARMER] balance/positions_value refreshed every 45s")
         # Nightly strategy review — runs daily at ~00:05 UTC.
         if NIGHTLY_REVIEW_ENABLED and ANTHROPIC_API_KEY:
             bot._nightly_review_task = asyncio.create_task(bot._nightly_review_loop())
