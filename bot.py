@@ -2072,19 +2072,35 @@ class PolymarketBot:
                     log.debug(f"position_monitor DB read error: {_db_e}")
                     continue
 
-                momentum_exits = []
-                for token_id, market, side, shares, cost, entry_time_str in db_rows:
-                    # EconFlow positions are already handled above; skip them.
+                # Pre-filter eligible rows and fetch all midpoints in parallel.
+                # Was sequential before — 25 positions × 200ms = ~5s of every
+                # 30s monitor cycle on HTTP roundtrips. Parallel gather drops
+                # this to ~300ms total.
+                eligible = []
+                for r in db_rows:
+                    token_id, _market, _side, shares, cost, _t = r
                     if token_id in self._managed_positions:
                         continue
+                    if not shares or shares <= 0 or not cost or cost <= 0:
+                        continue
+                    entry_price = cost / shares
+                    if not (0.01 < entry_price < 0.99):
+                        continue
+                    eligible.append((r, entry_price))
+
+                if eligible:
+                    mids = await asyncio.gather(
+                        *(asyncio.to_thread(self.get_midpoint, e[0][0]) for e in eligible),
+                        return_exceptions=True,
+                    )
+                else:
+                    mids = []
+
+                momentum_exits = []
+                for (row, entry_price), mid in zip(eligible, mids):
+                    token_id, market, side, shares, cost, entry_time_str = row
                     try:
-                        if not shares or shares <= 0 or not cost or cost <= 0:
-                            continue
-                        entry_price = cost / shares
-                        if not (0.01 < entry_price < 0.99):
-                            continue
-                        mid = await asyncio.to_thread(self.get_midpoint, token_id)
-                        if mid is None:
+                        if isinstance(mid, BaseException) or mid is None:
                             continue
 
                         # Update the in-memory high-water mark.
@@ -2097,11 +2113,10 @@ class PolymarketBot:
                         peak_gain_c = (peak - entry_price) * 100
                         drop_from_peak_c = (peak - mid) * 100
 
-                        # Age check
+                        # Age check (timezone already imported at module scope)
                         try:
-                            from datetime import timezone as _tz
-                            et = datetime.fromisoformat(entry_time_str).replace(tzinfo=_tz.utc)
-                            age_h = (datetime.now(_tz.utc) - et).total_seconds() / 3600
+                            et = datetime.fromisoformat(entry_time_str).replace(tzinfo=timezone.utc)
+                            age_h = (datetime.now(timezone.utc) - et).total_seconds() / 3600
                         except Exception:
                             age_h = 0.0
 
