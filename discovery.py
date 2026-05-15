@@ -204,15 +204,39 @@ _INTERNAL_CATEGORY_KEYWORDS = {
                  "house of representatives","supreme court","impeach"],
     "crypto":   ["bitcoin","ethereum","btc","eth","solana","sol ","crypto","blockchain",
                  "polygon","matic","usdt","usdc","defi","nft","stablecoin","altcoin",
-                 "dogecoin","xrp","cardano","ada ","chainlink","link "],
+                 "dogecoin","xrp","cardano","ada ","chainlink","link ",
+                 # MicroStrategy / corporate-BTC treasuries + memecoin set
+                 "microstrategy","mstr","pepe","bonk","wif"],
     "sports":   ["super bowl","world cup","world series","nba","nfl","mlb","nhl","mls",
                  "champions league","playoffs","tournament","olympics","formula 1","f1 ",
                  "boxing","mma","ufc","grand slam","open championship","masters","fifa",
-                 "quarterback","qb ","team "],
+                 "quarterback","qb ","team ",
+                 # Game-format markets ("Team A vs. Team B", "Spread: …")
+                 " vs.", " vs ", "spread:", "moneyline", "o/u ", "over/under",
+                 # Tennis
+                 "tennis","atp ","wta ",
+                 # Golf
+                 "pga","golf","scheffler",
+                 # Hockey
+                 "stanley cup","hockey",
+                 # Soccer leagues outside top-5 — Polymarket has these in volume
+                 "süper lig","super lig","serie a","la liga","bundesliga",
+                 "ligue 1","eredivisie","liga mx","brasileirão","j-league",
+                 # Cricket / rugby
+                 "ipl ","cricket","rugby",
+                 # Polymarket football match outcome questions
+                 # (standard format: "Will <club> win on YYYY-MM-DD?" — catches
+                 # all Süper Lig, Saudi Pro League, La Liga, etc.)
+                 "win on 2025-","win on 2026-","win on 2027-",
+                 # Esports
+                 "dota","csgo","valorant","league of legends","lol "],
     "macro":    ["fed ","federal reserve","fomc","interest rate","rate hike","rate cut",
                  "cpi","ppi","inflation","gdp","recession","jobs report","unemployment",
                  "nonfarm payroll","payrolls","jobless","labor market","dollar index",
-                 "dxy","yield curve","treasury","bond","tariff","trade war","pce"],
+                 "dxy","yield curve","treasury","bond","tariff","trade war","pce",
+                 # Commodities / energy — fall under macro for our purposes
+                 "wti","brent","crude oil","oil price","gasoline","natural gas",
+                 "gold price","silver price"],
     "legal":    ["indicted","indictment","trial","court","lawsuit","ruling","judge",
                  "convicted","charged","plea","verdict","sentenced","supreme court",
                  "appellate","docket","hearing","prosecutor","defendant"],

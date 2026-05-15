@@ -567,6 +567,7 @@ class PolymarketBot:
         self._last_review_at: float = 0.0
         # Brier resolver task handle
         self._brier_resolver_task: Optional[asyncio.Task] = None
+        self._arb_scanner_task: Optional[asyncio.Task] = None
         # Per-token error cooldown. After place_market_order / place_limit_order
         # errors, the same token is blocked for ERROR_COOLDOWN_SEC. Without
         # this, a market with a structurally thin book gets re-tried every
@@ -3261,6 +3262,71 @@ class PolymarketBot:
             except asyncio.CancelledError:
                 break
 
+    async def _arb_scanner_loop(self):
+        """Periodic cross-market arb detector. Decoupled from the Claude AI
+        enrichment path so it keeps producing `arb_signals` rows even when
+        CLAUDE_MAX_DISABLE=true. Pulls the top N Polymarket markets and the
+        (cached) Kalshi/Predictit/Manifold peer data, then runs detect_arb_gap
+        on each. Detector only — never executes a trade.
+
+        Why a separate loop: pre-2026-05-15 the arb detection was nested
+        inside the AI enrichment block, so disabling Claude (e.g. for spend
+        budget) silently killed arb_signals too. This loop runs the same
+        detect_arb_gap call independently."""
+        try:
+            await asyncio.sleep(120)   # boot grace period
+        except asyncio.CancelledError:
+            return
+        interval_s = int(os.getenv("ARB_SCAN_INTERVAL_S", "300"))
+        scan_limit = int(os.getenv("ARB_SCAN_LIMIT", "50"))
+        while self.running:
+            try:
+                if not ARB_ALERT_ENABLED:
+                    await asyncio.sleep(interval_s)
+                    continue
+                markets = await asyncio.to_thread(self.get_markets, scan_limit)
+                if not markets:
+                    await asyncio.sleep(interval_s)
+                    continue
+                # All three peer fetches are cached (5min) so calling each
+                # once per scan is essentially free when the cache is warm.
+                kalshi    = await asyncio.to_thread(self.get_kalshi_top)
+                predictit = await asyncio.to_thread(self.get_predictit_markets)
+                manifold  = await asyncio.to_thread(self.get_manifold_top)
+                _hits = 0
+                for m in markets:
+                    try:
+                        question = m.get("question") or ""
+                        token_ids_raw = m.get("clobTokenIds") or "[]"
+                        prices_raw    = m.get("outcomePrices") or "[0.5,0.5]"
+                        import json as _j
+                        token_ids = _j.loads(token_ids_raw) if isinstance(token_ids_raw, str) else token_ids_raw
+                        prices    = _j.loads(prices_raw)    if isinstance(prices_raw,    str) else prices_raw
+                        if not token_ids or not prices:
+                            continue
+                        result = self.detect_arb_gap(
+                            question=question,
+                            token_id=str(token_ids[0]),
+                            polymarket_yes_price=float(prices[0]),
+                            kalshi=kalshi or [],
+                            predictit=predictit or [],
+                            manifold=manifold or [],
+                        )
+                        if result:
+                            _hits += 1
+                    except Exception as _e:
+                        log.debug(f"arb-scanner per-market error: {_e}")
+                if _hits:
+                    self._log(f"[ARB SCAN] {_hits} divergence(s) detected this pass")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.debug(f"arb scanner loop error: {e}")
+            try:
+                await asyncio.sleep(interval_s)
+            except asyncio.CancelledError:
+                break
+
     async def _db_maintenance_loop(self):
         """Daily SQLite housekeeping. Runs once per 24h:
           - VACUUM       — reclaims space, keeps query latency flat as
@@ -3391,19 +3457,21 @@ class PolymarketBot:
 
     def get_category_exposure(self) -> dict:
         """Return {category: open_cost_usdc} for currently-open positions.
-        Joins `positions` to the most-recent BUY in `trades` on token_id
-        to attribute category. Used by the per-trade concentration check.
-        Empty dict on any DB error so the caller can fail open."""
+        Categorises each position via the LIVE `classify_internal_category`
+        (not the stored `trades.category`, which is frozen at fill time and
+        becomes stale when the classifier improves).
+
+        Used by the per-trade concentration check. Empty dict on any DB
+        error so the caller can fail open."""
         try:
-            rows = self.db.execute(
-                "SELECT COALESCE(t.category, 'unknown') AS cat, "
-                "       SUM(p.cost) "
-                "FROM positions p "
-                "LEFT JOIN trades t ON p.token_id = t.token_id "
-                "     AND t.side LIKE 'BUY%' AND t.dry_run = 0 "
-                "GROUP BY COALESCE(t.category, 'unknown')"
-            ).fetchall()
-            return {str(r[0] or "unknown"): float(r[1] or 0.0) for r in rows}
+            from discovery import classify_internal_category as _cic
+            exposure: dict[str, float] = {}
+            for market, cost in self.db.execute(
+                "SELECT p.market, p.cost FROM positions p"
+            ).fetchall():
+                cat = _cic(market or "") or "other"
+                exposure[cat] = exposure.get(cat, 0.0) + float(cost or 0.0)
+            return exposure
         except Exception as e:
             log.warning(f"get_category_exposure error: {e}")
             return {}
@@ -8508,6 +8576,11 @@ async def lifespan(app_: FastAPI):
         # calibration data into the nightly review. Independent of Claude.
         bot._brier_resolver_task = asyncio.create_task(bot._brier_resolver_loop())
         log.info(f"[BRIER] Calibration resolver scheduled (every {BRIER_RESOLVE_INTERVAL_S}s, limit {BRIER_RESOLVE_LIMIT}/pass)")
+        # Cross-market arb scanner — runs independent of Claude AI enrichment
+        # so arb_signals keep flowing when CLAUDE_MAX_DISABLE=true.
+        if ARB_ALERT_ENABLED:
+            bot._arb_scanner_task = asyncio.create_task(bot._arb_scanner_loop())
+            log.info("[ARB SCAN] Periodic detector scheduled (independent of Claude)")
         # Weekly scheduled backtester — fires Sundays 01:00 UTC to compound
         # insights from resolved trades. Operator can still click RUN.
         if BACKTEST_WEEKLY_ENABLED and ANTHROPIC_API_KEY:
@@ -8547,6 +8620,8 @@ async def lifespan(app_: FastAPI):
         bot._nightly_review_task.cancel()
     if bot._brier_resolver_task and not bot._brier_resolver_task.done():
         bot._brier_resolver_task.cancel()
+    if bot._arb_scanner_task and not bot._arb_scanner_task.done():
+        bot._arb_scanner_task.cancel()
     if bot._weekly_backtest_task and not bot._weekly_backtest_task.done():
         bot._weekly_backtest_task.cancel()
     if bot._db_maintenance_task and not bot._db_maintenance_task.done():
