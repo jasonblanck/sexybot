@@ -2008,6 +2008,11 @@ class PolymarketBot:
                             self._log(f"[ECON FLOW] EXIT {side} {mkt[:40]} — {reason}")
                             shares = pos.get("shares", 0)
                             amt    = shares if shares > 0 else pos.get("amount_usdc", 1.0)
+                            # 1% safety margin — DB-stored shares overshoot actual
+                            # on-chain balance by ~0.5-1.3% (fill rounding). Polymarket
+                            # rejects "balance is not enough" if we ask for more than
+                            # we hold; trim slightly. Dust recoverable at redemption.
+                            amt = round(amt * 0.99, 4)
                             await self._execute_order(token_id, "SELL", amt, mkt, "market")
                             self._managed_positions.pop(token_id, None)
                             self._momentum_position_peaks.pop(token_id, None)
@@ -2082,7 +2087,11 @@ class PolymarketBot:
                 for token_id, market, side_str, shares, reason in momentum_exits:
                     try:
                         self._log(f"[MOMENTUM EXIT] {side_str} {market[:40]} — {reason}")
-                        await self._execute_order(token_id, "SELL", shares, market, "market")
+                        # 1% safety margin — DB-stored shares overshoot on-chain
+                        # balance from fill rounding; "balance is not enough" reject
+                        # otherwise. Same fix as EconFlow exit above.
+                        sell_amt = round(shares * 0.99, 4)
+                        await self._execute_order(token_id, "SELL", sell_amt, market, "market")
                         self._momentum_position_peaks.pop(token_id, None)
                         asyncio.create_task(
                             asyncio.to_thread(self.send_telegram,
