@@ -2012,8 +2012,12 @@ class PolymarketBot:
                             # entirely (redemption / out-of-band sell). Skip if dust
                             # or zero; clip to actual otherwise.
                             on_chain = await asyncio.to_thread(self.get_share_balance, token_id)
+                            if on_chain is None:
+                                # API hiccup — try again next monitor tick, do NOT prune.
+                                self._log(f"[ECON FLOW] SKIP-EXIT {mkt[:40]} — balance query failed; will retry")
+                                continue
                             if on_chain < 0.5:
-                                self._log(f"[ECON FLOW] SKIP-EXIT {mkt[:40]} — on-chain balance {on_chain} too low; pruning pos")
+                                self._log(f"[ECON FLOW] PRUNE {mkt[:40]} — on-chain balance {on_chain} (dust/redeemed)")
                                 self._managed_positions.pop(token_id, None)
                                 self._momentum_position_peaks.pop(token_id, None)
                                 continue
@@ -2096,8 +2100,12 @@ class PolymarketBot:
                         # and resolved/redeemed positions may have zero balance
                         # despite still appearing in the DB). Skip dust.
                         on_chain = await asyncio.to_thread(self.get_share_balance, token_id)
+                        if on_chain is None:
+                            # API hiccup — try again next tick, do NOT prune.
+                            self._log(f"[MOMENTUM] SKIP-EXIT {market[:40]} — balance query failed; will retry")
+                            continue
                         if on_chain < 0.5:
-                            self._log(f"[MOMENTUM] SKIP-EXIT {market[:40]} — on-chain balance {on_chain} too low; pruning row")
+                            self._log(f"[MOMENTUM] PRUNE {market[:40]} — on-chain balance {on_chain} (dust/redeemed)")
                             try:
                                 with self.db:
                                     self.db.execute("DELETE FROM positions WHERE token_id=?", (token_id,))
@@ -5062,7 +5070,7 @@ class PolymarketBot:
         Cached 10 minutes. Safe fallback on any error: returns the last
         cached value (initially 'normal' with no adjustments) so a Claude
         outage never blocks trading."""
-        if not REGIME_DETECTOR_ENABLED or not ANTHROPIC_API_KEY:
+        if not REGIME_DETECTOR_ENABLED or not ANTHROPIC_API_KEY or CLAUDE_MAX_DISABLED:
             return self._regime_cache
         if not force and time.time() - self._regime_cache_time < 600:
             return self._regime_cache
@@ -7999,15 +8007,15 @@ class PolymarketBot:
     _positions_cache: float = 0.0
     _positions_cache_time: float = 0.0
 
-    def get_share_balance(self, token_id: str) -> float:
+    def get_share_balance(self, token_id: str) -> Optional[float]:
         """Fetch on-chain share balance for a specific outcome token.
-        Returns 0.0 if the call fails or no balance. Used by the position
-        monitor to size SELL orders correctly (DB-stored share counts
-        overshoot actual on-chain holdings by ~1% from fill rounding, and
-        positions can disappear entirely after redemption or out-of-band
-        sells — both produce 'balance is not enough' rejects)."""
+        Returns the balance (>=0) on success, or None on API error.
+        Callers MUST distinguish None ('unknown — don't prune') from 0.0
+        ('confirmed empty — safe to prune'). Earlier version returned 0.0
+        on failure, which would silently delete legitimate positions
+        whenever the CLOB had a transient outage."""
         if not self.client or not token_id:
-            return 0.0
+            return None
         try:
             from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
             params = BalanceAllowanceParams(
@@ -8019,8 +8027,8 @@ class PolymarketBot:
             raw = float(result.get("balance", 0))
             return round(raw / 1_000_000, 4)
         except Exception as e:
-            log.debug(f"get_share_balance({token_id[:16]}) failed: {e}")
-            return 0.0
+            log.warning(f"get_share_balance({token_id[:16]}) failed: {e}")
+            return None
 
     def get_balance(self, force: bool = False) -> float:
         """Fetch USDC.e cash balance for the proxy wallet. Cached 30s.
