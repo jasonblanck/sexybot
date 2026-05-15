@@ -2005,14 +2005,20 @@ class PolymarketBot:
                         try:
                             mkt  = pos.get("market", "")
                             side = pos["side"]
-                            self._log(f"[ECON FLOW] EXIT {side} {mkt[:40]} — {reason}")
                             shares = pos.get("shares", 0)
                             amt    = shares if shares > 0 else pos.get("amount_usdc", 1.0)
-                            # 1% safety margin — DB-stored shares overshoot actual
-                            # on-chain balance by ~0.5-1.3% (fill rounding). Polymarket
-                            # rejects "balance is not enough" if we ask for more than
-                            # we hold; trim slightly. Dust recoverable at redemption.
-                            amt = round(amt * 0.99, 4)
+                            # Query actual on-chain balance — DB count overshoots
+                            # by ~1% (fill rounding) and positions sometimes vanish
+                            # entirely (redemption / out-of-band sell). Skip if dust
+                            # or zero; clip to actual otherwise.
+                            on_chain = await asyncio.to_thread(self.get_share_balance, token_id)
+                            if on_chain < 0.5:
+                                self._log(f"[ECON FLOW] SKIP-EXIT {mkt[:40]} — on-chain balance {on_chain} too low; pruning pos")
+                                self._managed_positions.pop(token_id, None)
+                                self._momentum_position_peaks.pop(token_id, None)
+                                continue
+                            amt = round(min(amt, on_chain) * 0.999, 4)
+                            self._log(f"[ECON FLOW] EXIT {side} {mkt[:40]} — {reason} (sell {amt})")
                             await self._execute_order(token_id, "SELL", amt, mkt, "market")
                             self._managed_positions.pop(token_id, None)
                             self._momentum_position_peaks.pop(token_id, None)
@@ -2086,11 +2092,21 @@ class PolymarketBot:
 
                 for token_id, market, side_str, shares, reason in momentum_exits:
                     try:
-                        self._log(f"[MOMENTUM EXIT] {side_str} {market[:40]} — {reason}")
-                        # 1% safety margin — DB-stored shares overshoot on-chain
-                        # balance from fill rounding; "balance is not enough" reject
-                        # otherwise. Same fix as EconFlow exit above.
-                        sell_amt = round(shares * 0.99, 4)
+                        # Query actual on-chain balance (DB overshoots by ~1%,
+                        # and resolved/redeemed positions may have zero balance
+                        # despite still appearing in the DB). Skip dust.
+                        on_chain = await asyncio.to_thread(self.get_share_balance, token_id)
+                        if on_chain < 0.5:
+                            self._log(f"[MOMENTUM] SKIP-EXIT {market[:40]} — on-chain balance {on_chain} too low; pruning row")
+                            try:
+                                with self.db:
+                                    self.db.execute("DELETE FROM positions WHERE token_id=?", (token_id,))
+                            except Exception:
+                                pass
+                            self._momentum_position_peaks.pop(token_id, None)
+                            continue
+                        sell_amt = round(min(shares, on_chain) * 0.999, 4)
+                        self._log(f"[MOMENTUM EXIT] {side_str} {market[:40]} — {reason} (sell {sell_amt})")
                         await self._execute_order(token_id, "SELL", sell_amt, market, "market")
                         self._momentum_position_peaks.pop(token_id, None)
                         asyncio.create_task(
@@ -7982,6 +7998,29 @@ class PolymarketBot:
     _balance_cache_time: float = 0.0
     _positions_cache: float = 0.0
     _positions_cache_time: float = 0.0
+
+    def get_share_balance(self, token_id: str) -> float:
+        """Fetch on-chain share balance for a specific outcome token.
+        Returns 0.0 if the call fails or no balance. Used by the position
+        monitor to size SELL orders correctly (DB-stored share counts
+        overshoot actual on-chain holdings by ~1% from fill rounding, and
+        positions can disappear entirely after redemption or out-of-band
+        sells — both produce 'balance is not enough' rejects)."""
+        if not self.client or not token_id:
+            return 0.0
+        try:
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=2,
+            )
+            result = self.client.get_balance_allowance(params)
+            raw = float(result.get("balance", 0))
+            return round(raw / 1_000_000, 4)
+        except Exception as e:
+            log.debug(f"get_share_balance({token_id[:16]}) failed: {e}")
+            return 0.0
 
     def get_balance(self, force: bool = False) -> float:
         """Fetch USDC.e cash balance for the proxy wallet. Cached 30s.
