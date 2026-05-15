@@ -15,15 +15,20 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 from pydantic import BaseModel, field_validator
 
 from calibrator import Calibrator, RegimeReader, RegimeState, record_prediction
-from discovery import MarketFilter, PolyMarket, fetch_markets
+from discovery import MarketFilter, PolyMarket, classify_internal_category, fetch_markets
 from executor import ClobExecutor
 from market_maker import MarketMaker
+from observability import (
+    record_discovery_batch,
+    record_postmortem,
+    record_shadow_batch,
+)
 from orderbook_ws import BookManager, BookSnapshot
 from redeemer import PositionRedeemer
 from risk import (
@@ -186,6 +191,14 @@ class Position:
     # positive fractions of entry_price (e.g. 0.12 = 12% profit target).
     profit_target:  float = PROFIT_TARGET
     stop_loss:      float = STOP_LOSS
+    # Observability — peak/trough best_bid seen while holding, plus the entry
+    # signal source/strength. None of these affect exit decisions; they only
+    # feed the position_postmortem table on close.
+    peak_bid:           Optional[float] = None
+    trough_bid:         Optional[float] = None
+    market_question:    Optional[str]   = None
+    entry_signal_source: Optional[str]  = None
+    entry_signal_strength: Optional[float] = None
 
 
 @dataclass
@@ -224,6 +237,63 @@ def _build_regime(market: PolyMarket, book: BookSnapshot) -> MarketRegime:
         spread_cents             = book.spread_cents,
         time_to_resolution_hours = _hours_to_resolution(market.end_date),
     )
+
+
+def _audit_discovery(raw_markets: list[PolyMarket]) -> list[dict]:
+    """
+    Mirror the MarketFilter chain used in main() / strategy_loop and tag each
+    candidate with the FIRST filter that would exclude it ('kept' otherwise).
+    Pure observation — never mutates anything, never raises. Output is a
+    list of dicts ready for record_discovery_batch.
+
+    Filter order must match the chain at line ~1024 of main(); if that order
+    changes, this should change too (otherwise the dashboard's reason
+    attribution will mis-blame the wrong gate).
+    """
+    rows: list[dict] = []
+    # Pre-compute the top-N-by-volume cutoff so we can identify markets that
+    # passed every filter but lost the volume cap.
+    survivors = []
+    excluded_kw_lower    = [k.lower() for k in EXCLUDE_KEYWORDS]
+    excluded_cat_lower   = [c.lower() for c in EXCLUDE_CATEGORIES]
+    blocked_internal_set = {c.lower() for c in BLOCK_INTERNAL_CATEGORIES}
+
+    for m in raw_markets:
+        question_lower = (m.question or "").lower()
+        category_lower = (m.category or "").lower()
+        internal_cat   = classify_internal_category(m.question or "")
+        base = {
+            "token_id":          m.yes_token_id,
+            "question":          m.question,
+            "category":          m.category,
+            "internal_category": internal_cat,
+            "yes_price":         m.yes_price,
+            "volume_24h":        m.volume_24h,
+            "liquidity":         m.liquidity,
+            "spread_cents":      m.spread,
+        }
+        if m.spread > 3.0:
+            rows.append({**base, "excluded_by": "spread"})
+            continue
+        if m.yes_price < 0.08 or m.yes_price > 0.92:
+            rows.append({**base, "excluded_by": "price_range"})
+            continue
+        if any(c in category_lower for c in excluded_cat_lower):
+            rows.append({**base, "excluded_by": "category"})
+            continue
+        if any(k in question_lower for k in excluded_kw_lower):
+            rows.append({**base, "excluded_by": "keyword"})
+            continue
+        if internal_cat.lower() in blocked_internal_set:
+            rows.append({**base, "excluded_by": "internal_category"})
+            continue
+        survivors.append((m, base))
+
+    # Top-20 by volume_24h — the only ones that actually make the watchlist.
+    survivors.sort(key=lambda pair: pair[0].volume_24h, reverse=True)
+    for idx, (_m, base) in enumerate(survivors):
+        rows.append({**base, "excluded_by": "kept" if idx < 20 else "top_n"})
+    return rows
 
 
 # ── Momentum signal ────────────────────────────────────────────────────────────
@@ -318,6 +388,7 @@ async def estimate_true_probability(
     market:     PolyMarket,
     book:       BookSnapshot,
     calibrator: Optional[Calibrator] = None,
+    shadow_recorder: Optional[Callable[..., None]] = None,
 ) -> Optional[Signal]:
     """
     Tiered momentum + OBI signal model.
@@ -332,10 +403,34 @@ async def estimate_true_probability(
            obi       — pure imbalance fallback, requires |OBI| ≥ OBI_SOLO_MIN (strength → 0.3)
       4. OBI must not actively oppose the trade direction.
       5. Edge = |estimated_prob − execution_price| must exceed MIN_EDGE.
+
+    `shadow_recorder` is an optional best-effort callback invoked at every
+    return point with the gate outcome and the observable state at that
+    moment. It exists purely for the shadow_signals table — trading
+    behaviour is identical whether or not it's passed in.
     """
+    def _shadow(outcome: str, **extra) -> None:
+        if shadow_recorder is None:
+            return
+        try:
+            shadow_recorder(
+                token_id=book.token_id,
+                market=market.question,
+                outcome=outcome,
+                yes_price=book.vamp,
+                best_bid=book.best_bid,
+                best_ask=book.best_ask,
+                book_depth_usdc=book.book_depth_usdc,
+                obi=book.obi,
+                **extra,
+            )
+        except Exception as exc:   # never block trading on observability errors
+            log.debug("shadow_recorder error (non-fatal): %s", exc)
+
     # 1. Fair value — VAMP only; don't fall back to a bare mid from a phantom book
     yes_price = book.vamp
     if yes_price is None:
+        _shadow("no_vamp")
         return None
 
     # Thin books → skip. Liquidity-starved markets produce erratic signals and
@@ -345,6 +440,7 @@ async def estimate_true_probability(
                   market.question[:40],
                   f"${book.book_depth_usdc:.0f}" if book.book_depth_usdc else "None",
                   MIN_BOOK_DEPTH_USDC)
+        _shadow("depth_skip")
         return None
 
     # 2. Volume spike (non-blocking)
@@ -371,6 +467,13 @@ async def estimate_true_probability(
     else:
         # Pure-OBI fallback — tightest threshold, smallest sizing.
         if abs(obi) < OBI_SOLO_MIN:
+            _shadow(
+                "obi_solo_below",
+                spike_has=spike.has_spike,
+                spike_dominant_side=spike.dominant_side,
+                spike_confidence=spike.confidence,
+                spike_ratio=spike.spike_ratio,
+            )
             return None
         dominant_side = "YES" if obi > 0 else "NO"
         source        = "obi"
@@ -381,9 +484,27 @@ async def estimate_true_probability(
     # 4. OBI must not actively oppose the signal
     if dominant_side == "YES" and obi < -OBI_CONFIRM_MIN:
         log.debug("OBI opposes YES trade (obi=%+.3f) — skip %s", obi, market.question[:40])
+        _shadow(
+            "obi_opposes",
+            spike_has=spike.has_spike,
+            spike_dominant_side=spike.dominant_side,
+            spike_confidence=spike.confidence,
+            spike_ratio=spike.spike_ratio,
+            signal_source=source,
+            signal_strength=strength,
+        )
         return None
     if dominant_side == "NO" and obi > OBI_CONFIRM_MIN:
         log.debug("OBI opposes NO trade (obi=%+.3f) — skip %s", obi, market.question[:40])
+        _shadow(
+            "obi_opposes",
+            spike_has=spike.has_spike,
+            spike_dominant_side=spike.dominant_side,
+            spike_confidence=spike.confidence,
+            spike_ratio=spike.spike_ratio,
+            signal_source=source,
+            signal_strength=strength,
+        )
         return None
 
     # 4b. Price ceiling. For BUY YES the fill price ≈ best_ask; for BUY NO the
@@ -398,6 +519,16 @@ async def estimate_true_probability(
     if side_fill_price >= MAX_ENTRY_PRICE:
         log.info("PRICE CEILING [signal] | %s  side=%s  fill=%.4f >= %.2f — skip",
                  market.question[:40], dominant_side, side_fill_price, MAX_ENTRY_PRICE)
+        _shadow(
+            "price_ceiling",
+            spike_has=spike.has_spike,
+            spike_dominant_side=spike.dominant_side,
+            spike_confidence=spike.confidence,
+            spike_ratio=spike.spike_ratio,
+            signal_source=source,
+            signal_strength=strength,
+            fill_price=side_fill_price,
+        )
         return None
 
     # 5. Estimate true probability + edge check
@@ -422,6 +553,18 @@ async def estimate_true_probability(
         edge = (book.best_bid or yes_price) - true_prob
 
     if edge < MIN_EDGE:
+        _shadow(
+            "edge_below",
+            spike_has=spike.has_spike,
+            spike_dominant_side=spike.dominant_side,
+            spike_confidence=spike.confidence,
+            spike_ratio=spike.spike_ratio,
+            signal_source=source,
+            signal_strength=strength,
+            estimated_prob=true_prob,
+            edge=edge,
+            fill_price=side_fill_price,
+        )
         return None
 
     calibration_note = (
@@ -433,6 +576,18 @@ async def estimate_true_probability(
         "SIGNAL | %s  side=%s  prob=%.3f  vamp=%.3f  edge=%.3f  obi=%+.3f  src=%s  str=%.2f%s",
         market.question[:55], dominant_side, true_prob, yes_price,
         edge, obi, source, strength, calibration_note,
+    )
+    _shadow(
+        "accepted",
+        spike_has=spike.has_spike,
+        spike_dominant_side=spike.dominant_side,
+        spike_confidence=spike.confidence,
+        spike_ratio=spike.spike_ratio,
+        signal_source=source,
+        signal_strength=strength,
+        estimated_prob=true_prob,
+        edge=edge,
+        fill_price=side_fill_price,
     )
     return Signal(true_prob=true_prob, side=side, strength=strength, source=source)
 
@@ -493,6 +648,14 @@ async def strategy_loop(
                     "Markets refreshed — %d/%d still active",
                     len(markets), len(subscribed_yes_ids),
                 )
+                # Audit the refresh: same chain rules, same recorder. Lets the
+                # dashboard see which markets are newly excluded or newly
+                # available over time without us having to rerun discovery.
+                try:
+                    refresh_rows = _audit_discovery(fresh_raw)
+                    await asyncio.to_thread(record_discovery_batch, refresh_rows)
+                except Exception as exc:
+                    log.debug("discovery audit (refresh) failed: %s", exc)
             except Exception as exc:
                 log.warning("Market refresh failed (keeping old list): %s", exc)
 
@@ -569,6 +732,12 @@ async def strategy_loop(
                 log.warning("skip exit check: %s has invalid entry_price=%s",
                             token_id[:14], pos.entry_price)
                 continue
+            # Update peak/trough bid before exit check — observability only,
+            # never affects the exit decision below.
+            if pos.peak_bid is None or book.best_bid > pos.peak_bid:
+                pos.peak_bid = book.best_bid
+            if pos.trough_bid is None or book.best_bid < pos.trough_bid:
+                pos.trough_bid = book.best_bid
             gain    = (book.best_bid - pos.entry_price) / pos.entry_price
             held_s  = time.time() - pos.entry_time
             # Per-position exit bands (computed at entry with the entry regime).
@@ -599,6 +768,53 @@ async def strategy_loop(
                 continue
 
             if exit_result:
+                # Post-mortem write (best-effort, never blocks). Captures the
+                # full life of the position so the nightly review can answer
+                # "did we exit at the right moment?" Peak/trough are bid-side
+                # snapshots only — they understate actual high-water marks
+                # between scan cycles, but they're the same metric the exit
+                # check uses so the comparison is apples-to-apples.
+                try:
+                    peak  = pos.peak_bid  if pos.peak_bid  is not None else book.best_bid
+                    trough = pos.trough_bid if pos.trough_bid is not None else book.best_bid
+                    max_gain = (peak - pos.entry_price) / pos.entry_price
+                    min_gain = (trough - pos.entry_price) / pos.entry_price
+                    exit_fill = (
+                        exit_result.fill_price
+                        if exit_result.fill_price is not None
+                        else book.best_bid
+                    )
+                    realized = (
+                        (exit_fill - pos.entry_price) / pos.entry_price
+                        if exit_fill is not None
+                        else None
+                    )
+                    await asyncio.to_thread(
+                        record_postmortem,
+                        token_id              = token_id,
+                        market                = pos.market_question,
+                        entry_price           = pos.entry_price,
+                        entry_time            = datetime.fromtimestamp(
+                            pos.entry_time, tz=timezone.utc
+                        ).isoformat(),
+                        exit_price            = exit_fill,
+                        exit_time             = datetime.now(timezone.utc).isoformat(),
+                        held_seconds          = int(held_s),
+                        peak_bid              = peak,
+                        trough_bid            = trough,
+                        max_gain_pct          = max_gain * 100,
+                        min_gain_pct          = min_gain * 100,
+                        realized_gain_pct     = realized * 100 if realized is not None else None,
+                        exit_reason           = reason,
+                        entry_signal_source   = pos.entry_signal_source,
+                        entry_signal_strength = pos.entry_signal_strength,
+                        profit_target         = pos.profit_target,
+                        stop_loss             = pos.stop_loss,
+                        exit_order_id         = exit_result.order_id,
+                        exit_status           = exit_result.status,
+                    )
+                except Exception as exc:
+                    log.debug("record_postmortem failed (non-fatal): %s", exc)
                 del open_positions[token_id]
                 last_traded[token_id] = time.time()   # cooldown after exit
                 log.info(
@@ -612,6 +828,28 @@ async def strategy_loop(
                     "ABANDON | %s  value<$1  entry=%.4f  qty=%.4f  bid=%.4f",
                     token_id[:14], pos.entry_price, pos.token_qty, book.best_bid,
                 )
+                try:
+                    await asyncio.to_thread(
+                        record_postmortem,
+                        token_id              = token_id,
+                        market                = pos.market_question,
+                        entry_price           = pos.entry_price,
+                        entry_time            = datetime.fromtimestamp(
+                            pos.entry_time, tz=timezone.utc
+                        ).isoformat(),
+                        exit_price            = book.best_bid,
+                        exit_time             = datetime.now(timezone.utc).isoformat(),
+                        held_seconds          = int(held_s),
+                        peak_bid              = pos.peak_bid  or book.best_bid,
+                        trough_bid            = pos.trough_bid or book.best_bid,
+                        exit_reason           = "abandoned_below_min_notional",
+                        entry_signal_source   = pos.entry_signal_source,
+                        entry_signal_strength = pos.entry_signal_strength,
+                        profit_target         = pos.profit_target,
+                        stop_loss             = pos.stop_loss,
+                    )
+                except Exception as exc:
+                    log.debug("record_postmortem (abandon) failed: %s", exc)
                 del open_positions[token_id]
 
         # Collect live books — skip markets with an open position (no stacking)
@@ -631,9 +869,20 @@ async def strategy_loop(
             await asyncio.sleep(SCAN_INTERVAL)
             continue
 
+        # Shadow recorder — collects one row per (market, cycle) into a local
+        # list. Flushed to SQLite at end-of-cycle in a thread so DB writes
+        # never sit in the event loop. Trading behaviour is unchanged whether
+        # this list is populated or not.
+        shadow_rows: list[dict] = []
+        def _shadow_record(**kw) -> None:
+            shadow_rows.append(kw)
+
         # Run all signal estimates concurrently (each fires one HTTP request)
         signal_tasks = [
-            estimate_true_probability(mkt, book, calibrator=calibrator)
+            estimate_true_probability(
+                mkt, book, calibrator=calibrator,
+                shadow_recorder=_shadow_record,
+            )
             for mkt, book in live
         ]
         signal_results = await asyncio.gather(*signal_tasks, return_exceptions=True)
@@ -762,12 +1011,17 @@ async def strategy_loop(
                         regime      = regime,
                     )
                     open_positions[trade_token_id] = Position(
-                        token_id      = trade_token_id,
-                        entry_price   = result.fill_price,
-                        token_qty     = result.token_qty,
-                        entry_time    = time.time(),
-                        profit_target = pt,
-                        stop_loss     = sl,
+                        token_id              = trade_token_id,
+                        entry_price           = result.fill_price,
+                        token_qty             = result.token_qty,
+                        entry_time            = time.time(),
+                        profit_target         = pt,
+                        stop_loss             = sl,
+                        peak_bid              = result.fill_price,
+                        trough_bid            = result.fill_price,
+                        market_question       = mkt.question,
+                        entry_signal_source   = signal.source,
+                        entry_signal_strength = signal.strength,
                     )
                     log.info(
                         "EXIT BANDS | %s  entry=%.4f profit=+%.1f%% stop=-%.1f%%",
@@ -796,6 +1050,16 @@ async def strategy_loop(
                     mkt.question[:55], result.order_id, result.status,
                     result.fill_price or 0, result.token_qty or 0,
                 )
+
+        # Flush this cycle's shadow rows in a single batch insert so DB I/O
+        # is amortised and doesn't run on the event loop. Best-effort — a
+        # busy lock or missing trades.db is a log-and-move-on.
+        if shadow_rows:
+            try:
+                written = await asyncio.to_thread(record_shadow_batch, shadow_rows)
+                log.debug("shadow_signals: wrote %d/%d rows", written, len(shadow_rows))
+            except Exception as exc:
+                log.debug("shadow_signals flush failed (non-fatal): %s", exc)
 
         await asyncio.sleep(SCAN_INTERVAL)
 
@@ -837,6 +1101,19 @@ async def main() -> None:
         len(markets), EXCLUDE_CATEGORIES or "none", EXCLUDE_KEYWORDS or "none",
         BLOCK_INTERNAL_CATEGORIES or "none",
     )
+
+    # Discovery audit — log every candidate from fetch_markets with the filter
+    # that dropped it (or 'kept'). Sync write at startup is fine; the periodic
+    # refresh inside strategy_loop uses asyncio.to_thread.
+    try:
+        audit_rows = _audit_discovery(raw)
+        written = record_discovery_batch(audit_rows)
+        log.info(
+            "Discovery audit: %d candidates evaluated, %d written",
+            len(audit_rows), written,
+        )
+    except Exception as exc:
+        log.debug("discovery audit (startup) failed: %s", exc)
 
     if not markets:
         log.error("No tradeable markets found — exiting")
