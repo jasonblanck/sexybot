@@ -560,6 +560,398 @@ def mempool_fees() -> list[dict]:
     }]
 
 
+# ── Bluesky public search ──────────────────────────────────────────────────────
+
+def _bluesky_search(query: str, source_label: str, limit: int = 25) -> list[dict]:
+    """Public Bluesky search — no auth, no rate-limit headers documented but
+    light usage (a handful of queries every 10 min) has never tripped throttling.
+    Useful as a Reddit/Twitter substitute now that Twitter's free API is gone
+    and Reddit's JSON endpoint 403s from data-centre IPs."""
+    data = _get_json(
+        "https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts",
+        params={"q": query, "limit": limit, "sort": "latest"},
+    )
+    rows = []
+    for p in data.get("posts", []):
+        uri = p.get("uri")
+        if not uri:
+            continue
+        record = p.get("record") or {}
+        author = p.get("author") or {}
+        rows.append({
+            "source":       source_label,
+            "category":     "social",
+            "external_id":  uri,
+            "title":        (record.get("text") or "")[:280],
+            "url":          f"https://bsky.app/profile/{author.get('handle')}/post/{uri.split('/')[-1]}",
+            "numeric_value": float(p.get("likeCount") or 0),
+            "metadata":     json.dumps({
+                "handle":       author.get("handle"),
+                "displayName":  author.get("displayName"),
+                "replyCount":   p.get("replyCount"),
+                "repostCount":  p.get("repostCount"),
+                "indexedAt":    p.get("indexedAt"),
+            }),
+            "published_at": record.get("createdAt"),
+        })
+    return rows
+
+
+def bluesky_polymarket() -> list[dict]:
+    return _bluesky_search("polymarket", "bluesky_polymarket")
+
+
+def bluesky_prediction() -> list[dict]:
+    return _bluesky_search("prediction market", "bluesky_prediction")
+
+
+def bluesky_macro() -> list[dict]:
+    return _bluesky_search("FOMC OR \"rate cut\" OR \"rate hike\" OR \"CPI\"", "bluesky_macro")
+
+
+def bluesky_elections() -> list[dict]:
+    return _bluesky_search("election OR primary OR poll", "bluesky_elections")
+
+
+# ── Reddit RSS fallback (Cloudflare blocks the JSON endpoints from VPS) ────────
+
+def reddit_rss(subreddit: str, limit: int = 25) -> list[dict]:
+    """Try the .rss endpoint instead of /hot.json. Cloudflare's bot-management
+    layer treats these differently — JSON is blocked from data-centre IPs,
+    RSS sometimes isn't. Use as a fallback when reddit_hot() is 403'd."""
+    xml = _get_text(f"https://www.reddit.com/r/{subreddit}/hot/.rss")
+    rows = _parse_rss(xml, f"reddit_rss_{subreddit.lower()}", "social", limit=limit)
+    return rows
+
+
+# ── Macro / fixed income ───────────────────────────────────────────────────────
+
+def treasury_avg_interest_rates() -> list[dict]:
+    """Treasury fiscaldata — avg interest on outstanding marketable debt by
+    security type. Slow-moving but a useful background macro signal."""
+    data = _get_json(
+        "https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
+        "/v2/accounting/od/avg_interest_rates",
+        params={"sort": "-record_date", "page[size]": 25},
+    )
+    rows = []
+    for r in data.get("data", []):
+        sec = r.get("security_desc") or "?"
+        date = r.get("record_date") or ""
+        rows.append({
+            "source":       "treasury_rates",
+            "category":     "macro",
+            "external_id":  f"{date}|{sec}",
+            "title":        f"{sec} avg rate {r.get('avg_interest_rate_amt')}% ({date})",
+            "url":          "https://fiscaldata.treasury.gov/datasets/average-interest-rates-treasury-securities/",
+            "numeric_value": float(r.get("avg_interest_rate_amt") or 0),
+            "metadata":     json.dumps(r),
+            "published_at": date,
+        })
+    return rows
+
+
+def world_bank_indicator(country: str, indicator: str, label: str) -> list[dict]:
+    """One indicator for one country from the World Bank. The API returns a
+    paginated array; we only take the latest non-null observation."""
+    data = _get_json(
+        f"https://api.worldbank.org/v2/country/{country}/indicator/{indicator}",
+        params={"format": "json", "per_page": 5},
+    )
+    if not isinstance(data, list) or len(data) < 2:
+        return []
+    rows = []
+    for r in (data[1] or []):
+        val = r.get("value")
+        if val is None:
+            continue
+        date = r.get("date") or ""
+        rows.append({
+            "source":       f"worldbank_{label}",
+            "category":     "macro",
+            "external_id":  f"{country}|{indicator}|{date}",
+            "title":        f"{(r.get('country') or {}).get('value')} {(r.get('indicator') or {}).get('value')} {date}",
+            "url":          f"https://data.worldbank.org/indicator/{indicator}",
+            "numeric_value": float(val),
+            "metadata":     json.dumps({"country": country, "indicator": indicator}),
+            "published_at": date,
+        })
+        break   # only the most recent observation
+    return rows
+
+
+def worldbank_us_cpi() -> list[dict]:
+    return world_bank_indicator("USA", "FP.CPI.TOTL.ZG", "us_cpi")
+
+
+def worldbank_us_gdp_growth() -> list[dict]:
+    return world_bank_indicator("USA", "NY.GDP.MKTP.KD.ZG", "us_gdp_growth")
+
+
+def worldbank_world_inflation() -> list[dict]:
+    return world_bank_indicator("WLD", "FP.CPI.TOTL.ZG", "world_inflation")
+
+
+def ecb_eurusd() -> list[dict]:
+    """ECB SDMX endpoint — last 10 EUR/USD daily observations. The SDMX
+    JSON format is wordy; we extract just the observation series."""
+    data = _get_json(
+        "https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A",
+        params={"lastNObservations": 10, "format": "jsondata"},
+        headers={"Accept": "application/json"},
+    )
+    try:
+        obs = data["dataSets"][0]["series"]["0:0:0:0:0"]["observations"]
+        times = [t["id"] for t in data["structure"]["dimensions"]["observation"][0]["values"]]
+    except (KeyError, IndexError, TypeError):
+        return []
+    rows = []
+    for idx, vals in obs.items():
+        try:
+            i = int(idx)
+            d = times[i]
+            v = float(vals[0])
+        except (ValueError, IndexError, TypeError):
+            continue
+        rows.append({
+            "source":       "ecb_eurusd",
+            "category":     "macro",
+            "external_id":  f"EURUSD|{d}",
+            "title":        f"EUR/USD {v} ({d})",
+            "url":          "https://data.ecb.europa.eu/",
+            "numeric_value": v,
+            "metadata":     None,
+            "published_at": d,
+        })
+    return rows
+
+
+# ── Politics RSS (no auth) ─────────────────────────────────────────────────────
+
+def congress_most_viewed_bills() -> list[dict]:
+    return _parse_rss(
+        _get_text("https://www.congress.gov/rss/most-viewed-bills.xml"),
+        "congress_bills", "politics",
+    )
+
+
+def congress_most_viewed_laws() -> list[dict]:
+    # Was public-laws.xml — 404'd as of 2026-05. presented-to-president.xml
+    # is the closest still-published feed (bills sent for signature).
+    return _parse_rss(
+        _get_text("https://www.congress.gov/rss/presented-to-president.xml"),
+        "congress_to_president", "politics",
+    )
+
+
+# ── Geopolitics RSS ────────────────────────────────────────────────────────────
+
+def reliefweb_headlines() -> list[dict]:
+    """ReliefWeb's RSS endpoints are now CDN-cached and return 202 with
+    empty bodies on first hit. Their v1 JSON API still works freely with
+    just an `appname` query parameter (no key, no signup)."""
+    data = _get_json(
+        "https://api.reliefweb.int/v1/reports",
+        params={
+            "appname":     "sexybot-feeds",
+            "limit":       25,
+            "sort[]":      "date.created:desc",
+            "fields[include][]": ["title", "url_alias", "date", "primary_country.name"],
+        },
+    )
+    rows = []
+    for r in data.get("data", []):
+        rid = r.get("id")
+        f = r.get("fields") or {}
+        if not rid:
+            continue
+        rows.append({
+            "source":       "reliefweb",
+            "category":     "geopolitics",
+            "external_id":  str(rid),
+            "title":        f.get("title"),
+            "url":          f.get("url_alias"),
+            "metadata":     json.dumps({
+                "country": (f.get("primary_country") or {}).get("name"),
+            }),
+            "published_at": (f.get("date") or {}).get("created"),
+        })
+    return rows
+
+
+# ── AP News (RSS) ──────────────────────────────────────────────────────────────
+
+def news_ap() -> list[dict]:
+    # AP's official RSS endpoints are partially deprecated; Google News
+    # site-search is the most reliable mirror at this point.
+    return _parse_rss(
+        _get_text("https://news.google.com/rss/search",
+                  params={"q": "site:apnews.com when:1h"}),
+        "news_ap", "news",
+    )
+
+
+# ── Wikipedia trending ─────────────────────────────────────────────────────────
+
+def wikipedia_top_pageviews() -> list[dict]:
+    """Yesterday's top 25 pages on en.wikipedia.org. A massive spike on a
+    name or event often precedes a Polymarket market repricing — early-
+    awareness signal."""
+    from datetime import datetime, timedelta, timezone as _tz
+    d = (datetime.now(tz=_tz.utc) - timedelta(days=1)).strftime("%Y/%m/%d")
+    data = _get_json(
+        f"https://wikimedia.org/api/rest_v1/metrics/pageviews/top"
+        f"/en.wikipedia.org/all-access/{d}",
+    )
+    rows = []
+    items = (data.get("items") or [{}])[0].get("articles", [])
+    for a in items[:25]:
+        article = a.get("article")
+        if not article or article.startswith("Special:") or article == "Main_Page":
+            continue
+        rows.append({
+            "source":       "wiki_top",
+            "category":     "social",
+            "external_id":  f"{d}|{article}",
+            "title":        article.replace("_", " "),
+            "url":          f"https://en.wikipedia.org/wiki/{article}",
+            "numeric_value": float(a.get("views") or 0),
+            "metadata":     json.dumps({"rank": a.get("rank")}),
+            "published_at": d.replace("/", "-"),
+        })
+    return rows
+
+
+# ── Box office (entertainment markets) ─────────────────────────────────────────
+
+def box_office_mojo_weekend() -> list[dict]:
+    """Scrape Box Office Mojo's weekend chart. Light HTML parsing with
+    regex — BeautifulSoup is not in requirements.txt. Failure modes are
+    page layout changes; we log and move on."""
+    html = _get_text(
+        "https://www.boxofficemojo.com/weekend/chart/",
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            ),
+        },
+    )
+    import re
+    rows = []
+    # Mojo's table: rows have a release URL + title cell, then a gross cell.
+    pattern = re.compile(
+        r'/release/(?P<rid>rl\d+)/[^"]*"[^>]*>(?P<title>[^<]+)</a>.*?'
+        r'\$(?P<gross>[\d,]+)',
+        re.DOTALL,
+    )
+    seen = set()
+    for m in pattern.finditer(html):
+        rid = m.group("rid")
+        if rid in seen:
+            continue
+        seen.add(rid)
+        try:
+            gross = float(m.group("gross").replace(",", ""))
+        except ValueError:
+            continue
+        rows.append({
+            "source":       "boxoffice_mojo",
+            "category":     "entertainment",
+            "external_id":  rid,
+            "title":        m.group("title").strip(),
+            "url":          f"https://www.boxofficemojo.com/release/{rid}/",
+            "numeric_value": gross,
+            "metadata":     None,
+            "published_at": None,
+        })
+        if len(rows) >= 20:
+            break
+    return rows
+
+
+# ── NBA stats API (needs specific headers or 403s) ─────────────────────────────
+
+def nba_scoreboard() -> list[dict]:
+    """NBA stats today's scoreboard. The stats.nba.com endpoints fingerprint
+    on Referer/Origin headers; a plain User-Agent isn't enough. They also
+    have aggressive rate-limiting that produces silent timeouts under load,
+    so we give it 30s instead of the default 10s and accept that some
+    passes will fail."""
+    from datetime import datetime, timezone as _tz
+    today = datetime.now(tz=_tz.utc).strftime("%m/%d/%Y")
+    data = _get_json(
+        "https://stats.nba.com/stats/scoreboardV2",
+        params={"DayOffset": 0, "LeagueID": "00", "gameDate": today},
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            ),
+            "Origin":  "https://www.nba.com",
+            "Referer": "https://www.nba.com/",
+            "x-nba-stats-origin": "stats",
+            "x-nba-stats-token":  "true",
+        },
+        timeout=30,
+    )
+    # resultSets is a typed table — find the GameHeader set
+    rows = []
+    for rs in data.get("resultSets", []):
+        if rs.get("name") != "GameHeader":
+            continue
+        headers = rs.get("headers", [])
+        for r in rs.get("rowSet", []):
+            row = dict(zip(headers, r))
+            gid = row.get("GAME_ID")
+            if not gid:
+                continue
+            rows.append({
+                "source":       "nba_scoreboard",
+                "category":     "sports",
+                "external_id":  str(gid),
+                "title":        f"{row.get('VISITOR_TEAM_ID')} @ {row.get('HOME_TEAM_ID')} ({row.get('GAMECODE')})",
+                "url":          f"https://www.nba.com/game/{gid}",
+                "metadata":     json.dumps({
+                    "status":   row.get("GAME_STATUS_TEXT"),
+                    "gamecode": row.get("GAMECODE"),
+                    "season":   row.get("SEASON"),
+                }),
+                "published_at": row.get("GAME_DATE_EST"),
+            })
+        break
+    return rows
+
+
+# ── YouTube channel RSS (no auth) ──────────────────────────────────────────────
+
+def _youtube_channel(channel_id: str, source_label: str) -> list[dict]:
+    return _parse_rss(
+        _get_text(f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"),
+        source_label, "social", limit=15,
+    )
+
+
+# Channels picked for breadth: macro/markets, news, sports betting, AI/tech.
+# YouTube only exposes the latest 15 videos per channel via RSS so each
+# call returns at most 15 rows. Adjust this list if you want more / less
+# coverage in any vertical.
+def youtube_cnbc() -> list[dict]:
+    return _youtube_channel("UCrp_UI8XtuYfpiqluWLD7Lw", "yt_cnbc")          # CNBC Television
+
+def youtube_bloomberg() -> list[dict]:
+    return _youtube_channel("UCIALMKvObZNtJ6AmdCLP7Lg", "yt_bloomberg")     # Bloomberg
+
+def youtube_espn() -> list[dict]:
+    return _youtube_channel("UCiWLfSweyRNmLpgEHekhoAg", "yt_espn")          # ESPN
+
+def youtube_reuters() -> list[dict]:
+    return _youtube_channel("UChqUTb7kYRX8-EiaN3XFrSQ", "yt_reuters")       # Reuters
+
+def youtube_ap() -> list[dict]:
+    return _youtube_channel("UC52X5wxOL_s5yw0dQk7NtgA", "yt_ap")            # Associated Press
+
+
 # ── Registry ───────────────────────────────────────────────────────────────────
 
 # (label, fetcher). The label is what shows up in the log line. Order
@@ -567,7 +959,7 @@ def mempool_fees() -> list[dict]:
 FEEDS: list[tuple[str, Callable[[], list[dict]]]] = [
     # Cross-market peers
     ("metaculus",          metaculus),
-    # News & social
+    # News & social (Reddit JSON 403s from DO IPs but works on operator's Mac)
     ("hn_top",             hacker_news_top),
     ("reddit_sportsbook",  lambda: reddit_hot("sportsbook")),
     ("reddit_wallstreetbets", lambda: reddit_hot("wallstreetbets")),
@@ -575,17 +967,36 @@ FEEDS: list[tuple[str, Callable[[], list[dict]]]] = [
     ("reddit_nba",         lambda: reddit_hot("nba")),
     ("reddit_nfl",         lambda: reddit_hot("nfl")),
     ("reddit_soccer",      lambda: reddit_hot("soccer")),
+    # Reddit RSS fallback — may work where JSON is blocked
+    ("reddit_rss_politics",    lambda: reddit_rss("politics", limit=15)),
+    ("reddit_rss_nba",         lambda: reddit_rss("nba")),
+    ("reddit_rss_nfl",         lambda: reddit_rss("nfl")),
+    ("reddit_rss_sportsbook",  lambda: reddit_rss("sportsbook")),
+    # Bluesky search (Reddit/Twitter substitute)
+    ("bluesky_polymarket",  bluesky_polymarket),
+    ("bluesky_prediction",  bluesky_prediction),
+    ("bluesky_macro",       bluesky_macro),
+    ("bluesky_elections",   bluesky_elections),
+    # GDELT broad news graph
     ("gdelt",              gdelt),
+    # News RSS
     ("news_bbc",           news_bbc),
     ("news_nyt",           news_nyt),
     ("news_reuters",       news_reuters),
     ("news_politico",      news_politico),
     ("news_google",        news_google_topstories),
+    ("news_ap",            news_ap),
+    # Politics RSS
+    ("congress_bills",     congress_most_viewed_bills),
+    ("congress_laws",      congress_most_viewed_laws),
+    # Geopolitics — ReliefWeb removed; their RSS returns 202 empty and the
+    # v1/v2 JSON APIs now require an approved appname (free but requires
+    # operator signup). Add it back once an appname is registered.
     # Weather / disaster
     ("nws_alerts",         nws_alerts),
     ("usgs_quakes",        usgs_quakes),
     ("nhc_storms",         nhc_storms),
-    # Sports
+    # Sports — ESPN scoreboards
     ("espn_nfl",           espn_nfl),
     ("espn_nba",           espn_nba),
     ("espn_mlb",           espn_mlb),
@@ -593,11 +1004,27 @@ FEEDS: list[tuple[str, Callable[[], list[dict]]]] = [
     ("espn_epl",           espn_soccer_eng),
     ("espn_ucl",           espn_soccer_uefa),
     ("mlb_schedule",       mlb_schedule),
+    ("nba_scoreboard",     nba_scoreboard),
     # Crypto
     ("coingecko",          coingecko_top),
     ("binance_ticker",     binance_ticker),
     ("defillama_tvl",      defillama_tvl),
     ("mempool_fees",       mempool_fees),
+    # Macro / fixed income
+    ("treasury_rates",     treasury_avg_interest_rates),
+    ("worldbank_us_cpi",         worldbank_us_cpi),
+    ("worldbank_us_gdp_growth",  worldbank_us_gdp_growth),
+    ("worldbank_world_inflation", worldbank_world_inflation),
+    ("ecb_eurusd",         ecb_eurusd),
+    # Trending / entertainment
+    ("wikipedia_top",      wikipedia_top_pageviews),
+    ("boxoffice_mojo",     box_office_mojo_weekend),
+    # YouTube channel RSS
+    ("yt_cnbc",            youtube_cnbc),
+    ("yt_bloomberg",       youtube_bloomberg),
+    ("yt_espn",            youtube_espn),
+    ("yt_reuters",         youtube_reuters),
+    ("yt_ap",              youtube_ap),
 ]
 
 
