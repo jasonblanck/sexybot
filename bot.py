@@ -8360,6 +8360,22 @@ class PolymarketBot:
                     "pretrade_abort_cd_sec":    PRETRADE_ABORT_COOLDOWN_SEC,
                     "ai_min_confidence":        AI_MIN_CONFIDENCE,
                     "scan_interval_s":          SCAN_INTERVAL_S,
+                    # Surfaced for dashboard visibility — every operator-tunable
+                    # gate the bot consults during a cycle should appear here so
+                    # "why no trades?" can be answered from /status alone.
+                    "claude_max_disabled":      CLAUDE_MAX_DISABLED,
+                    "max_open_positions":       MAX_OPEN_POSITIONS,
+                    "max_deployed_usd":         MAX_DEPLOYED_USD,
+                    "max_category_exposure_pct": MAX_CATEGORY_EXPOSURE_PCT,
+                    "daily_loss_limit":         DAILY_LOSS_LIMIT,
+                    "momentum_tp_cents":        MOMENTUM_TP_CENTS,
+                    "momentum_sl_cents":        MOMENTUM_SL_CENTS,
+                    "momentum_trail_trigger_c": MOMENTUM_TRAIL_TRIGGER_CENTS,
+                    "momentum_trail_drop_c":    MOMENTUM_TRAIL_DROP_CENTS,
+                    "momentum_timeout_h":       MOMENTUM_TIMEOUT_H,
+                    "volume_spike_min_delta":   VOLUME_SPIKE_MIN_DELTA,
+                    "late_res_min_yes_p":       LATE_RES_MIN_YES_P,
+                    "max_ob_spread_for_ai":     MAX_OB_SPREAD_FOR_AI,
                 },
             },
         }

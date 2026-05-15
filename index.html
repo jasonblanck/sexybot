@@ -627,6 +627,10 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <span class="chip-dot" id="sdot"></span>
       <span id="stext">connecting</span>
     </span>
+    <span class="chip" id="ai-chip" title="AI / Claude status" style="display:none">
+      <span class="chip-dot"></span>
+      <span id="ai-chip-text">AI ?</span>
+    </span>
     <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle light/dark mode" aria-label="Toggle theme">
       <svg id="theme-icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
       <svg id="theme-icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
@@ -686,7 +690,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
         <div class="stat-row"><span class="stat-lbl">Cash Balance</span><span class="stat-val g" id="cash-balance">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Deployed</span><span class="stat-val o" id="deployed">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Trades</span><span class="stat-val b" id="ntrades">—</span></div>
-        <div class="stat-row"><span class="stat-lbl">Win rate</span><span class="stat-val y" id="winrate">—</span></div>
+        <div class="stat-row"><span class="stat-lbl" title="Fraction of order ATTEMPTS that matched on Polymarket — execution health, not P&amp;L. See 'Realized P&amp;L' below for actual win rate.">Fill rate</span><span class="stat-val y" id="winrate">—</span></div>
         <div class="wr-bar"><div class="wr-fill" id="wrfill" style="width:0%"></div></div>
         <div class="stat-row" style="margin-top:8px"><span class="stat-lbl">Today · trades</span><span class="stat-val b" id="today-trades">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Today · realized P&amp;L</span><span class="stat-val" id="today-pnl">—</span></div>
@@ -1459,8 +1463,30 @@ function setBotStatus(state,label){
 }
 async function fetchBot(){
   try{
+    // /health/runtime gives us the operational triad — bot_running,
+    // new_trades_paused (daily-loss halt), balance_halted, plus
+    // claude_max_disabled. /status doesn't include these so without this
+    // second fetch the chip would conflate three different states into
+    // "paused".
+    let rt=null;try{const rr=await fetch(`${BOT}/health/runtime`);if(rr.ok)rt=await rr.json();}catch(e){}
     const r=await fetch(`${BOT}/status`);const d=await r.json();
-    setBotStatus(d.running?'active':'paused',d.running?'live':'stopped');
+    // Pick the most-actionable status. Order matters: balance-halted > daily-
+    // loss-paused > operator-stopped > running.
+    let chipState='active',chipText='live';
+    if(rt&&rt.balance_halted){chipState='error';chipText='balance halted';}
+    else if(rt&&rt.new_trades_paused){chipState='paused';chipText='daily-loss pause';}
+    else if(!d.running){chipState='paused';chipText='stopped';}
+    setBotStatus(chipState,chipText);
+    // AI status chip — surfaces CLAUDE_MAX_DISABLE so an operator can tell
+    // at a glance whether trades are being verified by Claude or running
+    // rule-based only.
+    const aiChip=document.getElementById('ai-chip');
+    const aiText=document.getElementById('ai-chip-text');
+    if(aiChip&&aiText&&rt){
+      aiChip.style.display='';
+      if(rt.claude_max_disabled){aiChip.className='chip chip-paused';aiText.textContent='AI OFF';aiChip.title='CLAUDE_MAX_DISABLE=true — rule-based only';}
+      else{aiChip.className='chip chip-active';aiText.textContent='AI ON';aiChip.title='Claude verification active';}
+    }
     document.getElementById('strat').textContent=(d.strategy||'—').toUpperCase();
     const modeStr=d.paper_mode?'PAPER':(d.dry_run?'DRY RUN':'LIVE');
     const modeCls=d.paper_mode?'p':(d.dry_run?'o':'g');
