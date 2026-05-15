@@ -172,6 +172,13 @@ MAX_CATEGORY_EXPOSURE_PCT = float(os.getenv("MAX_CATEGORY_EXPOSURE_PCT", "0.50")
 #   MAX_DEPLOYED_USD=150   — leaves ~40% cash buffer to capture exits.
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "25"))
 MAX_DEPLOYED_USD   = float(os.getenv("MAX_DEPLOYED_USD", "150"))
+# Total markets fetched per scan cycle (3-5 Gamma pages of 100 each).
+# Higher = more diverse signal pool, but every market adds work to Phase 2
+# orderbook fetches when its signal fires. Going past ~300 + 30s cycles
+# saturated uvicorn's accept-loop, observed as nginx 504s and CLOSE-WAIT
+# socket pileup on port 8000. 300 is a safe upper bound for the current
+# single-worker uvicorn config.
+MARKET_POOL_SIZE   = int(os.getenv("MARKET_POOL_SIZE", "300"))
 # Tiered drawdown — at WARN_AT_DAILY_LOSS_PCT × DAILY_LOSS_LIMIT we start
 # scaling new-trade size linearly toward 0 at the full limit. Soft warning
 # before the hard halt; gives the bot a chance to stop bleeding before it
@@ -7213,7 +7220,7 @@ class PolymarketBot:
                             self._daily_loss_attenuation = 1.0
 
                 _ai_failures = 0  # circuit breaker: disable AI mid-cycle after 3 consecutive failures
-                markets = await asyncio.to_thread(self.get_markets, 500)
+                markets = await asyncio.to_thread(self.get_markets, MARKET_POOL_SIZE)
                 self._bump_skip("markets_scanned", len(markets))
                 self._log(f"Scanning {len(markets)} markets…")
 
