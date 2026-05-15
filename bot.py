@@ -6675,7 +6675,7 @@ class PolymarketBot:
                                               MAX_ORDER_SIZE * _vol_delta / 5000)),
                             }
             dev = abs(yes_p - 0.5)
-            if dev > 0.05:
+            if dev > 0.04:
                 macro = self.get_macro_context()
                 weather = self.get_weather_context()
                 fmp = self.get_fmp_market()
@@ -6771,7 +6771,7 @@ class PolymarketBot:
         # ── "both" also runs momentum as a fallback ─────────────────────────────
         if STRATEGY == "both":
             dev = abs(yes_p - 0.5)
-            if dev > 0.05:
+            if dev > 0.04:
                 macro   = self.get_macro_context()
                 fmp     = self.get_fmp_market()
                 sentiment = fmp.get("_sentiment", {})
@@ -7146,7 +7146,7 @@ class PolymarketBot:
                             self._daily_loss_attenuation = 1.0
 
                 _ai_failures = 0  # circuit breaker: disable AI mid-cycle after 3 consecutive failures
-                markets = await asyncio.to_thread(self.get_markets, 300)
+                markets = await asyncio.to_thread(self.get_markets, 500)
                 self._bump_skip("markets_scanned", len(markets))
                 self._log(f"Scanning {len(markets)} markets…")
 
