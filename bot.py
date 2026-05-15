@@ -165,6 +165,13 @@ THE_ODDS_API_KEY   = os.getenv("THE_ODDS_API_KEY", "")
 # of the open book. 0 disables the check; 1.0 effectively disables it.
 # Default 0.50 = no single category > 50% of book.
 MAX_CATEGORY_EXPOSURE_PCT = float(os.getenv("MAX_CATEGORY_EXPOSURE_PCT", "0.50"))
+# Hard caps to keep account utilisation bounded — prevents the bot from
+# churning through wallet equity even on a healthy trade-rate day. Set
+# either to 0 to disable. Defaults sized for a ~$250 wallet:
+#   MAX_OPEN_POSITIONS=25  — operator can still mentally track this many.
+#   MAX_DEPLOYED_USD=150   — leaves ~40% cash buffer to capture exits.
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "25"))
+MAX_DEPLOYED_USD   = float(os.getenv("MAX_DEPLOYED_USD", "150"))
 # Tiered drawdown — at WARN_AT_DAILY_LOSS_PCT × DAILY_LOSS_LIMIT we start
 # scaling new-trade size linearly toward 0 at the full limit. Soft warning
 # before the hard halt; gives the bot a chance to stop bleeding before it
@@ -7833,6 +7840,43 @@ class PolymarketBot:
                                             f"drawdown attenuation below $1 min"
                                         )
                                         continue
+
+                            # ── Account-utilisation caps ───────────────────
+                            # Two hard caps keep the bot from over-extending on
+                            # a high-trade day:
+                            #   MAX_OPEN_POSITIONS: don't open if we'd exceed.
+                            #   MAX_DEPLOYED_USD: don't open if total cost
+                            #     basis + this trade would exceed.
+                            # Both checks fail-open on DB error so a malformed
+                            # query never blocks trading.
+                            if not PAPER_MODE and (MAX_OPEN_POSITIONS > 0 or MAX_DEPLOYED_USD > 0):
+                                try:
+                                    row = self.db.execute(
+                                        "SELECT COUNT(*), COALESCE(SUM(cost),0) FROM positions"
+                                    ).fetchone()
+                                    open_n = int(row[0] or 0)
+                                    open_cost = float(row[1] or 0)
+                                    if MAX_OPEN_POSITIONS > 0 and open_n >= MAX_OPEN_POSITIONS:
+                                        self._log(
+                                            f"[UTIL CAP] skip — {open_n} open >= MAX_OPEN_POSITIONS={MAX_OPEN_POSITIONS}",
+                                            "warning",
+                                        )
+                                        self._bump_skip("util_max_positions")
+                                        sig_record["skip_reason"] = f"max positions ({open_n}/{MAX_OPEN_POSITIONS})"
+                                        continue
+                                    if MAX_DEPLOYED_USD > 0 and (open_cost + amt) > MAX_DEPLOYED_USD:
+                                        self._log(
+                                            f"[UTIL CAP] skip — open cost ${open_cost:.2f} + ${amt:.2f} "
+                                            f"> MAX_DEPLOYED_USD=${MAX_DEPLOYED_USD}",
+                                            "warning",
+                                        )
+                                        self._bump_skip("util_max_deployed")
+                                        sig_record["skip_reason"] = (
+                                            f"deployed cap ${open_cost+amt:.0f}>${MAX_DEPLOYED_USD:.0f}"
+                                        )
+                                        continue
+                                except Exception as _ucap_e:
+                                    log.debug(f"util-cap check error (allowing trade): {_ucap_e}")
 
                             # ── Portfolio concentration check ──────────────
                             # Skip the trade if it would push this market's
