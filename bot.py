@@ -961,17 +961,23 @@ class PolymarketBot:
         return has_extreme and has_threshold
 
     def get_daily_loss(self) -> float:
+        """Sum realized losses on positions that resolved today (negative
+        realized_pnl values, returned as a positive 'loss' number). Prior
+        implementation summed gross trade `amount` — counted every $5 BUY
+        as a $5 loss, so 10 trades tripped the limit before any position
+        even resolved. That bug single-handedly capped daily activity to
+        ~$50/DAILY_LOSS_LIMIT in deployed capital regardless of P&L."""
         try:
-            today = datetime.utcnow().strftime("%Y-%m-%d")  # match UTC stored in time column
+            today = datetime.utcnow().strftime("%Y-%m-%d")
             cur = self.db.execute(
-                "SELECT SUM(amount) FROM trades WHERE time LIKE ? AND dry_run=0 AND status='matched'",
-                (f"{today}%",))
+                "SELECT SUM(realized_pnl) FROM trades "
+                "WHERE time LIKE ? AND dry_run=0 AND resolved=1 "
+                "  AND realized_pnl IS NOT NULL AND realized_pnl < 0",
+                (f"{today}%",),
+            )
             total = cur.fetchone()[0] or 0
-            return float(total)
+            return float(abs(total))  # positive loss magnitude
         except Exception as e:
-            # Fail closed: report infinity so the daily-loss halt fires. A
-            # silent return of 0.0 would let trading continue while we're
-            # blind to the real loss — strictly worse than briefly pausing.
             log.error(f"get_daily_loss DB error — failing closed: {e}")
             return float("inf")
 
