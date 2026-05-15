@@ -113,6 +113,35 @@ CREATE TABLE IF NOT EXISTS discovery_audit (
 )
 """
 
+_SCHEMA_EXTERNAL_FEEDS = """
+CREATE TABLE IF NOT EXISTS external_feeds (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source        TEXT NOT NULL,        -- 'metaculus' | 'hn_top' | 'reddit_sportsbook'
+                                        -- | 'gdelt' | 'news_bbc' | 'news_nyt'
+                                        -- | 'news_reuters' | 'news_politico'
+                                        -- | 'news_google' | 'nws_alerts'
+                                        -- | 'usgs_quakes' | 'nhc_storms'
+                                        -- | 'espn_nfl' | 'espn_nba' | 'espn_mlb'
+                                        -- | 'espn_nhl' | 'espn_soccer' | 'mlb_schedule'
+                                        -- | 'coingecko' | 'binance_ticker'
+                                        -- | 'defillama_tvl' | 'mempool_fees'
+    category      TEXT,                 -- 'news' | 'prediction_market' | 'social'
+                                        -- | 'sports' | 'weather' | 'disaster'
+                                        -- | 'crypto' | 'macro'
+    external_id   TEXT NOT NULL,        -- per-source dedup key (article URL,
+                                        -- market slug, event id, etc.)
+    title         TEXT,
+    url           TEXT,
+    numeric_value REAL,                 -- price / probability / magnitude /
+                                        -- score / vol — source-defined meaning
+    metadata      TEXT,                 -- JSON blob with anything else worth
+                                        -- keeping (raw event payload subset)
+    published_at  TEXT,                 -- ISO8601 if source provides it
+    fetched_at    TEXT NOT NULL,
+    UNIQUE(source, external_id)
+)
+"""
+
 _INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_shadow_time ON shadow_signals(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_shadow_outcome ON shadow_signals(outcome)",
@@ -121,6 +150,9 @@ _INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_postmortem_reason ON position_postmortem(exit_reason)",
     "CREATE INDEX IF NOT EXISTS idx_discovery_time ON discovery_audit(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_discovery_excluded ON discovery_audit(excluded_by)",
+    "CREATE INDEX IF NOT EXISTS idx_feeds_time ON external_feeds(fetched_at)",
+    "CREATE INDEX IF NOT EXISTS idx_feeds_source ON external_feeds(source)",
+    "CREATE INDEX IF NOT EXISTS idx_feeds_category ON external_feeds(category)",
 )
 
 
@@ -151,6 +183,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             conn.execute(_SCHEMA_SHADOW)
             conn.execute(_SCHEMA_POSTMORTEM)
             conn.execute(_SCHEMA_DISCOVERY)
+            conn.execute(_SCHEMA_EXTERNAL_FEEDS)
             for stmt in _INDEXES:
                 conn.execute(stmt)
         _SCHEMA_INITIALISED = True
@@ -354,6 +387,54 @@ def record_discovery_batch(rows: list[dict], db_path: str = DEFAULT_DB_PATH) -> 
         return len(params)
     except sqlite3.Error as exc:
         log.debug("record_discovery_batch failed: %s", exc)
+        return 0
+    finally:
+        conn.close()
+
+
+def record_external_feeds(rows: list[dict], db_path: str = DEFAULT_DB_PATH) -> int:
+    """Batch upsert into external_feeds.
+
+    Dedupes on (source, external_id) via the UNIQUE index — rerunning a feed
+    poller after a partial fetch is idempotent. Returns the number of NEW
+    rows persisted (existing rows are silently skipped by INSERT OR IGNORE).
+    """
+    if not rows:
+        return 0
+    conn = _connect(db_path)
+    if conn is None:
+        return 0
+    try:
+        _ensure_schema(conn)
+        params = [
+            (
+                r.get("source", "unknown"),
+                r.get("category"),
+                r.get("external_id", ""),
+                r.get("title"),
+                r.get("url"),
+                r.get("numeric_value"),
+                r.get("metadata"),
+                r.get("published_at"),
+            )
+            for r in rows
+            if r.get("external_id")    # rows without a dedup key are dropped
+        ]
+        if not params:
+            return 0
+        with conn:
+            cur = conn.executemany(
+                """
+                INSERT OR IGNORE INTO external_feeds (
+                    source, category, external_id, title, url,
+                    numeric_value, metadata, published_at, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                """,
+                params,
+            )
+            return cur.rowcount if cur.rowcount is not None else 0
+    except sqlite3.Error as exc:
+        log.debug("record_external_feeds failed: %s", exc)
         return 0
     finally:
         conn.close()

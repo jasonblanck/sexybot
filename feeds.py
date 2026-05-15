@@ -1,0 +1,611 @@
+"""
+feeds.py
+Free / no-auth external data feeds — pure ingest sinks.
+
+Every public function here is a pure fetcher: it makes one HTTP call, parses
+the response, and returns a list[dict] ready for `observability.record_external_feeds`.
+None of these touch the trading process, the wallet, or place orders.
+
+Design rules:
+- No API keys, no auth, no signups.
+- One HTTP call per fetcher (timeouts at 10s) — if it 4xx/5xx/times-out we
+  log a warning and return [] so a single source going down never kills
+  the whole pass.
+- Returns a list of dicts with keys: source, category, external_id, title,
+  url, numeric_value, metadata, published_at. The schema is identical
+  for all sources so the writer doesn't need source-specific code.
+- Dedup is the caller's problem via the (source, external_id) UNIQUE index.
+
+To add a new feed: add a function, append it to FEEDS at the bottom.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Callable
+from xml.etree import ElementTree as ET
+
+import requests
+
+log = logging.getLogger(__name__)
+
+HTTP_TIMEOUT = 10
+DEFAULT_HEADERS = {
+    # Some endpoints (Reddit, NWS, some news RSS) gate on User-Agent and
+    # return 403/429 to default python-requests. A descriptive UA also
+    # makes it easy for operators on the other side to ban us cleanly if
+    # we ever misbehave.
+    "User-Agent": "sexybot-feeds/1.0 (+research/observability; trades.db sink)",
+    "Accept": "application/json,application/xml,text/xml,*/*;q=0.5",
+}
+
+
+def _get_json(url: str, *, params: dict | None = None,
+              headers: dict | None = None, timeout: int = HTTP_TIMEOUT):
+    h = {**DEFAULT_HEADERS, **(headers or {})}
+    resp = requests.get(url, params=params, headers=h, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _get_text(url: str, *, params: dict | None = None,
+              headers: dict | None = None, timeout: int = HTTP_TIMEOUT) -> str:
+    h = {**DEFAULT_HEADERS, **(headers or {})}
+    resp = requests.get(url, params=params, headers=h, timeout=timeout)
+    resp.raise_for_status()
+    return resp.text
+
+
+def _safe(fn: Callable, label: str) -> list[dict]:
+    """Run a fetcher, catch everything, return [] on failure. The poller
+    runs every 10 min so a transient failure resolves itself by next pass;
+    a chronic failure is visible in the log as a steady warning rate."""
+    try:
+        t0 = time.time()
+        rows = fn() or []
+        log.info("feeds[%s]: %d rows in %.1fs", label, len(rows), time.time() - t0)
+        return rows
+    except Exception as exc:
+        log.warning("feeds[%s] failed: %s", label, exc)
+        return []
+
+
+# ── RSS helpers ────────────────────────────────────────────────────────────────
+
+def _parse_rss(xml_text: str, source: str, category: str,
+               limit: int = 50) -> list[dict]:
+    """Minimal RSS 2.0 / Atom parser using stdlib. Robust against feeds
+    that mix conventions because every namespace lookup is wrapped in a
+    try/except — a single weird item never poisons the rest of the feed."""
+    out: list[dict] = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        log.warning("RSS parse error for %s: %s", source, exc)
+        return out
+
+    items = root.findall(".//item")                # RSS 2.0
+    if not items:
+        items = root.findall("{http://www.w3.org/2005/Atom}entry")  # Atom
+
+    for it in items[:limit]:
+        def text_of(tag: str) -> str | None:
+            # `Element or fallback` is unsafe in stdlib ElementTree — an
+            # element with text but no children evaluates as False. Use
+            # explicit `is None` checks instead.
+            el = it.find(tag)
+            if el is None:
+                el = it.find(f"{{http://www.w3.org/2005/Atom}}{tag}")
+            if el is None or el.text is None:
+                return None
+            return el.text.strip() or None
+
+        link_text = text_of("link")
+        if link_text is None:
+            link_el = it.find("{http://www.w3.org/2005/Atom}link")
+            if link_el is not None:
+                link_text = link_el.get("href")
+
+        guid = text_of("guid") or link_text or text_of("id")
+        if not guid:
+            continue   # no dedup key → skip
+
+        out.append({
+            "source":       source,
+            "category":     category,
+            "external_id":  guid,
+            "title":        text_of("title"),
+            "url":          link_text,
+            "published_at": text_of("pubDate") or text_of("updated") or text_of("published"),
+            "metadata":     None,
+        })
+    return out
+
+
+# ── Prediction markets ─────────────────────────────────────────────────────────
+
+def metaculus(limit: int = 100) -> list[dict]:
+    """Metaculus open questions, ordered by most recent activity. The
+    `community_prediction.full.q2` field is the median community forecast
+    — useful for cross-market comparison with Polymarket pricing on the
+    same topic. Their WAF now 403s on default python-requests, so we
+    spoof a browser UA — purely for read-only public API access."""
+    data = _get_json(
+        "https://www.metaculus.com/api2/questions/",
+        params={"status": "open", "order_by": "-activity", "limit": limit},
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            ),
+        },
+    )
+    rows = []
+    for q in data.get("results", []):
+        cp = (q.get("community_prediction") or {}).get("full", {})
+        median = cp.get("q2")
+        rows.append({
+            "source":       "metaculus",
+            "category":     "prediction_market",
+            "external_id":  str(q.get("id")),
+            "title":        q.get("title"),
+            "url":          f"https://www.metaculus.com{q.get('page_url', '')}",
+            "numeric_value": float(median) if median is not None else None,
+            "metadata":     json.dumps({
+                "categories":      q.get("categories", []),
+                "close_time":      q.get("close_time"),
+                "predictions":     q.get("number_of_predictions"),
+                "publish_time":    q.get("publish_time"),
+            }),
+            "published_at": q.get("publish_time"),
+        })
+    return rows
+
+
+# ── Social / news aggregators ──────────────────────────────────────────────────
+
+def hacker_news_top(n: int = 30) -> list[dict]:
+    """Top N HN stories. The Algolia search endpoint returns the full
+    story payload in one call instead of the firebaseio (1 + N) pattern
+    that took ~30s end-to-end. Same data, ~1s."""
+    data = _get_json(
+        "https://hn.algolia.com/api/v1/search",
+        params={"tags": "front_page", "hitsPerPage": n},
+    )
+    rows = []
+    for h in data.get("hits", []):
+        sid = h.get("objectID")
+        if not sid:
+            continue
+        rows.append({
+            "source":       "hn_top",
+            "category":     "social",
+            "external_id":  str(sid),
+            "title":        h.get("title"),
+            "url":          h.get("url") or f"https://news.ycombinator.com/item?id={sid}",
+            "numeric_value": float(h.get("points") or 0),
+            "metadata":     json.dumps({
+                "by":            h.get("author"),
+                "num_comments":  h.get("num_comments"),
+            }),
+            "published_at": h.get("created_at"),
+        })
+    return rows
+
+
+def reddit_hot(subreddit: str, limit: int = 25) -> list[dict]:
+    """Reddit hot posts for one subreddit. Requires a non-default User-Agent
+    or 429s. The free /hot.json endpoint is good for ~60 req/min per UA."""
+    data = _get_json(
+        f"https://www.reddit.com/r/{subreddit}/hot.json",
+        params={"limit": limit},
+    )
+    rows = []
+    for child in data.get("data", {}).get("children", []):
+        p = child.get("data", {})
+        rows.append({
+            "source":       f"reddit_{subreddit.lower()}",
+            "category":     "social",
+            "external_id":  p.get("name") or p.get("id"),
+            "title":        p.get("title"),
+            "url":          f"https://www.reddit.com{p.get('permalink', '')}",
+            "numeric_value": float(p.get("score") or 0),
+            "metadata":     json.dumps({
+                "subreddit":     p.get("subreddit"),
+                "num_comments":  p.get("num_comments"),
+                "author":        p.get("author"),
+                "is_self":       p.get("is_self"),
+            }),
+            "published_at": None,
+        })
+    return rows
+
+
+def gdelt(query: str = "Polymarket OR prediction market OR election OR Fed OR CPI",
+          max_records: int = 75) -> list[dict]:
+    """GDELT 2.0 article search. ArtList mode returns up to 250 articles.
+    Free, no key, but the response format is undocumented enough that
+    we parse defensively. Useful as a broad event detector for the
+    bot's macro/political market exposure. The endpoint is slow under
+    load — give it 30s instead of the default 10s."""
+    data = _get_json(
+        "https://api.gdeltproject.org/api/v2/doc/doc",
+        params={
+            "query":     query,
+            "mode":      "ArtList",
+            "maxrecords": max_records,
+            "format":    "json",
+            "sort":      "DateDesc",
+        },
+        timeout=30,
+    )
+    rows = []
+    for art in data.get("articles", []):
+        url = art.get("url")
+        if not url:
+            continue
+        rows.append({
+            "source":       "gdelt",
+            "category":     "news",
+            "external_id":  url,
+            "title":        art.get("title"),
+            "url":          url,
+            "metadata":     json.dumps({
+                "domain":      art.get("domain"),
+                "language":    art.get("language"),
+                "sourcecountry": art.get("sourcecountry"),
+                "tone":        art.get("tone"),
+            }),
+            "published_at": art.get("seendate"),
+        })
+    return rows
+
+
+# ── News RSS ───────────────────────────────────────────────────────────────────
+
+def news_bbc() -> list[dict]:
+    return _parse_rss(_get_text("https://feeds.bbci.co.uk/news/world/rss.xml"),
+                      "news_bbc", "news")
+
+
+def news_nyt() -> list[dict]:
+    return _parse_rss(_get_text("https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"),
+                      "news_nyt", "news")
+
+
+def news_reuters() -> list[dict]:
+    # Reuters' own RSS endpoints have been flaky since 2024 — Google News
+    # site-search is a more reliable mirror that requires no auth.
+    return _parse_rss(
+        _get_text("https://news.google.com/rss/search",
+                  params={"q": "site:reuters.com when:1h"}),
+        "news_reuters", "news",
+    )
+
+
+def news_politico() -> list[dict]:
+    return _parse_rss(_get_text("https://rss.politico.com/politics-news.xml"),
+                      "news_politico", "news")
+
+
+def news_google_topstories() -> list[dict]:
+    return _parse_rss(_get_text("https://news.google.com/rss"),
+                      "news_google", "news")
+
+
+# ── Weather / disaster ─────────────────────────────────────────────────────────
+
+def nws_alerts() -> list[dict]:
+    """Active NWS alerts (US). Filtered to severe/extreme so we don't
+    drown in routine advisories. Hurricane / flood / heat-wave events
+    are the ones that move Polymarket weather markets."""
+    data = _get_json(
+        "https://api.weather.gov/alerts/active",
+        params={"severity": "Severe,Extreme"},
+        headers={"User-Agent": DEFAULT_HEADERS["User-Agent"]},
+    )
+    rows = []
+    for f in data.get("features", []):
+        props = f.get("properties", {})
+        rows.append({
+            "source":       "nws_alerts",
+            "category":     "weather",
+            "external_id":  props.get("id") or f.get("id"),
+            "title":        props.get("headline") or props.get("event"),
+            "url":          props.get("@id"),
+            "metadata":     json.dumps({
+                "event":     props.get("event"),
+                "severity":  props.get("severity"),
+                "urgency":   props.get("urgency"),
+                "areaDesc":  props.get("areaDesc"),
+                "effective": props.get("effective"),
+                "expires":   props.get("expires"),
+            }),
+            "published_at": props.get("sent"),
+        })
+    return rows
+
+
+def usgs_quakes(period: str = "all_day", min_magnitude: float = 4.0) -> list[dict]:
+    """Significant earthquakes in the period. `all_day` is a rolling 24h
+    window. Magnitude filter trims the long tail of M2 events that don't
+    matter for prediction markets."""
+    data = _get_json(
+        f"https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/{period}.geojson"
+    )
+    rows = []
+    for f in data.get("features", []):
+        props = f.get("properties", {})
+        mag = props.get("mag")
+        if mag is None or mag < min_magnitude:
+            continue
+        rows.append({
+            "source":       "usgs_quakes",
+            "category":     "disaster",
+            "external_id":  f.get("id"),
+            "title":        props.get("title") or props.get("place"),
+            "url":          props.get("url"),
+            "numeric_value": float(mag),
+            "metadata":     json.dumps({
+                "place":   props.get("place"),
+                "tsunami": props.get("tsunami"),
+                "alert":   props.get("alert"),
+                "type":    props.get("type"),
+                "felt":    props.get("felt"),
+            }),
+            "published_at": props.get("time"),
+        })
+    return rows
+
+
+def nhc_storms() -> list[dict]:
+    """National Hurricane Center current active storms (Atlantic + Pacific).
+    Empty list outside hurricane season — that's the expected normal."""
+    data = _get_json("https://www.nhc.noaa.gov/CurrentStorms.json")
+    rows = []
+    for storm in data.get("activeStorms", []):
+        sid = storm.get("id")
+        if not sid:
+            continue
+        rows.append({
+            "source":       "nhc_storms",
+            "category":     "weather",
+            "external_id":  sid,
+            "title":        f"{storm.get('classification')} {storm.get('name')}",
+            "url":          (storm.get("publicAdvisory") or {}).get("url"),
+            "numeric_value": float(storm.get("intensity") or 0),
+            "metadata":     json.dumps({
+                "binNumber":      storm.get("binNumber"),
+                "classification": storm.get("classification"),
+                "wallet":         storm.get("wallet"),
+                "lastUpdate":     storm.get("lastUpdate"),
+            }),
+            "published_at": storm.get("lastUpdate"),
+        })
+    return rows
+
+
+# ── Sports ─────────────────────────────────────────────────────────────────────
+
+def _espn_scoreboard(sport: str, league: str, source_label: str) -> list[dict]:
+    data = _get_json(
+        f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
+    )
+    rows = []
+    for ev in data.get("events", []):
+        rows.append({
+            "source":       source_label,
+            "category":     "sports",
+            "external_id":  str(ev.get("id")),
+            "title":        ev.get("shortName") or ev.get("name"),
+            "url":          ev.get("links", [{}])[0].get("href"),
+            "metadata":     json.dumps({
+                "status": (ev.get("status") or {}).get("type", {}).get("description"),
+                "competitors": [
+                    {"abbr": c.get("team", {}).get("abbreviation"),
+                     "score": c.get("score")}
+                    for c in (ev.get("competitions", [{}])[0].get("competitors", []))
+                ],
+                "date":   ev.get("date"),
+            }),
+            "published_at": ev.get("date"),
+        })
+    return rows
+
+
+def espn_nfl() -> list[dict]:    return _espn_scoreboard("football", "nfl", "espn_nfl")
+def espn_nba() -> list[dict]:    return _espn_scoreboard("basketball", "nba", "espn_nba")
+def espn_mlb() -> list[dict]:    return _espn_scoreboard("baseball", "mlb", "espn_mlb")
+def espn_nhl() -> list[dict]:    return _espn_scoreboard("hockey", "nhl", "espn_nhl")
+def espn_soccer_eng() -> list[dict]: return _espn_scoreboard("soccer", "eng.1", "espn_epl")
+def espn_soccer_uefa() -> list[dict]: return _espn_scoreboard("soccer", "uefa.champions", "espn_ucl")
+
+
+def mlb_schedule() -> list[dict]:
+    """MLB official stats API — has more depth than ESPN (probable pitchers,
+    weather, full box once games end). Use as a richer secondary source."""
+    data = _get_json("https://statsapi.mlb.com/api/v1/schedule",
+                     params={"sportId": 1})
+    rows = []
+    for d in data.get("dates", []):
+        for g in d.get("games", []):
+            rows.append({
+                "source":       "mlb_schedule",
+                "category":     "sports",
+                "external_id":  str(g.get("gamePk")),
+                "title":        f"{(g.get('teams') or {}).get('away', {}).get('team', {}).get('name')} @ "
+                                f"{(g.get('teams') or {}).get('home', {}).get('team', {}).get('name')}",
+                "url":          f"https://www.mlb.com/gameday/{g.get('gamePk')}/",
+                "metadata":     json.dumps({
+                    "status": (g.get("status") or {}).get("detailedState"),
+                    "venue":  (g.get("venue") or {}).get("name"),
+                }),
+                "published_at": g.get("gameDate"),
+            })
+    return rows
+
+
+# ── Crypto ─────────────────────────────────────────────────────────────────────
+
+def coingecko_top(per_page: int = 30) -> list[dict]:
+    """Top N coins by market cap. CoinGecko free tier allows ~30 req/min,
+    so a single 10-min cron pass is well under the limit. The free tier
+    has occasionally added auth requirements — fall back gracefully on 401."""
+    data = _get_json(
+        "https://api.coingecko.com/api/v3/coins/markets",
+        params={
+            "vs_currency": "usd",
+            "order":       "market_cap_desc",
+            "per_page":    per_page,
+            "page":        1,
+            "sparkline":   "false",
+        },
+    )
+    rows = []
+    for c in data:
+        rows.append({
+            "source":       "coingecko",
+            "category":     "crypto",
+            # Include the timestamp in the dedup key so a 10-min cron writes
+            # one fresh row per coin per pass — otherwise INSERT OR IGNORE
+            # would silently drop every snapshot after the first.
+            "external_id":  f"{c.get('id')}@{int(time.time() // 600)}",
+            "title":        f"{c.get('name')} ({c.get('symbol','').upper()})",
+            "url":          f"https://www.coingecko.com/en/coins/{c.get('id')}",
+            "numeric_value": float(c.get("current_price") or 0),
+            "metadata":     json.dumps({
+                "id":             c.get("id"),
+                "symbol":         c.get("symbol"),
+                "market_cap":     c.get("market_cap"),
+                "volume_24h":     c.get("total_volume"),
+                "change_24h_pct": c.get("price_change_percentage_24h"),
+            }),
+            "published_at": c.get("last_updated"),
+        })
+    return rows
+
+
+def binance_ticker(symbols: tuple[str, ...] = ("BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT")) -> list[dict]:
+    """24h ticker for selected pairs. Free, no auth. We restrict to a few
+    headline pairs so the row count stays small and proportional to signal."""
+    data = _get_json("https://api.binance.com/api/v3/ticker/24hr")
+    wanted = set(symbols)
+    rows = []
+    for t in data:
+        sym = t.get("symbol")
+        if sym not in wanted:
+            continue
+        rows.append({
+            "source":       "binance_ticker",
+            "category":     "crypto",
+            "external_id":  f"{sym}@{int(time.time() // 600)}",
+            "title":        sym,
+            "url":          f"https://www.binance.com/en/trade/{sym}",
+            "numeric_value": float(t.get("lastPrice") or 0),
+            "metadata":     json.dumps({
+                "priceChangePercent": t.get("priceChangePercent"),
+                "highPrice":          t.get("highPrice"),
+                "lowPrice":           t.get("lowPrice"),
+                "quoteVolume":        t.get("quoteVolume"),
+            }),
+            "published_at": None,
+        })
+    return rows
+
+
+def defillama_tvl() -> list[dict]:
+    """Top protocols by TVL. The /protocols endpoint returns ~3000 protocols
+    which is too many — we cap to top 50 by current TVL."""
+    data = _get_json("https://api.llama.fi/protocols")
+    data.sort(key=lambda p: p.get("tvl") or 0, reverse=True)
+    rows = []
+    for p in data[:50]:
+        rows.append({
+            "source":       "defillama_tvl",
+            "category":     "crypto",
+            "external_id":  f"{p.get('slug')}@{int(time.time() // 600)}",
+            "title":        p.get("name"),
+            "url":          p.get("url"),
+            "numeric_value": float(p.get("tvl") or 0),
+            "metadata":     json.dumps({
+                "slug":     p.get("slug"),
+                "symbol":   p.get("symbol"),
+                "category": p.get("category"),
+                "chain":    p.get("chain"),
+                "change_1d": p.get("change_1d"),
+                "change_7d": p.get("change_7d"),
+            }),
+            "published_at": None,
+        })
+    return rows
+
+
+def mempool_fees() -> list[dict]:
+    """BTC mempool fee + price snapshot. One row per pass."""
+    fees = _get_json("https://mempool.space/api/v1/fees/recommended")
+    try:
+        prices = _get_json("https://mempool.space/api/v1/prices")
+    except Exception:
+        prices = {}
+    return [{
+        "source":       "mempool_fees",
+        "category":     "crypto",
+        "external_id":  f"snapshot@{int(time.time() // 600)}",
+        "title":        f"BTC ${prices.get('USD','?')} | fast {fees.get('fastestFee')} sat/vB",
+        "url":          "https://mempool.space",
+        "numeric_value": float(prices.get("USD") or 0),
+        "metadata":     json.dumps({"fees": fees, "prices": prices}),
+        "published_at": None,
+    }]
+
+
+# ── Registry ───────────────────────────────────────────────────────────────────
+
+# (label, fetcher). The label is what shows up in the log line. Order
+# matters only for log readability — there's no dependency between feeds.
+FEEDS: list[tuple[str, Callable[[], list[dict]]]] = [
+    # Cross-market peers
+    ("metaculus",          metaculus),
+    # News & social
+    ("hn_top",             hacker_news_top),
+    ("reddit_sportsbook",  lambda: reddit_hot("sportsbook")),
+    ("reddit_wallstreetbets", lambda: reddit_hot("wallstreetbets")),
+    ("reddit_politics",    lambda: reddit_hot("politics", limit=15)),
+    ("reddit_nba",         lambda: reddit_hot("nba")),
+    ("reddit_nfl",         lambda: reddit_hot("nfl")),
+    ("reddit_soccer",      lambda: reddit_hot("soccer")),
+    ("gdelt",              gdelt),
+    ("news_bbc",           news_bbc),
+    ("news_nyt",           news_nyt),
+    ("news_reuters",       news_reuters),
+    ("news_politico",      news_politico),
+    ("news_google",        news_google_topstories),
+    # Weather / disaster
+    ("nws_alerts",         nws_alerts),
+    ("usgs_quakes",        usgs_quakes),
+    ("nhc_storms",         nhc_storms),
+    # Sports
+    ("espn_nfl",           espn_nfl),
+    ("espn_nba",           espn_nba),
+    ("espn_mlb",           espn_mlb),
+    ("espn_nhl",           espn_nhl),
+    ("espn_epl",           espn_soccer_eng),
+    ("espn_ucl",           espn_soccer_uefa),
+    ("mlb_schedule",       mlb_schedule),
+    # Crypto
+    ("coingecko",          coingecko_top),
+    ("binance_ticker",     binance_ticker),
+    ("defillama_tvl",      defillama_tvl),
+    ("mempool_fees",       mempool_fees),
+]
+
+
+def run_all() -> list[dict]:
+    """Run every registered fetcher and flatten the results into one list
+    ready for record_external_feeds. A failure in one source never affects
+    the others — _safe catches everything."""
+    out: list[dict] = []
+    for label, fn in FEEDS:
+        out.extend(_safe(fn, label))
+    return out
