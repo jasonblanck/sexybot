@@ -551,6 +551,11 @@ class PolymarketBot:
         }
         self._regime_cache_time: float = 0.0
         self._regime_fail_streak: int = 0   # consecutive Claude failures; resets to normal after threshold
+        # SEXYBOT_FEEDS_DAMPER per-instance state — explicit init avoids
+        # the class-level-mutable-default footgun for these dicts.
+        self._damper_today_date: str = ""
+        self._damper_fires_today: dict = {}
+        self._damper_alerted_today: dict = {}
         # Brier-score calibrator — self-corrects predicted_prob bias learned
         # from resolved history. source='default' reads ALL rows in brier_scores
         # (including pre-migration rows with NULL source) so the bot starts
@@ -2194,8 +2199,9 @@ class PolymarketBot:
 
     def _record_damper_fire(self, condition: str, summary: str) -> None:
         """Bookkeeping when a SEXYBOT_FEEDS_DAMPER condition fires inside
-        _econflow_signal. Increments today's per-condition counter; sends
-        ONE Telegram alert the first time each condition fires per day."""
+        a strategy signal (currently the momentum path). Increments today's
+        per-condition counter; sends ONE Telegram alert the first time each
+        condition fires per day."""
         today = datetime.utcnow().strftime("%Y-%m-%d")
         if self._damper_today_date != today:
             self._damper_today_date = today
@@ -2208,7 +2214,7 @@ class PolymarketBot:
                 msg = (
                     f"⚠️ DAMPER FIRED [{condition}]\n"
                     f"{summary}\n"
-                    f"econFlow confidence is being damped on matching markets."
+                    f"Momentum signal confidence is being damped on matching markets."
                 )
                 try:
                     asyncio.create_task(asyncio.to_thread(self.send_telegram, msg))
@@ -2216,19 +2222,40 @@ class PolymarketBot:
                     log.debug("damper telegram dispatch failed: %s", _e)
 
     def get_macro_context(self) -> dict:
+        """Returns {fed_rate, cpi, vix} with a 1-hour cache.
+
+        Preference order for each value:
+        1. Local `external_feeds` row from FRED (populated by feeds_poll
+           every 10 min). Read once via _feed_recent_values — fast, no
+           HTTP, robust to FRED outage.
+        2. Direct FRED HTTP fetch (the legacy code path) if the local
+           table has no row for that series.
+        3. Hardcoded fallbacks (rate=4.5, cpi=3.0, vix=None).
+
+        CPI in this dict is the YoY % change, not the absolute index.
+        External_feeds stores the raw level; we compute YoY from a 13-month
+        FRED HTTP fetch as the fast path can't do it locally."""
         import urllib.request, json as _j
         if time.time() - self._macro_cache_time < 3600 and self._macro_cache:
             return self._macro_cache
+        # 1) Fed funds rate — try external_feeds first.
+        rate = None
+        feeds_rate = self._feed_recent_values("fred_fedfunds", 1)
+        if feeds_rate:
+            rate = float(feeds_rate[0])
+            log.debug("get_macro_context: fed_rate from external_feeds = %.2f", rate)
+        if rate is None:
+            try:
+                url = f"https://api.stlouisfed.org/fred/series/observations?series_id=FEDFUNDS&api_key={FRED_API_KEY}&sort_order=desc&limit=1&file_type=json"
+                with _ureq.urlopen(url, timeout=5) as r:
+                    d = _j.loads(r.read())
+                    rate = float(d["observations"][0]["value"])
+            except Exception as e:
+                log.warning(f"FRED FEDFUNDS fetch failed, using fallback 4.5: {e}")
+                rate = 4.5
+        # 2) CPI YoY % — external_feeds has the level; YoY needs 13mo
+        #    history, which only the HTTP path can compute. Keep HTTP.
         try:
-            url = f"https://api.stlouisfed.org/fred/series/observations?series_id=FEDFUNDS&api_key={FRED_API_KEY}&sort_order=desc&limit=1&file_type=json"
-            with _ureq.urlopen(url, timeout=5) as r:
-                d = _j.loads(r.read())
-                rate = float(d["observations"][0]["value"])
-        except Exception as e:
-            log.warning(f"FRED FEDFUNDS fetch failed, using fallback 4.5: {e}")
-            rate = 4.5
-        try:
-            # Fetch 13 months to compute YoY % change
             url2 = f"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key={FRED_API_KEY}&sort_order=desc&limit=13&file_type=json"
             with urllib.request.urlopen(url2, timeout=5) as r:
                 d2 = _j.loads(r.read())
@@ -2239,17 +2266,22 @@ class PolymarketBot:
         except Exception as e:
             log.warning(f"FRED CPIAUCSL fetch failed, using fallback 3.0: {e}")
             cpi = 3.0
-        # VIX — try FRED first, fall back to Yahoo Finance if FRED fails.
+        # 3) VIX — external_feeds first, then FRED, then Yahoo.
         vix = None
-        try:
-            url3 = f"https://api.stlouisfed.org/fred/series/observations?series_id=VIXCLS&api_key={FRED_API_KEY}&sort_order=desc&limit=1&file_type=json"
-            with _ureq.urlopen(url3, timeout=5) as r:
-                d3 = _j.loads(r.read())
-                obs3 = [o for o in d3["observations"] if o["value"] != "."]
-                if obs3:
-                    vix = float(obs3[0]["value"])
-        except Exception as e:
-            log.warning(f"FRED VIXCLS fetch failed ({e}); trying Yahoo Finance fallback")
+        feeds_vix = self._feed_recent_values("fred_vixcls", 1)
+        if feeds_vix:
+            vix = float(feeds_vix[0])
+            log.debug("get_macro_context: vix from external_feeds = %.2f", vix)
+        if vix is None:
+            try:
+                url3 = f"https://api.stlouisfed.org/fred/series/observations?series_id=VIXCLS&api_key={FRED_API_KEY}&sort_order=desc&limit=1&file_type=json"
+                with _ureq.urlopen(url3, timeout=5) as r:
+                    d3 = _j.loads(r.read())
+                    obs3 = [o for o in d3["observations"] if o["value"] != "."]
+                    if obs3:
+                        vix = float(obs3[0]["value"])
+            except Exception as e:
+                log.warning(f"FRED VIXCLS fetch failed ({e}); trying Yahoo Finance fallback")
         if vix is None:
             try:
                 req_yf = _ureq.Request(
@@ -6874,7 +6906,11 @@ class PolymarketBot:
                 q_lower = question.lower()
                 is_sports = any(x in q_lower for x in ["win","game","match","league","cup","fc","nba","nfl","mlb","nhl"])
                 is_political = any(x in q_lower for x in ["president","election","senate","congress","party","nominee"])
-                is_economic = any(x in q_lower for x in ["fed","rate","inflation","gdp","economy","recession","cpi","stock","market"])
+                is_economic = any(x in q_lower for x in [
+                    "fed","rate","rates","inflation","gdp","economy","recession",
+                    "cpi","ppi","stock","market","jobs","employment","payroll",
+                    "unemployment","fomc","powell","wage","wages","labor",
+                ])
                 is_tech = any(x in q_lower for x in ["tech","ai","apple","microsoft","nvidia","tesla","amazon","meta","google"])
                 if weather["bad_weather"] and is_sports:
                     confidence *= 0.75
@@ -6893,6 +6929,56 @@ class PolymarketBot:
                     confidence *= 0.85
                     amount *= 0.8
                     self._log(f"FMP ADJ: market bearish ({sentiment.get('spy_change_pct',0):+.2f}%), reducing exposure")
+
+                # SEXYBOT_FEEDS_DAMPER: additional macro dampers sourced from
+                # external_feeds (FRED). Gated OFF by default. Strict safety
+                # invariant: these conditions can ONLY multiply confidence
+                # by <= 1.0 — never raise it. Worst case: bot trades less,
+                # not worse. Mirrors the dampener that was previously wired
+                # into _econflow_signal (which is dead code when
+                # STRATEGY=momentum).
+                if os.getenv("SEXYBOT_FEEDS_DAMPER", "0") == "1":
+                    # 1) Jobless-claims w/w surprise (FRED ICSA). >20% spike
+                    #    → damp labor/recession markets. Latest ICSA was
+                    #    211k as of 2026-05-09 — well within normal range.
+                    try:
+                        icsa = self._feed_recent_values("fred_icsa", 2)
+                        if len(icsa) == 2 and icsa[1] > 0:
+                            wow = (icsa[0] - icsa[1]) / icsa[1]
+                            if wow > 0.20 and any(k in q_lower for k in
+                                ("employ", "job", "unemploy", "payroll",
+                                 "labor", "recession")):
+                                confidence *= 0.70
+                                self._log(
+                                    f"DAMPER ADJ: jobless claims +{wow*100:.0f}% w/w "
+                                    f"({icsa[1]:.0f}→{icsa[0]:.0f}) — confidence ×0.70"
+                                )
+                                self._record_damper_fire(
+                                    "jobless_claims",
+                                    f"ICSA jumped {wow*100:.0f}% w/w ({icsa[1]:.0f} → {icsa[0]:.0f})"
+                                )
+                    except Exception as _e:
+                        log.debug("ICSA damper error: %s", _e)
+                    # 2) Yield curve inversion (FRED T10Y2Y). Deeply negative
+                    #    → damp growth/index markets. Current value +0.5
+                    #    (positive/steepening), so silent today.
+                    try:
+                        t10y2y = self._feed_recent_values("fred_t10y2y", 1)
+                        if t10y2y and t10y2y[0] < -0.5 and any(k in q_lower for k in
+                            ("s&p", "sp500", "spx", "gdp", "growth", "economy",
+                             "recession", "earnings")):
+                            confidence *= 0.80
+                            self._log(
+                                f"DAMPER ADJ: yield curve inverted "
+                                f"({t10y2y[0]:.2f}pp) — confidence ×0.80"
+                            )
+                            self._record_damper_fire(
+                                "yield_curve",
+                                f"10Y-2Y spread at {t10y2y[0]:.2f}pp (deeply inverted)"
+                            )
+                    except Exception as _e:
+                        log.debug("T10Y2Y damper error: %s", _e)
+
                 side_label = "YES" if yes_p > 0.5 else "NO"
                 tid = yes_id if yes_p > 0.5 else no_id
                 return {"strategy": "momentum", "signal": f"BUY {side_label}",
@@ -6967,7 +7053,11 @@ class PolymarketBot:
                 confidence = round(dev * 200, 1)
                 amount     = min(MAX_ORDER_SIZE, MAX_ORDER_SIZE * dev * 2)
                 q_lower    = question.lower()
-                is_economic = any(x in q_lower for x in ["fed","rate","inflation","gdp","economy","recession","cpi","stock","market"])
+                is_economic = any(x in q_lower for x in [
+                    "fed","rate","rates","inflation","gdp","economy","recession",
+                    "cpi","ppi","stock","market","jobs","employment","payroll",
+                    "unemployment","fomc","powell","wage","wages","labor",
+                ])
                 is_tech     = any(x in q_lower for x in ["tech","ai","apple","microsoft","nvidia","tesla","amazon","meta","google"])
                 if sentiment.get("bullish") and (is_economic or is_tech):
                     confidence *= 1.10
@@ -7056,47 +7146,11 @@ class PolymarketBot:
                 conf_mult *= 0.75
                 notes.append(f"contra-cycle (rate {fed_rate:.2f}% + dovish bet)")
 
-        # SEXYBOT_FEEDS_DAMPER: additional macro dampers sourced from the
-        # external_feeds table (FRED/BLS). Gated OFF by default so this is
-        # a no-op until the operator explicitly enables it. Strict safety
-        # invariant: conditions in this block can ONLY multiply conf_mult
-        # by a value <= 1.0 — never raise it. Worst case if the gate is
-        # on and data is noisy: bot trades less, not worse.
-        if os.getenv("SEXYBOT_FEEDS_DAMPER", "0") == "1":
-            # 1) Jobless-claims week-over-week surprise (FRED ICSA, weekly).
-            #    A >20% w/w spike means a labor-market shock that the
-            #    momentum-flow signal isn't aware of. Damp employment-
-            #    and recession-themed markets so we don't fade fresh info.
-            try:
-                icsa = self._feed_recent_values("fred_icsa", 2)
-                if len(icsa) == 2 and icsa[1] > 0:
-                    wow = (icsa[0] - icsa[1]) / icsa[1]
-                    if wow > 0.20 and any(k in q_low for k in
-                        ("employ", "job", "unemploy", "payroll", "labor", "recession")):
-                        conf_mult *= 0.70
-                        notes.append(f"jobless claims +{wow*100:.0f}% w/w")
-                        self._record_damper_fire(
-                            "jobless_claims",
-                            f"ICSA jumped {wow*100:.0f}% w/w ({icsa[1]:.0f} → {icsa[0]:.0f})"
-                        )
-            except Exception as _e:
-                log.debug("ICSA damper error: %s", _e)
-            # 2) Yield-curve inversion (FRED T10Y2Y). Deeply negative spread
-            #    is the canonical recession leading indicator. Damp
-            #    growth/index/economy markets when curve is < -0.5.
-            try:
-                t10y2y = self._feed_recent_values("fred_t10y2y", 1)
-                if t10y2y and t10y2y[0] < -0.5 and any(k in q_low for k in
-                    ("s&p", "sp500", "spx", "gdp", "growth", "economy",
-                     "recession", "earnings")):
-                    conf_mult *= 0.80
-                    notes.append(f"yield curve inverted ({t10y2y[0]:.2f}pp)")
-                    self._record_damper_fire(
-                        "yield_curve",
-                        f"10Y-2Y spread at {t10y2y[0]:.2f}pp (deeply inverted)"
-                    )
-            except Exception as _e:
-                log.debug("T10Y2Y damper error: %s", _e)
+        # NOTE: SEXYBOT_FEEDS_DAMPER for the econflow path was removed in
+        # favor of wiring the same conditions into the momentum signal,
+        # which is the actually-active code path in production
+        # (STRATEGY=momentum). The damper code lives in the momentum
+        # block near the existing fed_rate / cpi adjustments.
 
         weighted_conf = max(0.0, min(100.0, flow["confidence"] * conf_mult))
 
