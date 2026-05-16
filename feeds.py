@@ -1650,8 +1650,8 @@ FEEDS: list[tuple[str, Callable[[], list[dict]]]] = [
     # Congress.gov — recent bills + nominations in current Congress.
     # Bumps existing congress.gov RSS up to structured JSON with action
     # text. No-op if CONGRESS_API_KEY unset.
-    ("congress_bills",     congress_recent_bills),
-    ("congress_nominations", congress_recent_nominations),
+    ("congress_bills_v3",  congress_recent_bills),
+    ("congress_nominations_v3", congress_recent_nominations),
     # Trending / entertainment
     ("wikipedia_top",      wikipedia_top_pageviews),
     ("boxoffice_mojo",     box_office_mojo_weekend),
