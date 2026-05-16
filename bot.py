@@ -2192,6 +2192,29 @@ class PolymarketBot:
             log.debug("_feed_recent_values(%s) failed: %s", source, exc)
             return []
 
+    def _record_damper_fire(self, condition: str, summary: str) -> None:
+        """Bookkeeping when a SEXYBOT_FEEDS_DAMPER condition fires inside
+        _econflow_signal. Increments today's per-condition counter; sends
+        ONE Telegram alert the first time each condition fires per day."""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        if self._damper_today_date != today:
+            self._damper_today_date = today
+            self._damper_fires_today = {}
+            self._damper_alerted_today = {}
+        self._damper_fires_today[condition] = self._damper_fires_today.get(condition, 0) + 1
+        if not self._damper_alerted_today.get(condition):
+            self._damper_alerted_today[condition] = True
+            if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                msg = (
+                    f"⚠️ DAMPER FIRED [{condition}]\n"
+                    f"{summary}\n"
+                    f"econFlow confidence is being damped on matching markets."
+                )
+                try:
+                    asyncio.create_task(asyncio.to_thread(self.send_telegram, msg))
+                except Exception as _e:
+                    log.debug("damper telegram dispatch failed: %s", _e)
+
     def get_macro_context(self) -> dict:
         import urllib.request, json as _j
         if time.time() - self._macro_cache_time < 3600 and self._macro_cache:
@@ -2541,6 +2564,14 @@ class PolymarketBot:
     # routine catches plan-exhaustion or a dead provider).
     _openrouter_last_error: str = ""
     _openrouter_last_success_ts: float = 0
+
+    # SEXYBOT_FEEDS_DAMPER bookkeeping. Per-condition daily counters +
+    # one-per-day Telegram alert flag. Reset implicitly when the bot
+    # process restarts (acceptable — we only care about "did this fire
+    # today, and how often"). Date string is YYYY-MM-DD UTC.
+    _damper_today_date: str = ""
+    _damper_fires_today: dict = {}    # condition -> count
+    _damper_alerted_today: dict = {}  # condition -> True/False
 
     # Finnhub stock quote cache. Keyed by ticker, 60s TTL per symbol.
     _finnhub_cache:      dict  = {}    # symbol → {price, change_pct, ts}
@@ -7044,6 +7075,10 @@ class PolymarketBot:
                         ("employ", "job", "unemploy", "payroll", "labor", "recession")):
                         conf_mult *= 0.70
                         notes.append(f"jobless claims +{wow*100:.0f}% w/w")
+                        self._record_damper_fire(
+                            "jobless_claims",
+                            f"ICSA jumped {wow*100:.0f}% w/w ({icsa[1]:.0f} → {icsa[0]:.0f})"
+                        )
             except Exception as _e:
                 log.debug("ICSA damper error: %s", _e)
             # 2) Yield-curve inversion (FRED T10Y2Y). Deeply negative spread
@@ -7056,6 +7091,10 @@ class PolymarketBot:
                      "recession", "earnings")):
                     conf_mult *= 0.80
                     notes.append(f"yield curve inverted ({t10y2y[0]:.2f}pp)")
+                    self._record_damper_fire(
+                        "yield_curve",
+                        f"10Y-2Y spread at {t10y2y[0]:.2f}pp (deeply inverted)"
+                    )
             except Exception as _e:
                 log.debug("T10Y2Y damper error: %s", _e)
 
@@ -9877,6 +9916,14 @@ async def health_all(request: Request):
                 err = f"{type(e).__name__}: {e}"[:200]
                 bot._openrouter_last_error = err
                 openrouter_probe = {"ok": False, "configured": True, "detail": err}
+        # SEXYBOT_FEEDS_DAMPER state — gated econflow dampener that fires
+        # on jobless-claims w/w spike or yield-curve inversion. Reset on
+        # bot restart; date check inside _record_damper_fire keeps it daily.
+        damper = {
+            "enabled": os.getenv("SEXYBOT_FEEDS_DAMPER", "0") == "1",
+            "fires_today": dict(bot._damper_fires_today or {}),
+            "today_date":  bot._damper_today_date or None,
+        }
         return {
             "runtime":          runtime,
             "external":         ext,
@@ -9884,6 +9931,7 @@ async def health_all(request: Request):
             "calibrator":       calibrator,
             "arb_signals":      {"today": arb_today, "last_24h": arb_24h},
             "openrouter_probe": openrouter_probe,
+            "damper":           damper,
         }
     except Exception as e:
         log.warning(f"/health/all error: {e}")
