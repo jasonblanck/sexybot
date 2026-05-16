@@ -1210,6 +1210,99 @@ def thesportsdb_next_events() -> list[dict]:
     return rows
 
 
+_CONGRESS_CURRENT = 119  # bump when a new Congress convenes
+
+
+def _congress_recent(endpoint: str, label: str, count_key: str,
+                     extract: Callable) -> list[dict]:
+    """Shared helper for Congress.gov /v3 endpoints — bills + nominations.
+
+    Free tier is 1000 req/hour, way over our needs (2 calls per 10-min
+    pass = 12/hour), so no throttle. Returns [] if CONGRESS_API_KEY unset."""
+    api_key = os.getenv("CONGRESS_API_KEY", "").strip()
+    if not api_key:
+        log.debug("CONGRESS_API_KEY not set; skipping %s fetch", label)
+        return []
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    since = (_dt.now(_tz.utc) - _td(days=14)).strftime("%Y-%m-%dT00:00:00Z")
+    try:
+        data = _get_json(
+            f"https://api.congress.gov/v3/{endpoint}/{_CONGRESS_CURRENT}",
+            params={
+                "api_key":      api_key,
+                "format":       "json",
+                "limit":        15,
+                "fromDateTime": since,
+            },
+        )
+    except Exception as exc:
+        log.warning("Congress %s fetch failed: %s", label, exc)
+        return []
+    rows: list[dict] = []
+    for item in (data.get(count_key) or [])[:15]:
+        row = extract(item)
+        if row:
+            rows.append(row)
+    return rows
+
+
+def congress_recent_bills() -> list[dict]:
+    """Bills in the current Congress with activity in the last 14 days."""
+    def _ex(b: dict) -> dict | None:
+        btype = b.get("type") or ""
+        bnum  = b.get("number") or ""
+        if not btype or not bnum:
+            return None
+        title = (b.get("title") or "").strip()
+        la = b.get("latestAction") or {}
+        action_date = la.get("actionDate", "")
+        action_text = (la.get("text") or "").strip()
+        return {
+            "source":        "congress_bill",
+            "category":      "politics",
+            "external_id":   f"CONGRESS|{_CONGRESS_CURRENT}|{btype}|{bnum}",
+            "title":         f"[{btype}{bnum}] {title[:140]} — {action_date}: {action_text[:120]}",
+            "url":           b.get("url") or f"https://www.congress.gov/bill/{_CONGRESS_CURRENT}th-congress/{btype.lower()}/{bnum}",
+            "numeric_value": None,
+            "metadata":      json.dumps({
+                "type":        btype,
+                "number":      bnum,
+                "action_date": action_date,
+                "action":      action_text[:200],
+            }),
+            "published_at": action_date or b.get("updateDate"),
+        }
+    return _congress_recent("bill", "bills", "bills", _ex)
+
+
+def congress_recent_nominations() -> list[dict]:
+    """Pending nominations in the current Congress with recent activity —
+    high-value for Polymarket 'will X be confirmed by Y' markets."""
+    def _ex(n: dict) -> dict | None:
+        num = n.get("number") or n.get("citation") or ""
+        if not num:
+            return None
+        desc = (n.get("description") or "").strip()
+        la = n.get("latestAction") or {}
+        action_date = la.get("actionDate", "")
+        action_text = (la.get("text") or "").strip()
+        return {
+            "source":        "congress_nomination",
+            "category":      "politics",
+            "external_id":   f"CONGRESS|{_CONGRESS_CURRENT}|PN|{num}|{action_date}",
+            "title":         f"[PN{num}] {desc[:140]} — {action_date}: {action_text[:120]}",
+            "url":           n.get("url") or f"https://www.congress.gov/nomination/{_CONGRESS_CURRENT}th-congress/{num}",
+            "numeric_value": None,
+            "metadata":      json.dumps({
+                "number":      num,
+                "action_date": action_date,
+                "action":      action_text[:200],
+            }),
+            "published_at": action_date or n.get("updateDate"),
+        }
+    return _congress_recent("nomination", "nominations", "nominations", _ex)
+
+
 def ecb_eurusd() -> list[dict]:
     """ECB SDMX endpoint — last 10 EUR/USD daily observations. The SDMX
     JSON format is wordy; we extract just the observation series."""
@@ -1554,6 +1647,11 @@ FEEDS: list[tuple[str, Callable[[], list[dict]]]] = [
     # TheSportsDB next events for leagues ESPN scoreboards skip (UFC, F1,
     # Bundesliga/SerieA/Ligue1, MLS). Throttled to ~1 fetch/hour.
     ("sportsdb_events",    thesportsdb_next_events),
+    # Congress.gov — recent bills + nominations in current Congress.
+    # Bumps existing congress.gov RSS up to structured JSON with action
+    # text. No-op if CONGRESS_API_KEY unset.
+    ("congress_bills",     congress_recent_bills),
+    ("congress_nominations", congress_recent_nominations),
     # Trending / entertainment
     ("wikipedia_top",      wikipedia_top_pageviews),
     ("boxoffice_mojo",     box_office_mojo_weekend),
