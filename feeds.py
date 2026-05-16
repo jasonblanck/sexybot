@@ -1051,6 +1051,81 @@ def newsapi_top_headlines() -> list[dict]:
     return rows
 
 
+def alphavantage_news_sentiment() -> list[dict]:
+    """Alpha Vantage NEWS_SENTIMENT — financial articles with pre-computed
+    bullish/bearish sentiment scores.
+
+    Free tier is 25 req/day, so we throttle hard: once per 2 hours via a
+    sentinel file (~12 calls/day, safe margin). Each call returns up to
+    50 articles already scored, which is the unique value-add vs the
+    rest of the news feeds (which are unscored)."""
+    api_key = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+    if not api_key:
+        log.debug("ALPHAVANTAGE_API_KEY not set; skipping AV fetch")
+        return []
+    sentinel = "/tmp/sexybot-alphavantage-lastrun"
+    try:
+        last = os.path.getmtime(sentinel)
+        if time.time() - last < 7100:  # < ~118 min
+            log.debug("alphavantage: throttled (last run %.0fs ago)", time.time() - last)
+            return []
+    except OSError:
+        pass
+    try:
+        data = _get_json(
+            "https://www.alphavantage.co/query",
+            params={
+                "function": "NEWS_SENTIMENT",
+                "topics":   "financial_markets,earnings,economy_macro",
+                "limit":    50,
+                "apikey":   api_key,
+            },
+            timeout=20,
+        )
+    except Exception as exc:
+        log.warning("Alpha Vantage fetch failed: %s", exc)
+        return []
+    # AV signals rate-limit by returning an Information / Note key with
+    # 200 OK — guard against it so we don't burn the sentinel on no-ops.
+    if not isinstance(data, dict) or "feed" not in data:
+        log.warning("Alpha Vantage unexpected payload (rate-limited?): %s",
+                    json.dumps(data)[:200])
+        return []
+    try:
+        with open(sentinel, "w") as fh:
+            fh.write("")
+    except OSError:
+        pass
+    rows: list[dict] = []
+    for art in data.get("feed", []):
+        title = (art.get("title") or "").strip()
+        if not title:
+            continue
+        url = art.get("url") or ""
+        try:
+            score = float(art.get("overall_sentiment_score") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        label = art.get("overall_sentiment_label", "")
+        published = (art.get("time_published") or "")[:15]
+        rows.append({
+            "source":        "alphavantage_sentiment",
+            "category":      "news",
+            "external_id":   f"AV|{url}",
+            "title":         f"[{label} {score:+.2f}] {title}",
+            "url":           url,
+            "numeric_value": score,
+            "metadata":      json.dumps({
+                "source":   art.get("source"),
+                "label":    label,
+                "tickers":  [t.get("ticker") for t in (art.get("ticker_sentiment") or [])][:8],
+                "topics":   [t.get("topic") for t in (art.get("topics") or [])][:5],
+            }),
+            "published_at": published,
+        })
+    return rows
+
+
 def ecb_eurusd() -> list[dict]:
     """ECB SDMX endpoint — last 10 EUR/USD daily observations. The SDMX
     JSON format is wordy; we extract just the observation series."""
@@ -1389,6 +1464,9 @@ FEEDS: list[tuple[str, Callable[[], list[dict]]]] = [
     # NewsAPI top US headlines — throttled to ~1/hour internally to fit
     # free-tier 100/day budget. No-op if NEWSAPI_KEY unset.
     ("newsapi_top",        newsapi_top_headlines),
+    # Alpha Vantage NEWS_SENTIMENT — pre-scored finance articles. Throttled
+    # to ~1 call / 2 hours to fit 25/day free-tier budget. No-op if unset.
+    ("av_news_sentiment",  alphavantage_news_sentiment),
     # Trending / entertainment
     ("wikipedia_top",      wikipedia_top_pageviews),
     ("boxoffice_mojo",     box_office_mojo_weekend),
