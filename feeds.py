@@ -1126,6 +1126,90 @@ def alphavantage_news_sentiment() -> list[dict]:
     return rows
 
 
+_SPORTSDB_LEAGUES = [
+    # (league_id, friendly_name) — picked to NOT overlap with ESPN scoreboards.
+    # ESPN already covers NFL, NBA, MLB, NHL, EPL, UCL well.
+    (4443, "UFC"),
+    (4370, "Formula 1"),
+    (4331, "Bundesliga"),
+    (4332, "Serie A"),
+    (4334, "Ligue 1"),
+    (4346, "MLS"),
+]
+
+
+def thesportsdb_next_events() -> list[dict]:
+    """TheSportsDB next 15 events per tracked league.
+
+    Free-tier key is the public sentinel "123" — but rate limits still
+    apply. We throttle to once per hour via /tmp sentinel: 6 leagues × 1
+    call = 6 calls/hour = 144/day. Each call returns up to 15 upcoming
+    events.
+
+    Picks leagues ESPN scoreboards don't cover well (UFC, F1, top-tier
+    European soccer outside EPL, MLS) — direct overlap with the markets
+    Polymarket lists. No-op if SPORTSDB_API_KEY isn't set."""
+    api_key = os.getenv("SPORTSDB_API_KEY", "").strip()
+    if not api_key:
+        log.debug("SPORTSDB_API_KEY not set; skipping TheSportsDB fetch")
+        return []
+    sentinel = "/tmp/sexybot-sportsdb-lastrun"
+    try:
+        last = os.path.getmtime(sentinel)
+        if time.time() - last < 3500:
+            log.debug("sportsdb: throttled (last run %.0fs ago)", time.time() - last)
+            return []
+    except OSError:
+        pass
+    rows: list[dict] = []
+    any_ok = False
+    for lid, label in _SPORTSDB_LEAGUES:
+        try:
+            data = _get_json(
+                f"https://www.thesportsdb.com/api/v1/json/{api_key}/eventsnextleague.php",
+                params={"id": lid},
+            )
+        except Exception as exc:
+            log.debug("SportsDB league %s fetch failed: %s", label, exc)
+            continue
+        any_ok = True
+        for ev in (data.get("events") or [])[:15]:
+            eid = ev.get("idEvent")
+            if not eid:
+                continue
+            home = ev.get("strHomeTeam") or ""
+            away = ev.get("strAwayTeam") or ""
+            event_name = ev.get("strEvent") or f"{home} vs {away}"
+            date = ev.get("dateEvent") or ""
+            t = ev.get("strTime") or ""
+            rows.append({
+                "source":        f"sportsdb_{label.lower().replace(' ','_')}",
+                "category":      "sports",
+                "external_id":   f"SPORTSDB|{eid}",
+                "title":         f"[{label}] {date} {t}: {event_name}".strip(),
+                "url":           f"https://www.thesportsdb.com/event/{eid}",
+                "numeric_value": None,
+                "metadata":      json.dumps({
+                    "league":      label,
+                    "league_id":   lid,
+                    "home":        home,
+                    "away":        away,
+                    "round":       ev.get("intRound"),
+                    "season":      ev.get("strSeason"),
+                }),
+                "published_at": date,
+            })
+    # Only mark the sentinel when at least one league succeeded —
+    # avoids burning the hour on a transient outage.
+    if any_ok:
+        try:
+            with open(sentinel, "w") as fh:
+                fh.write("")
+        except OSError:
+            pass
+    return rows
+
+
 def ecb_eurusd() -> list[dict]:
     """ECB SDMX endpoint — last 10 EUR/USD daily observations. The SDMX
     JSON format is wordy; we extract just the observation series."""
@@ -1467,6 +1551,9 @@ FEEDS: list[tuple[str, Callable[[], list[dict]]]] = [
     # Alpha Vantage NEWS_SENTIMENT — pre-scored finance articles. Throttled
     # to ~1 call / 2 hours to fit 25/day free-tier budget. No-op if unset.
     ("av_news_sentiment",  alphavantage_news_sentiment),
+    # TheSportsDB next events for leagues ESPN scoreboards skip (UFC, F1,
+    # Bundesliga/SerieA/Ligue1, MLS). Throttled to ~1 fetch/hour.
+    ("sportsdb_events",    thesportsdb_next_events),
     # Trending / entertainment
     ("wikipedia_top",      wikipedia_top_pageviews),
     ("boxoffice_mojo",     box_office_mojo_weekend),
