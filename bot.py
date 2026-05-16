@@ -2176,6 +2176,22 @@ class PolymarketBot:
         finally:
             self._monitor_active = False
 
+    def _feed_recent_values(self, source: str, n: int = 2) -> list[float]:
+        """Return up to n most recent numeric values for a feed source from
+        external_feeds, newest first. Empty list on any failure. Used by
+        the SEXYBOT_FEEDS_DAMPER path in _econflow_signal."""
+        try:
+            rows = self.db.execute(
+                "SELECT numeric_value FROM external_feeds "
+                "WHERE source = ? AND numeric_value IS NOT NULL "
+                "ORDER BY published_at DESC LIMIT ?",
+                (source, n),
+            ).fetchall()
+            return [float(r[0]) for r in rows if r[0] is not None]
+        except Exception as exc:
+            log.debug("_feed_recent_values(%s) failed: %s", source, exc)
+            return []
+
     def get_macro_context(self) -> dict:
         import urllib.request, json as _j
         if time.time() - self._macro_cache_time < 3600 and self._macro_cache:
@@ -7008,6 +7024,40 @@ class PolymarketBot:
             elif fed_rate < 2.0 and dovish_bet:
                 conf_mult *= 0.75
                 notes.append(f"contra-cycle (rate {fed_rate:.2f}% + dovish bet)")
+
+        # SEXYBOT_FEEDS_DAMPER: additional macro dampers sourced from the
+        # external_feeds table (FRED/BLS). Gated OFF by default so this is
+        # a no-op until the operator explicitly enables it. Strict safety
+        # invariant: conditions in this block can ONLY multiply conf_mult
+        # by a value <= 1.0 — never raise it. Worst case if the gate is
+        # on and data is noisy: bot trades less, not worse.
+        if os.getenv("SEXYBOT_FEEDS_DAMPER", "0") == "1":
+            # 1) Jobless-claims week-over-week surprise (FRED ICSA, weekly).
+            #    A >20% w/w spike means a labor-market shock that the
+            #    momentum-flow signal isn't aware of. Damp employment-
+            #    and recession-themed markets so we don't fade fresh info.
+            try:
+                icsa = self._feed_recent_values("fred_icsa", 2)
+                if len(icsa) == 2 and icsa[1] > 0:
+                    wow = (icsa[0] - icsa[1]) / icsa[1]
+                    if wow > 0.20 and any(k in q_low for k in
+                        ("employ", "job", "unemploy", "payroll", "labor", "recession")):
+                        conf_mult *= 0.70
+                        notes.append(f"jobless claims +{wow*100:.0f}% w/w")
+            except Exception as _e:
+                log.debug("ICSA damper error: %s", _e)
+            # 2) Yield-curve inversion (FRED T10Y2Y). Deeply negative spread
+            #    is the canonical recession leading indicator. Damp
+            #    growth/index/economy markets when curve is < -0.5.
+            try:
+                t10y2y = self._feed_recent_values("fred_t10y2y", 1)
+                if t10y2y and t10y2y[0] < -0.5 and any(k in q_low for k in
+                    ("s&p", "sp500", "spx", "gdp", "growth", "economy",
+                     "recession", "earnings")):
+                    conf_mult *= 0.80
+                    notes.append(f"yield curve inverted ({t10y2y[0]:.2f}pp)")
+            except Exception as _e:
+                log.debug("T10Y2Y damper error: %s", _e)
 
         weighted_conf = max(0.0, min(100.0, flow["confidence"] * conf_mult))
 
