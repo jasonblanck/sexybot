@@ -769,6 +769,157 @@ def fred_macro_series() -> list[dict]:
     return rows
 
 
+_BLS_SERIES = [
+    # (series_id, friendly_name)
+    # CPI / inflation
+    ("CUUR0000SA0",     "CPI-U All Items (NSA, monthly)"),
+    ("CUUR0000SA0L1E",  "Core CPI-U less food & energy (NSA, monthly)"),
+    # Employment situation report
+    ("LNS14000000",     "Unemployment Rate (SA, monthly)"),
+    ("CES0000000001",   "Total Nonfarm Payrolls (SA, thousands, monthly)"),
+    ("CES0500000003",   "Avg Hourly Earnings, total private (SA, monthly)"),
+    # Producer prices
+    ("WPSFD4",          "PPI Final Demand (SA, monthly)"),
+]
+
+
+def bls_releases() -> list[dict]:
+    """Fetch the latest data point for each BLS series in _BLS_SERIES.
+
+    BLS API v2 takes one POST with all series in the body — 1 HTTP call
+    covers everything, well under the 500 req/day registered-key limit.
+    Returns [] silently if BLS_API_KEY isn't set. The edge over FRED's
+    mirrors of the same series is timing: BLS publishes at 8:30am ET on
+    release day; FRED imports within minutes-to-hours."""
+    api_key = os.getenv("BLS_API_KEY", "").strip()
+    if not api_key:
+        log.debug("BLS_API_KEY not set; skipping BLS fetch")
+        return []
+    from datetime import datetime
+    year = datetime.utcnow().year
+    body = {
+        "seriesid":        [s for s, _ in _BLS_SERIES],
+        "startyear":       str(year - 1),
+        "endyear":         str(year),
+        "registrationkey": api_key,
+    }
+    resp = requests.post(
+        "https://api.bls.gov/publicAPI/v2/timeseries/data/",
+        json=body,
+        headers={**DEFAULT_HEADERS, "Content-Type": "application/json"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get("status") != "REQUEST_SUCCEEDED":
+        log.warning("BLS request not OK: %s", payload.get("status"))
+        return []
+    label_by_id = dict(_BLS_SERIES)
+    rows: list[dict] = []
+    for ser in payload.get("Results", {}).get("series", []):
+        sid = ser.get("seriesID", "")
+        data = ser.get("data", [])
+        if not data:
+            continue
+        latest = data[0]
+        try:
+            num = float(latest.get("value"))
+        except (TypeError, ValueError):
+            continue
+        period_label = f"{latest.get('year','')}-{latest.get('period','')}"
+        rows.append({
+            "source":        f"bls_{sid.lower()}",
+            "category":      "macro",
+            "external_id":   f"BLS|{sid}|{period_label}",
+            "title":         f"{label_by_id.get(sid, sid)}: {num} ({period_label})",
+            "url":           f"https://data.bls.gov/timeseries/{sid}",
+            "numeric_value": num,
+            "metadata":      json.dumps({"series_id": sid, "period": period_label}),
+            "published_at": f"{latest.get('year','')}-{(latest.get('period','M00')[1:] or '01')}-01",
+        })
+    return rows
+
+
+def etherscan_chain() -> list[dict]:
+    """Etherscan V2 multi-chain API — gas oracle + ETH price (chain id 1 = mainnet).
+
+    Two calls per pass. Free tier is 5 calls/sec, 100k/day — we're well
+    under. No-op if ETHERSCAN_API_KEY isn't set. Useful for prediction
+    markets on ETH price thresholds and gas-fee regimes."""
+    api_key = os.getenv("ETHERSCAN_API_KEY", "").strip()
+    if not api_key:
+        log.debug("ETHERSCAN_API_KEY not set; skipping Etherscan fetch")
+        return []
+    rows: list[dict] = []
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # Gas oracle — safe/propose/fast gwei + suggested base fee.
+    try:
+        data = _get_json(
+            "https://api.etherscan.io/v2/api",
+            params={
+                "chainid": 1,
+                "module":  "gastracker",
+                "action":  "gasoracle",
+                "apikey":  api_key,
+            },
+        )
+        res = data.get("result") or {}
+        if isinstance(res, dict) and res.get("ProposeGasPrice"):
+            try:
+                propose = float(res.get("ProposeGasPrice"))
+            except (TypeError, ValueError):
+                propose = None
+            if propose is not None:
+                rows.append({
+                    "source":        "etherscan_gas",
+                    "category":      "crypto",
+                    "external_id":   f"ETHERSCAN|gas|{now_iso[:16]}",
+                    "title":         (
+                        f"ETH gas (gwei): safe={res.get('SafeGasPrice')} "
+                        f"propose={res.get('ProposeGasPrice')} fast={res.get('FastGasPrice')} "
+                        f"baseFee={res.get('suggestBaseFee')}"
+                    ),
+                    "url":           "https://etherscan.io/gastracker",
+                    "numeric_value": propose,
+                    "metadata":      json.dumps(res),
+                    "published_at": now_iso,
+                })
+    except Exception as exc:
+        log.debug("Etherscan gas fetch failed: %s", exc)
+    # ETH price — USD + BTC, with the timestamp Etherscan attaches.
+    try:
+        data = _get_json(
+            "https://api.etherscan.io/v2/api",
+            params={
+                "chainid": 1,
+                "module":  "stats",
+                "action":  "ethprice",
+                "apikey":  api_key,
+            },
+        )
+        res = data.get("result") or {}
+        if isinstance(res, dict) and res.get("ethusd"):
+            try:
+                usd = float(res.get("ethusd"))
+            except (TypeError, ValueError):
+                usd = None
+            ts = res.get("ethusd_timestamp", "")
+            if usd is not None:
+                rows.append({
+                    "source":        "etherscan_ethprice",
+                    "category":      "crypto",
+                    "external_id":   f"ETHERSCAN|ethprice|{ts}",
+                    "title":         f"ETH price: ${usd} USD / {res.get('ethbtc')} BTC",
+                    "url":           "https://etherscan.io/chart/etherprice",
+                    "numeric_value": usd,
+                    "metadata":      json.dumps(res),
+                    "published_at": now_iso,
+                })
+    except Exception as exc:
+        log.debug("Etherscan ethprice fetch failed: %s", exc)
+    return rows
+
+
 def ecb_eurusd() -> list[dict]:
     """ECB SDMX endpoint — last 10 EUR/USD daily observations. The SDMX
     JSON format is wordy; we extract just the observation series."""
@@ -1096,6 +1247,11 @@ FEEDS: list[tuple[str, Callable[[], list[dict]]]] = [
     # FRED — Fed funds, CPI, payrolls, yield curve, VIX, M2, WTI, gold.
     # No-op if FRED_API_KEY isn't set in env / .env.
     ("fred_macro",         fred_macro_series),
+    # BLS — CPI, core CPI, unemployment, payrolls, AHE, PPI. Faster than
+    # FRED on release day. No-op if BLS_API_KEY isn't set.
+    ("bls_releases",       bls_releases),
+    # Etherscan — gas oracle + ETH price. No-op if ETHERSCAN_API_KEY unset.
+    ("etherscan_chain",    etherscan_chain),
     # Trending / entertainment
     ("wikipedia_top",      wikipedia_top_pageviews),
     ("boxoffice_mojo",     box_office_mojo_weekend),
