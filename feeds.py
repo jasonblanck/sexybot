@@ -713,20 +713,33 @@ _FRED_SERIES = [
 ]
 
 
-def _fred_one(series_id: str, label: str, api_key: str) -> list[dict]:
-    """Fetch the latest non-null observation for one FRED series."""
+def _fred_one(series_id: str, label: str, api_key: str,
+              keep: int = 3) -> list[dict]:
+    """Fetch the most recent `keep` non-null observations for one FRED series.
+
+    Returning multiple historical observations (instead of just the latest)
+    lets downstream consumers compute period-over-period changes — e.g.
+    the SEXYBOT_FEEDS_DAMPER w/w jobless-claims check, which needs at least
+    two consecutive ICSA observations to fire.
+
+    Dedupe key is (series, observation_date) via INSERT OR IGNORE, so
+    re-emitting old observations on every poll is free — only new dates
+    become new rows."""
     data = _get_json(
         "https://api.stlouisfed.org/fred/series/observations",
         params={
             "series_id":  series_id,
             "api_key":    api_key,
             "sort_order": "desc",
-            "limit":      5,           # tolerate one or two NaN tails
+            "limit":      keep + 3,    # buffer for NaN tails
             "file_type":  "json",
         },
         timeout=15,
     )
+    out: list[dict] = []
     for obs in data.get("observations", []):
+        if len(out) >= keep:
+            break
         val = obs.get("value")
         date = obs.get("date")
         if val in (None, "", "."):
@@ -735,7 +748,7 @@ def _fred_one(series_id: str, label: str, api_key: str) -> list[dict]:
             num = float(val)
         except ValueError:
             continue
-        return [{
+        out.append({
             "source":       f"fred_{series_id.lower()}",
             "category":     "macro",
             # Dedupe key is (series, observation_date) — FRED revises the
@@ -746,8 +759,8 @@ def _fred_one(series_id: str, label: str, api_key: str) -> list[dict]:
             "numeric_value": num,
             "metadata":     json.dumps({"series_id": series_id, "obs_date": date}),
             "published_at": date,
-        }]
-    return []
+        })
+    return out
 
 
 def fred_macro_series() -> list[dict]:
