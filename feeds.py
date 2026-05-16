@@ -991,6 +991,66 @@ def openweather_cities() -> list[dict]:
     return rows
 
 
+def newsapi_top_headlines() -> list[dict]:
+    """NewsAPI.org top US headlines — broader than the RSS feeds combined.
+
+    Free tier is 100 req/day; the 10-min cron would burn 144. We throttle
+    to ~once per hour via a sentinel file (24/day, well under). pageSize=20
+    so one call returns plenty.
+
+    No-op silently if NEWSAPI_KEY isn't set."""
+    api_key = os.getenv("NEWSAPI_KEY", "").strip()
+    if not api_key:
+        log.debug("NEWSAPI_KEY not set; skipping NewsAPI fetch")
+        return []
+    sentinel = "/tmp/sexybot-newsapi-lastrun"
+    try:
+        last = os.path.getmtime(sentinel)
+        if time.time() - last < 3500:  # < ~58 min
+            log.debug("newsapi: throttled (last run %.0fs ago)", time.time() - last)
+            return []
+    except OSError:
+        pass  # first run after boot
+    try:
+        data = _get_json(
+            "https://newsapi.org/v2/top-headlines",
+            params={"country": "us", "pageSize": 20, "apiKey": api_key},
+        )
+    except Exception as exc:
+        log.warning("NewsAPI fetch failed: %s", exc)
+        return []
+    # Touch the sentinel only on success — a failing call shouldn't burn
+    # the hour. The free tier counts attempts, so this is best-effort.
+    try:
+        with open(sentinel, "w") as fh:
+            fh.write("")
+    except OSError:
+        pass
+    rows: list[dict] = []
+    for art in data.get("articles", []):
+        title = (art.get("title") or "").strip()
+        if not title or title == "[Removed]":
+            continue
+        src = (art.get("source") or {}).get("name", "")
+        published = (art.get("publishedAt") or "")[:25]
+        url = art.get("url") or ""
+        rows.append({
+            "source":        "newsapi",
+            "category":      "news",
+            "external_id":   f"NEWSAPI|{url}",
+            "title":         f"[{src}] {title}",
+            "url":           url,
+            "numeric_value": None,
+            "metadata":      json.dumps({
+                "source":   src,
+                "author":   art.get("author"),
+                "desc":     (art.get("description") or "")[:200],
+            }),
+            "published_at": published,
+        })
+    return rows
+
+
 def ecb_eurusd() -> list[dict]:
     """ECB SDMX endpoint — last 10 EUR/USD daily observations. The SDMX
     JSON format is wordy; we extract just the observation series."""
@@ -1326,6 +1386,9 @@ FEEDS: list[tuple[str, Callable[[], list[dict]]]] = [
     # OpenWeatherMap — current weather for major US cities. No-op until
     # OWM_API_KEY activates (1-2h after signup).
     ("openweather_cities", openweather_cities),
+    # NewsAPI top US headlines — throttled to ~1/hour internally to fit
+    # free-tier 100/day budget. No-op if NEWSAPI_KEY unset.
+    ("newsapi_top",        newsapi_top_headlines),
     # Trending / entertainment
     ("wikipedia_top",      wikipedia_top_pageviews),
     ("boxoffice_mojo",     box_office_mojo_weekend),
