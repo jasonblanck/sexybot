@@ -920,6 +920,77 @@ def etherscan_chain() -> list[dict]:
     return rows
 
 
+_OWM_CITIES = [
+    # (city_label, lat, lon)
+    ("New York",    40.7128, -74.0060),
+    ("Los Angeles", 34.0522, -118.2437),
+    ("Chicago",     41.8781, -87.6298),
+    ("Houston",     29.7604, -95.3698),
+    ("Miami",       25.7617, -80.1918),
+    ("Washington",  38.9072, -77.0369),
+]
+
+
+def openweather_cities() -> list[dict]:
+    """OpenWeatherMap current weather for the major US cities most likely to
+    appear in Polymarket weather/temp/hurricane/snow markets.
+
+    Free tier allows 60 calls/min, 1M/month — 6 calls per 10-min pass is
+    ~870/day, deeply under any limit. No-op silently if OWM_API_KEY isn't
+    set or hasn't activated yet (OWM keys take 1-2h to propagate after
+    signup). Imperial units so titles match how Polymarket phrases markets."""
+    api_key = os.getenv("OWM_API_KEY", "").strip()
+    if not api_key:
+        log.debug("OWM_API_KEY not set; skipping OWM fetch")
+        return []
+    rows: list[dict] = []
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for city, lat, lon in _OWM_CITIES:
+        try:
+            data = _get_json(
+                "https://api.openweathermap.org/data/2.5/weather",
+                params={
+                    "lat":   lat,
+                    "lon":   lon,
+                    "appid": api_key,
+                    "units": "imperial",
+                },
+            )
+        except Exception as exc:
+            log.debug("OWM %s fetch failed: %s", city, exc)
+            continue
+        main = data.get("main") or {}
+        weather = (data.get("weather") or [{}])[0]
+        wind = data.get("wind") or {}
+        temp = main.get("temp")
+        if temp is None:
+            continue
+        # Hour-bucketed dedupe key — one row per city per hour, fine for
+        # 10-min cron (subsequent passes in the same hour overwrite-skip).
+        bucket = time.strftime("%Y-%m-%d-%H", time.gmtime())
+        rows.append({
+            "source":        "owm_current",
+            "category":      "weather",
+            "external_id":   f"OWM|{city}|{bucket}",
+            "title":         (
+                f"{city}: {temp:.0f}°F · {weather.get('description','')} · "
+                f"humidity={main.get('humidity','?')}%  wind={wind.get('speed','?')}mph"
+            ),
+            "url":           f"https://openweathermap.org/city/{data.get('id','')}",
+            "numeric_value": float(temp),
+            "metadata":      json.dumps({
+                "city":     city,
+                "temp_f":   temp,
+                "feels_f":  main.get("feels_like"),
+                "humidity": main.get("humidity"),
+                "wind_mph": wind.get("speed"),
+                "weather":  weather.get("main"),
+            }),
+            "published_at": now_iso,
+        })
+    return rows
+
+
 def ecb_eurusd() -> list[dict]:
     """ECB SDMX endpoint — last 10 EUR/USD daily observations. The SDMX
     JSON format is wordy; we extract just the observation series."""
@@ -1252,6 +1323,9 @@ FEEDS: list[tuple[str, Callable[[], list[dict]]]] = [
     ("bls_releases",       bls_releases),
     # Etherscan — gas oracle + ETH price. No-op if ETHERSCAN_API_KEY unset.
     ("etherscan_chain",    etherscan_chain),
+    # OpenWeatherMap — current weather for major US cities. No-op until
+    # OWM_API_KEY activates (1-2h after signup).
+    ("openweather_cities", openweather_cities),
     # Trending / entertainment
     ("wikipedia_top",      wikipedia_top_pageviews),
     ("boxoffice_mojo",     box_office_mojo_weekend),
