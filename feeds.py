@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Callable
 from xml.etree import ElementTree as ET
@@ -692,6 +693,82 @@ def worldbank_world_inflation() -> list[dict]:
     return world_bank_indicator("WLD", "FP.CPI.TOTL.ZG", "world_inflation")
 
 
+_FRED_SERIES = [
+    # (series_id, friendly_name, "monthly" | "daily" | "weekly")
+    ("FEDFUNDS",  "Federal Funds Rate (effective, monthly)",      "monthly"),
+    ("DFF",       "Federal Funds Rate (daily)",                   "daily"),
+    ("CPIAUCSL",  "CPI All Urban Consumers (SA, monthly)",        "monthly"),
+    ("CPILFESL",  "Core CPI (SA, monthly)",                       "monthly"),
+    ("UNRATE",    "Unemployment Rate (monthly)",                  "monthly"),
+    ("PAYEMS",    "Nonfarm Payrolls (thousands, monthly)",        "monthly"),
+    ("ICSA",      "Initial Jobless Claims (weekly)",              "weekly"),
+    ("VIXCLS",    "VIX (CBOE Volatility Index, daily)",           "daily"),
+    ("DGS10",     "10-Year Treasury Yield (daily)",               "daily"),
+    ("DGS2",      "2-Year Treasury Yield (daily)",                "daily"),
+    ("T10Y2Y",    "10Y minus 2Y Treasury spread (daily)",         "daily"),
+    ("T10Y3M",    "10Y minus 3M Treasury spread (daily)",         "daily"),
+    ("M2SL",      "M2 Money Stock (SA, billions, monthly)",       "monthly"),
+    ("DCOILWTICO", "WTI Crude Oil spot price (daily)",            "daily"),
+    ("GOLDPMGBD228NLBM", "Gold price PM London fixing (daily)",   "daily"),
+]
+
+
+def _fred_one(series_id: str, label: str, api_key: str) -> list[dict]:
+    """Fetch the latest non-null observation for one FRED series."""
+    data = _get_json(
+        "https://api.stlouisfed.org/fred/series/observations",
+        params={
+            "series_id":  series_id,
+            "api_key":    api_key,
+            "sort_order": "desc",
+            "limit":      5,           # tolerate one or two NaN tails
+            "file_type":  "json",
+        },
+        timeout=15,
+    )
+    for obs in data.get("observations", []):
+        val = obs.get("value")
+        date = obs.get("date")
+        if val in (None, "", "."):
+            continue
+        try:
+            num = float(val)
+        except ValueError:
+            continue
+        return [{
+            "source":       f"fred_{series_id.lower()}",
+            "category":     "macro",
+            # Dedupe key is (series, observation_date) — FRED revises the
+            # latest value occasionally; INSERT OR IGNORE drops the dupe.
+            "external_id":  f"FRED|{series_id}|{date}",
+            "title":        f"{label}: {num} ({date})",
+            "url":          f"https://fred.stlouisfed.org/series/{series_id}",
+            "numeric_value": num,
+            "metadata":     json.dumps({"series_id": series_id, "obs_date": date}),
+            "published_at": date,
+        }]
+    return []
+
+
+def fred_macro_series() -> list[dict]:
+    """Fetch the latest observation for each entry in _FRED_SERIES.
+
+    FRED's free API allows 120 req/min with no daily cap. 15 series at
+    10-min cron interval is ~90 req/hour — well under any limit. Returns
+    [] silently if FRED_API_KEY isn't set (e.g. local dev without secret)."""
+    api_key = os.getenv("FRED_API_KEY", "").strip()
+    if not api_key:
+        log.debug("FRED_API_KEY not set; skipping FRED fetch")
+        return []
+    rows: list[dict] = []
+    for series_id, label, _cadence in _FRED_SERIES:
+        try:
+            rows.extend(_fred_one(series_id, label, api_key))
+        except Exception as exc:
+            log.debug("FRED %s fetch failed: %s", series_id, exc)
+    return rows
+
+
 def ecb_eurusd() -> list[dict]:
     """ECB SDMX endpoint — last 10 EUR/USD daily observations. The SDMX
     JSON format is wordy; we extract just the observation series."""
@@ -1016,6 +1093,9 @@ FEEDS: list[tuple[str, Callable[[], list[dict]]]] = [
     ("worldbank_us_gdp_growth",  worldbank_us_gdp_growth),
     ("worldbank_world_inflation", worldbank_world_inflation),
     ("ecb_eurusd",         ecb_eurusd),
+    # FRED — Fed funds, CPI, payrolls, yield curve, VIX, M2, WTI, gold.
+    # No-op if FRED_API_KEY isn't set in env / .env.
+    ("fred_macro",         fred_macro_series),
     # Trending / entertainment
     ("wikipedia_top",      wikipedia_top_pageviews),
     ("boxoffice_mojo",     box_office_mojo_weekend),

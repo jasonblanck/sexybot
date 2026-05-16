@@ -17,8 +17,20 @@ deduping happens at the (source, external_id) UNIQUE index.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
+
+# Load /root/polybot/.env (or local .env) so secrets like FRED_API_KEY
+# are available when cron launches this script — cron's environment is
+# minimal and doesn't inherit interactive shell exports. python-dotenv
+# is already in requirements.txt for bot.py.
+try:
+    from dotenv import load_dotenv
+    _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    load_dotenv(_env_path)
+except ImportError:
+    pass   # dotenv missing — env vars must be set externally
 
 from feeds import run_all
 from observability import record_external_feeds
