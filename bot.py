@@ -7966,28 +7966,34 @@ class PolymarketBot:
 
                     min_conf = 55 if ai_enabled else 40
 
-                    # Confidence-band filter — May-2026 audit on 30 days of
-                    # resolved real-money trades showed:
-                    #   conf 40-60 → +$8.37 over 49 resolved (profitable)
-                    #   conf 60-80 → -$5.74 over 21 resolved (lossy)
-                    #   conf 80+   → +$5.20 over 22 resolved (profitable)
-                    # The 60-80 band is the only losing bucket despite a
-                    # higher raw win rate, likely because entry prices in
-                    # this band give worse payoff ratios. SEXYBOT_SKIP_MID_HIGH_BAND
-                    # gates the skip — default ON since the data clearly
-                    # signs the direction. Flip to "0" in .env to A/B revert.
-                    if os.getenv("SEXYBOT_SKIP_MID_HIGH_BAND", "1") == "1":
+                    # Surgical loss-band filter — May-2026 audit decomposed
+                    # the lossy 60-80 confidence bucket and found two
+                    # specific losing subsets, with the rest being neutral
+                    # or profitable. Skip only the proven losers:
+                    #
+                    #   A) crypto markets in 60-80 conf
+                    #      (13 placed, 3/7 won, -$10.14)
+                    #   B) extreme late-res fade entries (price < 5c)
+                    #      (0/3 won, -$7.31 — anchoring bets that fail
+                    #       when the market is "actually decided")
+                    #
+                    # Sports 60-80 was 7/7 winners (+$12.04) so we keep it.
+                    # Gate: SEXYBOT_SKIP_LOSS_BANDS (default ON). Set "0"
+                    # to disable. Sample sizes are small; reaudit in 2-4
+                    # weeks as more trades resolve.
+                    if os.getenv("SEXYBOT_SKIP_LOSS_BANDS", "1") == "1":
                         _conf_val = float(signal.get("confidence", 0))
-                        if 60.0 <= _conf_val < 80.0:
-                            self._bump_skip("mid_high_conf_band")
-                            self._log(
-                                f"BAND SKIP: conf {_conf_val:.0f}% in lossy 60-80 band "
-                                f"— {signal.get('market','')[:50]}"
-                            )
-                            sig_record["skip_reason"] = (
-                                f"conf {_conf_val:.0f}% in lossy 60-80 band "
-                                f"(SEXYBOT_SKIP_MID_HIGH_BAND=1)"
-                            )
+                        _price_val = float(signal.get("price", 1.0))
+                        _category = self.classify_market(question)
+                        _hit = None
+                        if 60.0 <= _conf_val < 80.0 and _category == "crypto":
+                            _hit = f"crypto in 60-80 conf band (conf={_conf_val:.0f}%)"
+                        elif _price_val < 0.05:
+                            _hit = f"extreme late-res entry (price={_price_val:.3f} < 5c)"
+                        if _hit:
+                            self._bump_skip("loss_band_skip")
+                            self._log(f"LOSS-BAND SKIP: {_hit} — {signal.get('market','')[:50]}")
+                            sig_record["skip_reason"] = f"loss-band: {_hit}"
                             continue
 
                     mkt_name = signal.get("market", question)
