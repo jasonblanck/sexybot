@@ -7934,6 +7934,31 @@ class PolymarketBot:
                         continue
 
                     min_conf = 55 if ai_enabled else 40
+
+                    # Confidence-band filter — May-2026 audit on 30 days of
+                    # resolved real-money trades showed:
+                    #   conf 40-60 → +$8.37 over 49 resolved (profitable)
+                    #   conf 60-80 → -$5.74 over 21 resolved (lossy)
+                    #   conf 80+   → +$5.20 over 22 resolved (profitable)
+                    # The 60-80 band is the only losing bucket despite a
+                    # higher raw win rate, likely because entry prices in
+                    # this band give worse payoff ratios. SEXYBOT_SKIP_MID_HIGH_BAND
+                    # gates the skip — default ON since the data clearly
+                    # signs the direction. Flip to "0" in .env to A/B revert.
+                    if os.getenv("SEXYBOT_SKIP_MID_HIGH_BAND", "1") == "1":
+                        _conf_val = float(signal.get("confidence", 0))
+                        if 60.0 <= _conf_val < 80.0:
+                            self._bump_skip("mid_high_conf_band")
+                            self._log(
+                                f"BAND SKIP: conf {_conf_val:.0f}% in lossy 60-80 band "
+                                f"— {signal.get('market','')[:50]}"
+                            )
+                            sig_record["skip_reason"] = (
+                                f"conf {_conf_val:.0f}% in lossy 60-80 band "
+                                f"(SEXYBOT_SKIP_MID_HIGH_BAND=1)"
+                            )
+                            continue
+
                     mkt_name = signal.get("market", question)
                     if float(signal.get("confidence", 0)) >= min_conf and signal.get("token_id"):
                         # Use asyncio.to_thread so blocking network I/O (CLOB API calls) in
