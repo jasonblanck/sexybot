@@ -7918,6 +7918,37 @@ class PolymarketBot:
                         self._log(f"SKIP: token_id from market data failed format check ({_exec_tid[:20]})", "error")
                         continue
 
+                    # Cash buffer: Polymarket "not enough balance" errors are
+                    # almost always sub-cent mismatches between cycle_cash
+                    # (start-of-cycle on-chain balance) and the actual free
+                    # balance at order time — caused by fees, by active
+                    # limit orders that haven't been decremented, or by
+                    # rounding inside place_market_order. Reserve a 3%
+                    # buffer (min 5¢) so the bot stops chasing trades that
+                    # will reject server-side. Audit on last 7 days showed
+                    # 30+ rejections of this form — almost all sub-cent.
+                    if not PAPER_MODE:
+                        _buffer = max(0.05, cycle_cash * 0.03)
+                        _spendable = cycle_cash - _buffer
+                        if amt > _spendable:
+                            _orig = amt
+                            amt = round(_spendable, 2)
+                            if amt < 1.0:
+                                self._bump_skip("cash_buffer_too_tight")
+                                self._log(
+                                    f"CASH BUFFER SKIP: ${_orig:.2f} → would leave "
+                                    f"only ${amt:.2f} after ${_buffer:.2f} buffer "
+                                    f"(cycle_cash ${cycle_cash:.2f})"
+                                )
+                                sig_record["skip_reason"] = (
+                                    f"cash buffer: ${_orig:.2f} > spendable ${_spendable:.2f}"
+                                )
+                                continue
+                            self._log(
+                                f"CASH BUFFER CLAMP: ${_orig:.2f} → ${amt:.2f} "
+                                f"(cycle_cash ${cycle_cash:.2f}, buffer ${_buffer:.2f})"
+                            )
+
                     # Pre-flight balance check: `amt` is a dollar figure for
                     # both market and limit BUYs (see place_market_order /
                     # place_limit_order).
