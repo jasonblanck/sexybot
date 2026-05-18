@@ -396,7 +396,7 @@ def kelly_size(
     kelly_fraction: float = 0.25,
     max_size:       float = 10.0,
     min_size:       float = 1.0,
-    max_pct_of_balance: float = 0.05,
+    max_pct_of_balance: float = 0.07,
     signal_strength:    float = 1.0,
     regime:             Optional[MarketRegime] = None,
 ) -> float:

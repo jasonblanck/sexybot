@@ -2964,8 +2964,11 @@ class PolymarketBot:
         if kelly_f <= 0.01:       # no meaningful edge
             return 0.0
         size = bankroll * kelly_f * fraction
-        # 5% of wallet cap — keeps single-loss impact small while payoff ratio <1.
-        return round(min(size, MAX_ORDER_SIZE, bankroll * 0.05), 2)
+        # 7% of wallet cap — bumped from 5% on 2026-05-18 so MAX_ORDER_SIZE=$10
+        # is reachable at current ~$150 bankroll. At 5% the cap was $7.50,
+        # silently throttling the operator's MAX_ORDER_SIZE setting. Still
+        # keeps single-loss impact bounded while payoff ratio <1.
+        return round(min(size, MAX_ORDER_SIZE, bankroll * 0.07), 2)
 
     def log_brier(self, market: str, token_id: str, side: str,
                   predicted_prob: float, market_price: float,
