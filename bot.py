@@ -2064,7 +2064,11 @@ class PolymarketBot:
                                 continue
                             amt = round(min(amt, on_chain) * 0.999, 4)
                             self._log(f"[ECON FLOW] EXIT {side} {mkt[:40]} — {reason} (sell {amt})")
-                            await self._execute_order(token_id, "SELL", amt, mkt, "market")
+                            await self._execute_order(
+                                token_id, "SELL", amt, mkt, "market",
+                                attribution={"strategy": "econFlow",
+                                             "category": self.classify_market(mkt)},
+                            )
                             self._managed_positions.pop(token_id, None)
                             self._momentum_position_peaks.pop(token_id, None)
                             asyncio.create_task(
@@ -2171,7 +2175,11 @@ class PolymarketBot:
                             continue
                         sell_amt = round(min(shares, on_chain) * 0.999, 4)
                         self._log(f"[MOMENTUM EXIT] {side_str} {market[:40]} — {reason} (sell {sell_amt})")
-                        await self._execute_order(token_id, "SELL", sell_amt, market, "market")
+                        await self._execute_order(
+                            token_id, "SELL", sell_amt, market, "market",
+                            attribution={"strategy": "momentum",
+                                         "category": self.classify_market(market)},
+                        )
                         self._momentum_position_peaks.pop(token_id, None)
                         asyncio.create_task(
                             asyncio.to_thread(self.send_telegram,
@@ -2596,14 +2604,6 @@ class PolymarketBot:
     # routine catches plan-exhaustion or a dead provider).
     _openrouter_last_error: str = ""
     _openrouter_last_success_ts: float = 0
-
-    # SEXYBOT_FEEDS_DAMPER bookkeeping. Per-condition daily counters +
-    # one-per-day Telegram alert flag. Reset implicitly when the bot
-    # process restarts (acceptable — we only care about "did this fire
-    # today, and how often"). Date string is YYYY-MM-DD UTC.
-    _damper_today_date: str = ""
-    _damper_fires_today: dict = {}    # condition -> count
-    _damper_alerted_today: dict = {}  # condition -> True/False
 
     # Finnhub stock quote cache. Keyed by ticker, 60s TTL per symbol.
     _finnhub_cache:      dict  = {}    # symbol → {price, change_pct, ts}
