@@ -57,6 +57,11 @@ SPREAD_MAX_CENTS = float(os.getenv("SPREAD_MAX_CENTS", "0.5"))
 SCAN_INTERVAL    = float(os.getenv("SCAN_INTERVAL",    "30"))
 
 CLOB_BASE       = "https://clob.polymarket.com"
+# Polymarket splits order placement (CLOB, L2-auth required) from public
+# market-data reads (data-api, no auth). The /trades endpoint moved/stayed
+# on data-api; the CLOB /trades route 401s for unauthenticated GETs and
+# silently broke volume-spike detection from 2026-04-13 until 2026-05-18.
+DATA_API_BASE   = "https://data-api.polymarket.com"
 REQUEST_TIMEOUT = 8
 
 # Momentum thresholds
@@ -299,10 +304,12 @@ def _audit_discovery(raw_markets: list[PolyMarket]) -> list[dict]:
 # ── Momentum signal ────────────────────────────────────────────────────────────
 
 def _get_recent_trades_sync(token_id: str) -> list[dict]:
-    """Synchronous trade fetch — always call via asyncio.to_thread()."""
+    """Synchronous trade fetch — always call via asyncio.to_thread().
+    Uses the public data-api host; the CLOB host requires L2 auth and was
+    silently returning 401 for over a month, disabling _detect_volume_spike."""
     try:
         resp = requests.get(
-            f"{CLOB_BASE}/trades",
+            f"{DATA_API_BASE}/trades",
             params={"asset_id": token_id, "limit": 100},
             timeout=REQUEST_TIMEOUT,
         )
@@ -310,7 +317,7 @@ def _get_recent_trades_sync(token_id: str) -> list[dict]:
         data = resp.json()
         return data if isinstance(data, list) else data.get("data", [])
     except Exception as exc:
-        log.warning("CLOB trade API error for %s: %s", token_id[:14], exc)
+        log.warning("data-api trade fetch error for %s: %s", token_id[:14], exc)
         return []
 
 
