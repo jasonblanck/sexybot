@@ -28,6 +28,7 @@ from observability import (
     record_discovery_batch,
     record_postmortem,
     record_shadow_batch,
+    record_trade,
 )
 from orderbook_ws import BookManager, BookSnapshot
 from redeemer import PositionRedeemer
@@ -822,6 +823,29 @@ async def strategy_loop(
                     )
                 except Exception as exc:
                     log.debug("record_postmortem failed (non-fatal): %s", exc)
+                # Mirror the SELL into the shared trades table — pairs with
+                # the BUY recorded at entry so /pnl/cuts can FIFO-attribute
+                # exit P&L. Uses post-fix USDC convention (amount = price ×
+                # shares, c4c93db). Best-effort; never blocks the loop.
+                try:
+                    if exit_fill is not None:
+                        await asyncio.to_thread(
+                            record_trade,
+                            market       = pos.market_question or "",
+                            side         = "SELL",
+                            amount_usdc  = float(exit_fill) * float(pos.token_qty),
+                            price        = float(exit_fill),
+                            shares       = float(pos.token_qty),
+                            token_id     = token_id,
+                            order_id     = exit_result.order_id,
+                            order_type   = "limit",
+                            strategy     = pos.entry_signal_source,
+                            category     = classify_internal_category(pos.market_question or ""),
+                            status_detail = reason,
+                            dry_run      = DRY_RUN,
+                        )
+                except Exception as exc:
+                    log.debug("record_trade (SELL) failed: %s", exc)
                 del open_positions[token_id]
                 last_traded[token_id] = time.time()   # cooldown after exit
                 log.info(
@@ -1034,6 +1058,27 @@ async def strategy_loop(
                         "EXIT BANDS | %s  entry=%.4f profit=+%.1f%% stop=-%.1f%%",
                         mkt.question[:45], result.fill_price, pt * 100, sl * 100,
                     )
+                    # Mirror the BUY into the shared trades table so /pnl/cuts,
+                    # /pnl/realized, and /activity see sexybot-v2's activity
+                    # (closes the accounting blind spot identified 2026-05-18).
+                    # Best-effort; a DB error must never block trading.
+                    try:
+                        await asyncio.to_thread(
+                            record_trade,
+                            market       = mkt.question,
+                            side         = "BUY",
+                            amount_usdc  = float(result.fill_price) * float(result.token_qty),
+                            price        = float(result.fill_price),
+                            shares       = float(result.token_qty),
+                            token_id     = trade_token_id,
+                            order_id     = result.order_id,
+                            order_type   = "limit",
+                            strategy     = signal.source,
+                            category     = classify_internal_category(mkt.question),
+                            dry_run      = DRY_RUN,
+                        )
+                    except Exception as exc:
+                        log.debug("record_trade (BUY) failed: %s", exc)
                     # Persist the prediction to brier_scores so the Calibrator
                     # has fresh training data for future cycles. Best-effort —
                     # a DB error here never blocks trading.

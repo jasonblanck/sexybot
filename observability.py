@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+from datetime import datetime, timezone
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -350,6 +351,69 @@ def record_postmortem(
         return True
     except sqlite3.Error as exc:
         log.debug("record_postmortem failed: %s", exc)
+        return False
+    finally:
+        conn.close()
+
+
+def record_trade(
+    *,
+    market:           str,
+    side:             str,                       # 'BUY' or 'SELL'
+    amount_usdc:      float,                     # USDC value of the trade (fill_price * shares)
+    price:            float,                     # fill price per share
+    shares:           float,                     # outcome-token count
+    token_id:         str,
+    order_id:         Optional[str]   = None,
+    status:           str             = "matched",
+    order_type:       str             = "limit",
+    strategy:         Optional[str]   = None,    # e.g. "obi", "spike", "obi_spike"
+    category:         Optional[str]   = None,    # classify_internal_category(question)
+    regime_at_entry:  Optional[str]   = None,
+    status_detail:    Optional[str]   = None,
+    dry_run:          bool            = False,
+    db_path:          str             = DEFAULT_DB_PATH,
+) -> bool:
+    """Insert a row into the `trades` table (the one bot.py owns).
+
+    Used by main_v2 to surface its order activity to PnL dashboards
+    (/pnl/cuts, /pnl/realized, /activity). Without this, sexybot-v2's
+    trades are invisible to every operator-facing report — the
+    accounting blind spot identified during the 2026-05-18 wallet audit.
+
+    Schema is identical to bot.py's _trade_row / _TRADE_INSERT_SQL so
+    rows from either service mix cleanly. amount_usdc is the *USDC* value
+    of the trade (post-bookkeeping-fix convention, c4c93db) — not raw
+    share count. Best-effort; logs and returns False on error.
+    """
+    conn = _connect(db_path)
+    if conn is None:
+        return False
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO trades "
+                "(market, side, amount, price, shares, order_type, status, order_id, "
+                " dry_run, time, token_id, strategy, category, "
+                " ai_probability, ai_confidence, ai_risk, "
+                " regime_at_entry, status_detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    market, side,
+                    round(float(amount_usdc), 4),
+                    round(float(price), 4),
+                    round(float(shares), 4),
+                    order_type, status, order_id,
+                    1 if dry_run else 0,
+                    datetime.now(timezone.utc).isoformat(),
+                    token_id, strategy, category,
+                    None, None, None,
+                    regime_at_entry, status_detail,
+                ),
+            )
+        return True
+    except sqlite3.Error as exc:
+        log.debug("record_trade failed: %s", exc)
         return False
     finally:
         conn.close()
