@@ -1233,13 +1233,28 @@ class PolymarketBot:
         nightly review can break down realized P&L by each dimension.
         Safe to omit for manual/legacy callers."""
         price = self.get_midpoint(token_id) or 0.5
+        # Polymarket market-order arg convention is asymmetric: BUYs take
+        # USDC, SELLs take shares. Callers honor this (BUY paths pass USDC,
+        # SELL exits pass on-chain share balance) and the SDK call below
+        # passes `amount_usdc` through to MarketOrderArgs unchanged, so
+        # actual order placement is correct. The recorded `amount_usdc`
+        # and `shares` columns, however, need a side-aware translation —
+        # without it, SELL rows stored `amount_usdc = shares_sold` and
+        # `shares = shares / price`, inflating reported SELL proceeds by
+        # ~1/price and breaking every PnL-by-exit dashboard.
+        if str(side).upper() == "SELL":
+            shares = float(amount_usdc)
+            recorded_amount_usdc = round(shares * price, 4)
+        else:
+            shares = round(amount_usdc / price, 4) if price else 0
+            recorded_amount_usdc = amount_usdc
         result = {
             "token_id": token_id,
             "side": side,
             "market": market,
-            "amount_usdc": amount_usdc,
+            "amount_usdc": recorded_amount_usdc,
             "price": price,
-            "shares": round(amount_usdc / price, 4) if price else 0,
+            "shares": shares,
             "type": "market",
             "dry_run": DRY_RUN,
             "time": datetime.utcnow().isoformat(),
