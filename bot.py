@@ -72,6 +72,13 @@ DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "50"))
 # Same env var as risk.py ExecutionGate — kept in sync so the dashboard path
 # and the main_v2.py pipeline share one underdog-guard threshold.
 MIN_YES_BUY_PRICE = float(os.getenv("MIN_YES_BUY_PRICE", "0.30"))
+# Symmetric floor that applies to BOTH YES and NO buys. The asymmetric
+# MIN_YES_BUY_PRICE leaves the NO side wide open — historical data
+# shows the 0-10c bucket (NO-side dust buys) loses ~$2.50/trade with
+# the same payoff-ratio<1 dynamic that MIN_YES_BUY_PRICE was meant
+# to block. 0 disables (default; preserves prior behavior). Set on
+# the VPS .env to e.g. 0.20 to cut the bleeder bucket.
+MIN_BUY_PRICE     = float(os.getenv("MIN_BUY_PRICE", "0"))
 # Symmetric near-decided filter applied at signal generation. Drop markets where
 # yes_p <= NEAR_DECIDED_BAND or yes_p >= (1 - NEAR_DECIDED_BAND). The previous
 # hard-coded 0.02 / 0.98 left a wide 0.02-0.08 / 0.92-0.98 zone where momentum
@@ -4266,15 +4273,23 @@ class PolymarketBot:
         })
 
         # ── 3. Brier score (trade-weighted across categories) ────────
-        # Pull from calibrator for the same window; fall back to the
-        # category-bucket Brier rows we already store.
+        # With AI overlay disabled (CLAUDE_MAX_DISABLE=true), the
+        # ai_probability column is null on nearly all trades and any
+        # COALESCE-to-50 fallback gives a mechanical ~0.25 Brier
+        # regardless of real edge. Instead use the trade's entry
+        # price as our implied probability: a BUY at 0.75 means we
+        # believe the side we bought has at least 0.75 chance of
+        # winning. Brier = (price - won)^2 averaged. This measures
+        # whether the bot's entry-price selection is calibrated to
+        # actual outcomes, which IS the real edge question now.
         try:
             cal = self.db.execute(
-                "SELECT category, AVG((COALESCE(ai_probability,50)/100.0 - "
-                "  CASE WHEN won=1 THEN 1 ELSE 0 END) * "
-                " (COALESCE(ai_probability,50)/100.0 - "
-                "  CASE WHEN won=1 THEN 1 ELSE 0 END)) AS brier, COUNT(*) "
+                "SELECT category, "
+                "  AVG((price - CASE WHEN won=1 THEN 1 ELSE 0 END) * "
+                "      (price - CASE WHEN won=1 THEN 1 ELSE 0 END)) AS brier, "
+                "  COUNT(*) "
                 "FROM trades WHERE resolved=1 AND dry_run=0 AND won IS NOT NULL "
+                "  AND price IS NOT NULL AND price > 0.001 AND price < 0.999 "
                 f"  AND resolved_at >= datetime('now','-{int(window_days)} days') "
                 "GROUP BY category"
             ).fetchall()
@@ -8187,6 +8202,18 @@ class PolymarketBot:
                         )
                         sig_record["skip_reason"] = (
                             f"YES underdog at {entry_price:.3f} < {MIN_YES_BUY_PRICE:.2f}"
+                        )
+                        continue
+                    # Symmetric floor — same logic for NO buys when the
+                    # operator opts into MIN_BUY_PRICE on the VPS .env.
+                    if MIN_BUY_PRICE > 0 and entry_price < MIN_BUY_PRICE:
+                        self._bump_skip("buy_underdog")
+                        self._log(
+                            f"LOW-PRICE BUY SKIP: price={entry_price:.3f} < {MIN_BUY_PRICE:.2f} "
+                            f"{question[:40]}"
+                        )
+                        sig_record["skip_reason"] = (
+                            f"underdog at {entry_price:.3f} < {MIN_BUY_PRICE:.2f}"
                         )
                         continue
 

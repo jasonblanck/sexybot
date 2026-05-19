@@ -43,11 +43,14 @@ Recommended values:
 1. **Deploy code** — already done in `a39b116`. No behavior change yet.
 2. **Add env vars to VPS .env**:
    ```
+   # Week 1 — consolidate prep
    SEXYBOT_SPORTS_ONLY=1
    SEXYBOT_BIG_WINNER_PCT=25
+
+   # Risk tightening — see "Why" below
+   DAILY_LOSS_LIMIT=15
+   MIN_BUY_PRICE=0.20
    ```
-   These two are the low-risk wins — filter trades to the proven-
-   profitable category and lock in existing big winners.
 3. **Restart bot.py** (`systemctl restart sexybot` or equivalent).
    Monitor the dashboard's pretrade panel for skip reasons.
 4. **Wait 24h**, observe:
@@ -58,7 +61,28 @@ Recommended values:
    opening new positions entirely; main_v2 takes over as the sole
    directional trader.
 
+## Why the risk-tightening values
+
+Pulled from the 30-day equity-curve walk on 2026-05-19:
+
+- **Worst single-day loss: −$32.87 on 2026-05-02**, dropping the
+  account 21.6% in one session. Current `DAILY_LOSS_LIMIT=50` would
+  not have paused trading until the damage was nearly done. Dropping
+  to **$15** caps the worst-day damage at ~10% of bankroll. The bot
+  then sat underwater for 13 days before a single +$43 day on May 16
+  pulled it back to net positive — that's variance, not edge.
+
+- **0-10¢ entry-price bucket: −$27.60 over 11 trades** (avg
+  −$2.50/trade). `MIN_YES_BUY_PRICE=0.30` already blocks the YES
+  side; **`MIN_BUY_PRICE=0.20`** applies the same logic to NO buys
+  and trims the bleeder bucket without touching the 70-80¢ band
+  (+$67.37 / 78 trades — the actual engine of profit).
+
+- **Sports vs everything else: sports +$31.97 / 214 trades, crypto
+  −$11.35 / 25 trades.** `SEXYBOT_SPORTS_ONLY=1` is the highest-
+  leverage single change.
+
 ## Rollback
 
 One env edit + `systemctl restart`. The code path defaults match
-prior behavior with all three flags at 0.
+prior behavior with all flags at 0.
