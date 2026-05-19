@@ -31,7 +31,7 @@ import sqlite3
 import itertools
 import sys
 
-DB_PATH         = os.getenv("AUTO_TUNE_DB", "/root/polybot/trades.db")
+DB_PATH         = os.getenv("AUTO_TUNE_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trades.db"))
 TOP_N           = int(os.getenv("AUTO_TUNE_TOP", "5"))
 MIN_TRADES      = int(os.getenv("AUTO_TUNE_MIN_TRADES", "50"))
 TRAIN_FRACTION  = 0.7
@@ -55,10 +55,8 @@ def load_trades(db_path: str) -> list:
         FROM trades
         WHERE dry_run=0
           AND resolved=1
-          AND ai_probability IS NOT NULL
           AND ai_confidence IS NOT NULL
           AND realized_pnl IS NOT NULL
-          AND status IN ('matched','filled')
         ORDER BY time
     """).fetchall()
     conn.close()

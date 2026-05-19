@@ -6,4 +6,8 @@ __pycache__/
 *.pyc
 venv/
 *.log
-
+trades.db
+*.csv
+*.db
+*.db-shm
+*.db-wal
