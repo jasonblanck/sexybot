@@ -1475,10 +1475,21 @@ function renderChart(){
   // Pull from real resolved-trade series. Filter for the active window;
   // when the window is shorter than ALL we rebase to zero at the window
   // start so the curve reads as "P&L over the last 1D/1W/1M" instead of
-  // inheriting the lifetime cumulative offset.
+  // inheriting the lifetime cumulative offset. For windowed views we
+  // also prepend a synthetic anchor point at $0 so the curve visibly
+  // grows from zero rather than starting at the first trade's delta.
   const filtered=filterSeries(_pnlSeries);
   const labels=[];const data=[];
-  const base=(filtered.length>0&&activeFilter!=='ALL')?(filtered[0].cum-(filtered[0].delta||0)):0;
+  const isWindow=activeFilter!=='ALL';
+  const base=(filtered.length>0&&isWindow)?(filtered[0].cum-(filtered[0].delta||0)):0;
+  if(isWindow&&filtered.length>0){
+    const w={'1D':86400000,'1W':604800000,'1M':2592000000}[activeFilter]||0;
+    const anchor=new Date(Date.now()-w);
+    const lbl=activeFilter==='1D'
+      ? anchor.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})
+      : anchor.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+    labels.push(lbl);data.push(0);
+  }
   filtered.forEach(p=>{
     const d=new Date(p.t);
     const lbl=activeFilter==='1D'
@@ -1487,10 +1498,10 @@ function renderChart(){
     labels.push(lbl);
     data.push(parseFloat((p.cum-base).toFixed(2)));
   });
-  const hasPoints=data.length>0;
+  const hasPoints=filtered.length>0;
   if(!hasPoints){labels.push('now');data.push(0);}
-  if(empty) empty.style.display=(!hasPoints&&activeFilter!=='ALL')?'flex':'none';
-  const end=hasPoints?data[data.length-1]:0;
+  if(empty) empty.style.display=(!hasPoints&&isWindow)?'flex':'none';
+  const end=data.length?data[data.length-1]:0;
   pnlChart.data.labels=labels;pnlChart.data.datasets[0].data=data;
   pnlChart.data.datasets[0].borderColor=(end>=0)?'#ff6600':'#ff3355';
   pnlChart.data.datasets[0].backgroundColor=(end>=0)?'rgba(255,102,0,0.08)':'rgba(255,51,85,0.08)';
@@ -1520,13 +1531,14 @@ async function renderToday(){
   try{
     const todayStart=new Date();todayStart.setHours(0,0,0,0);
     const startMs=todayStart.getTime();
-    // Signals today
+    // Signals today — split by what the activity feed considers
+    // "traded" so the breakdown matches the Activity tab counts.
     const sigs=(_allSignals||[]).filter(s=>{const t=new Date(s.time||0).getTime();return !isNaN(t)&&t>=startMs;});
-    const sBuy=sigs.filter(s=>(s.signal||'').includes('YES')||(s.signal||'').includes('NO')).length;
-    const sPass=sigs.length-sBuy;
+    const sTraded=sigs.filter(s=>s.traded||s.status==='matched'||s.status==='simulated').length;
+    const sSkipped=sigs.length-sTraded;
     const el=id=>document.getElementById(id);
     if(el('today-signals'))el('today-signals').textContent=sigs.length;
-    if(el('today-signals-sub'))el('today-signals-sub').textContent=`${sBuy} signal · ${sPass} skip`;
+    if(el('today-signals-sub'))el('today-signals-sub').textContent=`${sTraded} traded · ${sSkipped} skipped`;
     // Trades today (from /status — same data the live feed uses)
     let trades=[];
     try{const r=await fetch(`${BOT}/status`);if(r.ok){const d=await r.json();trades=(d.trades||[]).filter(t=>{const ts=new Date(t.time||0).getTime();return !isNaN(ts)&&ts>=startMs;});}}catch(e){}
