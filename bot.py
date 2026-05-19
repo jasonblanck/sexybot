@@ -897,6 +897,22 @@ class PolymarketBot:
             # Indexes on frequent WHERE-clause columns. Without these,
             # get_daily_loss and brier-stats queries scan the whole table
             # as trades/brier_scores grow — latency creeps up over weeks.
+            # ── portfolio_value_history ────────────────────────────
+            # Hourly snapshots sourced from Polymarket's data API
+            # (cash from on-chain USDC balance, positions_value from
+            # data-api.polymarket.com/value). Source of truth for true
+            # week-over-week P&L — the trades.realized_pnl path only
+            # sees CLOSED positions and misses mark-to-market on open
+            # ones, which produced the +$70/-$58 disagreement that
+            # made the 2026-05-19 scoreboard a fiction.
+            self.db.execute("""CREATE TABLE IF NOT EXISTS portfolio_value_history (
+                ts               TEXT    NOT NULL,
+                cash             REAL    NOT NULL,
+                positions_value  REAL    NOT NULL,
+                total_value      REAL    NOT NULL,
+                source           TEXT    NOT NULL DEFAULT 'polymarket_api'
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_pvh_ts ON portfolio_value_history(ts)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_trades_time   ON trades(time)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_brier_resolved ON brier_scores(resolved)")
@@ -3530,6 +3546,47 @@ class PolymarketBot:
                 await asyncio.sleep(interval_s)
             except asyncio.CancelledError:
                 break
+
+    async def _portfolio_snapshot_loop(self):
+        """Hourly snapshot of cash + positions value from Polymarket's
+        own API. Source of truth for true period-over-period P&L,
+        independent of the trades.realized_pnl tracking path that
+        misses unrealized mark-to-market changes.
+
+        First snapshot fires ~15s after startup so the boot sequence
+        has time to settle, then every 3600s (1h)."""
+        try:
+            await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            return
+        SNAPSHOT_INTERVAL_S = 3600
+        while self.running:
+            try:
+                cash = await asyncio.to_thread(self.get_balance, True)
+                positions = await asyncio.to_thread(self.get_positions_value, True)
+                if cash is None or positions is None:
+                    # Either API hiccup or wallet not configured. Don't
+                    # poison the table with NULLs / zeros that look like
+                    # real drawdowns — just skip this tick.
+                    log.debug("[PORTFOLIO HISTORY] skip — cash or positions unavailable")
+                else:
+                    total = round(float(cash) + float(positions), 2)
+                    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    with self.db:
+                        self.db.execute(
+                            "INSERT INTO portfolio_value_history "
+                            "(ts, cash, positions_value, total_value, source) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (ts, round(float(cash), 2), round(float(positions), 2),
+                             total, "polymarket_api"),
+                        )
+                    log.info(f"[PORTFOLIO HISTORY] snapshot cash=${cash:.2f} pos=${positions:.2f} total=${total:.2f}")
+            except Exception as e:
+                log.warning(f"[PORTFOLIO HISTORY] snapshot failed: {e}")
+            try:
+                await asyncio.sleep(SNAPSHOT_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
 
     async def _db_maintenance_loop(self):
         """Daily SQLite housekeeping. Runs once per 24h:
@@ -9359,6 +9416,12 @@ async def lifespan(app_: FastAPI):
         # Daily DB hygiene — VACUUM + prune of high-churn audit tables.
         bot._db_maintenance_task = asyncio.create_task(bot._db_maintenance_loop())
         log.info("[DB MAINT] Daily VACUUM + prune scheduled (every 24h)")
+        # Hourly portfolio snapshot — sourced from Polymarket's API
+        # (not the bot's internal realized-P&L tracker). Source of truth
+        # for true week-over-week P&L. Takes a first snapshot at startup,
+        # then every hour.
+        bot._portfolio_snapshot_task = asyncio.create_task(bot._portfolio_snapshot_loop())
+        log.info("[PORTFOLIO HISTORY] Hourly Polymarket snapshots scheduled")
         # Daily Telegram digest — silent if Telegram creds aren't set.
         if DAILY_SUMMARY_ENABLED and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
             bot._daily_summary_task = asyncio.create_task(bot._daily_summary_loop())
@@ -10398,6 +10461,68 @@ def get_pnl_series(days: int = 0):
     dashboard P&L chart."""
     days = max(0, min(int(days or 0), 3650))
     return JSONResponse({"days": days, "points": bot.get_realized_pnl_series(window_days=days)})
+
+
+@app.get("/portfolio/history")
+def get_portfolio_history(days: int = 30):
+    """Hourly snapshots of portfolio value sourced from Polymarket's
+    API. Source of truth for true period-over-period P&L — does NOT
+    depend on the trades.realized_pnl tracking that misses unrealized
+    mark-to-market. Returns the snapshot series plus computed period
+    deltas (1d/7d/30d). The +$70/-$58 disagreement on 2026-05-19 came
+    from /pnl/realized; this endpoint is the cross-check that catches
+    it."""
+    days = max(1, min(int(days or 30), 365))
+    try:
+        rows = bot.db.execute(
+            "SELECT ts, cash, positions_value, total_value "
+            "FROM portfolio_value_history "
+            f"WHERE ts >= datetime('now','-{days} days') "
+            "ORDER BY ts ASC"
+        ).fetchall()
+        snapshots = [
+            {"ts": r[0], "cash": r[1], "positions_value": r[2], "total_value": r[3]}
+            for r in rows
+        ]
+        # Period deltas — compare latest snapshot to nearest-prior at each cutoff.
+        def _delta_at(window_seconds: int) -> Optional[dict]:
+            if len(snapshots) < 2:
+                return None
+            latest = snapshots[-1]
+            from datetime import datetime as _dt
+            try:
+                latest_ts = _dt.fromisoformat(latest["ts"].replace("Z", "+00:00"))
+            except Exception:
+                return None
+            cutoff = latest_ts.timestamp() - window_seconds
+            # Pick the snapshot whose ts is closest to (but not after) cutoff.
+            prior = None
+            for s in snapshots:
+                try:
+                    s_ts = _dt.fromisoformat(s["ts"].replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    continue
+                if s_ts <= cutoff:
+                    prior = s
+                else:
+                    break
+            if not prior:
+                return None
+            d = round(latest["total_value"] - prior["total_value"], 2)
+            pct = round(d / prior["total_value"] * 100, 2) if prior["total_value"] else 0.0
+            return {"delta": d, "pct": pct, "from_ts": prior["ts"], "from_value": prior["total_value"]}
+        return JSONResponse({
+            "days":          days,
+            "snapshots":     snapshots,
+            "first_snapshot": snapshots[0]["ts"] if snapshots else None,
+            "latest":        snapshots[-1] if snapshots else None,
+            "delta_1d":      _delta_at(86400),
+            "delta_7d":      _delta_at(7 * 86400),
+            "delta_30d":     _delta_at(30 * 86400),
+        })
+    except Exception as e:
+        log.warning(f"/portfolio/history error: {e}")
+        return JSONResponse({"error": str(e), "snapshots": []}, status_code=500)
 
 
 @app.get("/scoreboard")
