@@ -61,6 +61,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
     "stats     fred      crypto   weather"
     "backtest  backtest  review   calibration"
     "pretrade  pretrade  spend    spend"
+    "exec      exec      today    today"
     "terminal  terminal  terminal terminal";
   gap:12px;padding:12px;background:var(--bg);
   align-items:start;
@@ -89,6 +90,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 #calibration-panel{grid-area:calibration;display:flex;flex-direction:column;height:420px;}
 #pretrade-panel{grid-area:pretrade;display:flex;flex-direction:column;height:420px;}
 #spend-panel{grid-area:spend;display:flex;flex-direction:column;height:420px;}
+#exec-health-panel{grid-area:exec;display:flex;flex-direction:column;height:420px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
+#today-panel{grid-area:today;display:flex;flex-direction:column;height:420px;}
 .panel.panel-term{grid-area:terminal;}
 
 /* Chart sizes to its card, not the other way around. */
@@ -126,6 +129,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
       "weather   backtest"
       "review    calibration"
       "pretrade  spend"
+      "exec      today"
       "terminal  terminal";
   }
 }
@@ -152,6 +156,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
       "calibration"
       "pretrade"
       "spend"
+      "exec"
+      "today"
       "terminal";
   }
 }
@@ -807,6 +813,40 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
         success = matched + delayed (V2 CLOB delays accepted orders briefly; verified to settle with P&amp;L) · failure = no_match, insufficient_balance, auth_error, signature_error, etc · skipped = pre-submit gate aborts.
       </div>
     </div>
+    <div class="panel" id="today-panel">
+      <div class="panel-title">TODAY AT A GLANCE <span class="pill pill-live">LIVE</span></div>
+      <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:12px">
+        <div style="background:var(--bg);border:1px solid var(--border2);border-radius:6px;padding:10px 12px">
+          <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">Signals · today</div>
+          <div style="font-family:var(--mono);font-size:22px;font-weight:500" id="today-signals">—</div>
+          <div style="font-size:10px;color:var(--text2)" id="today-signals-sub">— buy · — pass</div>
+        </div>
+        <div style="background:var(--bg);border:1px solid var(--border2);border-radius:6px;padding:10px 12px">
+          <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">Trades · today</div>
+          <div style="font-family:var(--mono);font-size:22px;font-weight:500" id="today-trades">—</div>
+          <div style="font-size:10px;color:var(--text2)" id="today-trades-sub">— matched · — failed</div>
+        </div>
+        <div style="background:var(--bg);border:1px solid var(--border2);border-radius:6px;padding:10px 12px">
+          <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">Pretrade gate</div>
+          <div style="font-family:var(--mono);font-size:22px;font-weight:500" id="today-gate">—</div>
+          <div style="font-size:10px;color:var(--text2)" id="today-gate-sub">— aborts · — downsized</div>
+        </div>
+        <div style="background:var(--bg);border:1px solid var(--border2);border-radius:6px;padding:10px 12px">
+          <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">Claude · today</div>
+          <div style="font-family:var(--mono);font-size:22px;font-weight:500" id="today-claude">—</div>
+          <div style="font-size:10px;color:var(--text2)" id="today-claude-sub">— calls · $—</div>
+        </div>
+      </div>
+      <div style="border-top:1px solid var(--border2);padding-top:10px">
+        <div style="color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px">Realized P&amp;L · today</div>
+        <div style="display:flex;align-items:baseline;gap:10px">
+          <div style="font-family:var(--mono);font-size:24px;font-weight:500" id="today-pnl">$—</div>
+          <div style="font-size:10px;color:var(--text2)" id="today-pnl-sub">— resolved · — win rate</div>
+        </div>
+      </div>
+      <div style="flex:1"></div>
+      <div class="panel-footer"><span>derived · live</span><span>refresh 60s</span></div>
+    </div>
     <div class="panel" id="pretrade-panel">
       <div class="panel-title">PRETRADE CHECKS (24H)</div>
       <div style="display:flex;gap:16px;margin-bottom:8px;font-size:11px">
@@ -1380,9 +1420,16 @@ window.addEventListener('hashchange',()=>{
   showPage(pg);
 });
 
-/* ── P&L CHART (dashboard) ── */
+/* ── P&L CHART (dashboard) ──
+   Source of truth: /pnl/series → cumulative realized P&L from resolved
+   trades, ordered chronologically. The previous version synthesized a
+   curve from amount_usdc*0.02 then scaled it to the headline number,
+   which produced a smooth fake shape that didn't match actual settled
+   P&L. _pnlSeries is filled by fetchPnlSeries() and re-filtered on tab
+   change (1D/1W/1M/ALL). */
+let _pnlSeries=[];
 function setFilter(f,btn){activeFilter=f;[btn.closest('div').querySelectorAll('.cf')].forEach(grp=>grp.forEach(b=>b.classList.remove('on')));btn.classList.add('on');renderChart();}
-function filterTrades(trades){if(activeFilter==='ALL')return trades;const now=Date.now();const w={'1D':86400000,'1W':604800000,'1M':2592000000};return trades.filter(t=>(now-new Date(t.time||0).getTime())<=(w[activeFilter]||86400000));}
+function filterSeries(points){if(activeFilter==='ALL')return points;const now=Date.now();const w={'1D':86400000,'1W':604800000,'1M':2592000000};const cutoff=now-(w[activeFilter]||86400000);return points.filter(p=>{const ts=new Date(p.t).getTime();return !isNaN(ts)&&ts>=cutoff;});}
 function _chartColors(){
   const cs=getComputedStyle(document.body);
   return {
@@ -1425,18 +1472,94 @@ function initChart(){
 function renderChart(){
   if(!pnlChart)return;
   const empty=document.getElementById('pnl-empty');
-  const filtered=filterTrades(allTrades);const labels=[];const data=[];let cum=0;
-  filtered.forEach(t=>{const filled=t.status==='matched'||t.status==='simulated';if(filled)cum=parseFloat((cum+(t.amount_usdc||t.amount||0)*0.02).toFixed(2));labels.push(new Date(t.time||Date.now()).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}));data.push(cum);});
-  if(_totalPnl!==0&&data.length>0){const scale=_totalPnl/data[data.length-1];for(let i=0;i<data.length;i++)data[i]=parseFloat((data[i]*scale).toFixed(2));}
-  const hasPoints=labels.length>0;
-  if(!hasPoints){labels.push('now');data.push(_totalPnl||0);}
+  // Pull from real resolved-trade series. Filter for the active window;
+  // when the window is shorter than ALL we rebase to zero at the window
+  // start so the curve reads as "P&L over the last 1D/1W/1M" instead of
+  // inheriting the lifetime cumulative offset.
+  const filtered=filterSeries(_pnlSeries);
+  const labels=[];const data=[];
+  const base=(filtered.length>0&&activeFilter!=='ALL')?(filtered[0].cum-(filtered[0].delta||0)):0;
+  filtered.forEach(p=>{
+    const d=new Date(p.t);
+    const lbl=activeFilter==='1D'
+      ? d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})
+      : d.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+    labels.push(lbl);
+    data.push(parseFloat((p.cum-base).toFixed(2)));
+  });
+  const hasPoints=data.length>0;
+  if(!hasPoints){labels.push('now');data.push(0);}
   if(empty) empty.style.display=(!hasPoints&&activeFilter!=='ALL')?'flex':'none';
+  const end=hasPoints?data[data.length-1]:0;
   pnlChart.data.labels=labels;pnlChart.data.datasets[0].data=data;
-  pnlChart.data.datasets[0].borderColor=(_totalPnl>=0)?'#ff6600':'#ff3355';
-  pnlChart.data.datasets[0].backgroundColor=(_totalPnl>=0)?'rgba(255,102,0,0.08)':'rgba(255,51,85,0.08)';
+  pnlChart.data.datasets[0].borderColor=(end>=0)?'#ff6600':'#ff3355';
+  pnlChart.data.datasets[0].backgroundColor=(end>=0)?'rgba(255,102,0,0.08)':'rgba(255,51,85,0.08)';
   pnlChart.update('none');
 }
-function updateChart(trades){allTrades=trades;renderChart();}
+async function fetchPnlSeries(){
+  try{
+    const r=await fetch(`${BOT}/pnl/series`);if(!r.ok)return;
+    const d=await r.json();
+    const pts=Array.isArray(d.points)?d.points:[];
+    // Pre-compute per-point delta so rebase-to-zero on the windowed
+    // views can subtract the right offset (first point's prior-cum).
+    let prev=0;_pnlSeries=pts.map(p=>{const delta=(p.cum||0)-prev;prev=p.cum||0;return{t:p.t,cum:p.cum,delta:delta};});
+    renderChart();
+    renderToday();
+  }catch(e){}
+}
+
+/* ── TODAY AT A GLANCE ──
+   Aggregates today's signals, trades, pretrade gate hits, Claude calls,
+   and realized P&L into one card. Reads from already-populated globals
+   (_allSignals, _pnlSeries) plus a fresh /status pull for the day's
+   trades. Realized P&L for "today" is computed by summing per-point
+   deltas from _pnlSeries whose timestamp falls in the current day,
+   which keeps it consistent with the chart. */
+async function renderToday(){
+  try{
+    const todayStart=new Date();todayStart.setHours(0,0,0,0);
+    const startMs=todayStart.getTime();
+    // Signals today
+    const sigs=(_allSignals||[]).filter(s=>{const t=new Date(s.time||0).getTime();return !isNaN(t)&&t>=startMs;});
+    const sBuy=sigs.filter(s=>(s.signal||'').includes('YES')||(s.signal||'').includes('NO')).length;
+    const sPass=sigs.length-sBuy;
+    const el=id=>document.getElementById(id);
+    if(el('today-signals'))el('today-signals').textContent=sigs.length;
+    if(el('today-signals-sub'))el('today-signals-sub').textContent=`${sBuy} signal · ${sPass} skip`;
+    // Trades today (from /status — same data the live feed uses)
+    let trades=[];
+    try{const r=await fetch(`${BOT}/status`);if(r.ok){const d=await r.json();trades=(d.trades||[]).filter(t=>{const ts=new Date(t.time||0).getTime();return !isNaN(ts)&&ts>=startMs;});}}catch(e){}
+    const tMatched=trades.filter(t=>t.status==='matched'||t.status==='simulated').length;
+    const tFailed=trades.filter(t=>t.status==='error'||t.status==='no_match'||t.status==='insufficient_balance').length;
+    if(el('today-trades'))el('today-trades').textContent=trades.length;
+    if(el('today-trades-sub'))el('today-trades-sub').textContent=`${tMatched} matched · ${tFailed} failed`;
+    // Pretrade gate — read off the already-rendered counters
+    const aborts=parseInt((el('pretrade-aborts')||{}).textContent||'0',10)||0;
+    const downs=parseInt((el('pretrade-downsizes')||{}).textContent||'0',10)||0;
+    if(el('today-gate'))el('today-gate').textContent=(aborts+downs);
+    if(el('today-gate-sub'))el('today-gate-sub').textContent=`${aborts} abort · ${downs} downsize`;
+    // Claude calls + spend — read off the spend panel
+    const calls=parseInt(((el('spend-calls')||{}).textContent||'0').replace(/,/g,''),10)||0;
+    const spendTxt=(el('spend-today')||{}).textContent||'$0';
+    if(el('today-claude'))el('today-claude').textContent=calls;
+    if(el('today-claude-sub'))el('today-claude-sub').textContent=`${calls} call · ${spendTxt}`;
+    // Realized P&L today — sum deltas in window from the series
+    const todays=(_pnlSeries||[]).filter(p=>{const ts=new Date(p.t).getTime();return !isNaN(ts)&&ts>=startMs;});
+    const tPnl=todays.reduce((s,p)=>s+(p.delta||0),0);
+    const tn=todays.length;
+    const tWins=todays.filter(p=>(p.delta||0)>0).length;
+    const tWr=tn>0?Math.round(tWins/tn*100):0;
+    const pnlEl=el('today-pnl');
+    if(pnlEl){
+      const sign=tPnl>=0?'+':'';
+      pnlEl.textContent=tn===0?'$0.00':`${sign}$${tPnl.toFixed(2)}`;
+      pnlEl.style.color=tn===0?'var(--text2)':(tPnl>=0?'var(--green)':'var(--red)');
+    }
+    if(el('today-pnl-sub'))el('today-pnl-sub').textContent=`${tn} resolved · ${tn>0?tWr+'% win rate':'no resolved trades yet'}`;
+  }catch(e){}
+}
+function updateChart(trades){allTrades=trades;}
 function _applyChartTheme(){
   const c=_chartColors();
   [pnlChart].forEach(ch=>{
@@ -2846,7 +2969,7 @@ async function applyReview(reviewId,idx,btn){
   }
 }
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchActivity();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchPnlCuts();fetchExecHealth();fetchDeep();fetchBacktest();_pollBacktestStatus();fetchClaudeMax();fetchCalibration();fetchSpend();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchActivity();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchPnlSeries();fetchPnlCuts();fetchExecHealth();fetchDeep();fetchBacktest();_pollBacktestStatus();fetchClaudeMax();fetchCalibration();fetchSpend();renderToday();
 setInterval(fetchBot,15000);
 setInterval(fetchActivity,30000);
 setInterval(fetchPortfolio,30000);
@@ -2863,7 +2986,9 @@ setInterval(fetchReviews,600000);
 setInterval(fetchPretrade,90000);
 setInterval(fetchCalibration,600000);  // 10 min — data only changes when Brier resolver fires (every 6h)
 setInterval(fetchSpend,60000);          // 1 min — Claude spend can move fast during heavy scanning
+setInterval(renderToday,60000);         // 1 min — aggregates counters already on the page
 setInterval(fetchRealizedPnl,180000);
+setInterval(fetchPnlSeries,180000);   // 3 min — same cadence as headline P&L
 setInterval(fetchPnlCuts,180000);     // 3 min — same cadence as headline P&L
 setInterval(fetchExecHealth,60000);   // 1 min — execution failures should surface fast
 setInterval(fetchDeep,120000);

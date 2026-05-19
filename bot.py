@@ -1671,7 +1671,7 @@ class PolymarketBot:
     # on the current FMP plan tier; the actual indices via Yahoo
     # notation (^DJI, ^IXIC) are included on the same plan. Stocks
     # below feed the Market Movers panel.
-    FMP_TICKERS = ["SPY", "^DJI", "^IXIC", "AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN"]
+    FMP_TICKERS = ["SPY", "^DJI", "^IXIC", "AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN", "GOOG"]
 
     # Stocks/indices don't move fast enough vs. dashboard refresh to need
     # 5-min freshness, and FMP's free-tier quota is the hard ceiling. 30-min
@@ -1680,42 +1680,80 @@ class PolymarketBot:
     # happen plenty often for a passive dashboard panel.
     FMP_CACHE_TTL = 1800
 
-    def get_fmp_market(self) -> dict:
-        """Fetch stock quotes from FMP and compute market sentiment score.
-        Serves last-known-good cache when fresh fetches fail (e.g. FMP
-        429s) so the MARKET MOVERS / INDEXES / top-bar panels don't go
-        blank for an entire day after one rate-limit hit."""
+    # Finnhub fallback for when the FMP key is dead / quota-blown / 401s.
+    # Finnhub's free tier doesn't carry the Yahoo-style index symbols, so
+    # ^DJI and ^IXIC are routed to liquid ETF proxies (DIA, QQQ) that
+    # mirror the underlying within a few bps intraday. SPY and individual
+    # tickers pass straight through.
+    FINNHUB_SYM_MAP = {"^DJI": "DIA", "^IXIC": "QQQ"}
+
+    def _finnhub_quote(self, sym: str) -> dict:
+        """Single-quote pull from Finnhub mapped into the FMP shape so
+        downstream consumers (sentiment calc, dashboard JS) don't need
+        to know which provider answered."""
         import json as _j
-        if not FMP_API_KEY:
+        if not FINNHUB_API_KEY:
             return {}
+        fh_sym = self.FINNHUB_SYM_MAP.get(sym, sym)
+        try:
+            url = f"https://finnhub.io/api/v1/quote?symbol={fh_sym}&token={FINNHUB_API_KEY}"
+            with _ureq.urlopen(url, timeout=5) as r:
+                q = _j.loads(r.read())
+            if not q or q.get("c") in (None, 0):
+                return {}
+            price = float(q.get("c") or 0)
+            change = float(q.get("d") or 0)
+            change_pct = float(q.get("dp") or 0)
+            return {
+                "price": price,
+                "change": round(change, 2),
+                "change_pct": round(change_pct, 2),
+                "volume": None,
+                "day_high": q.get("h"),
+                "day_low": q.get("l"),
+                "prev_close": q.get("pc"),
+                "mktcap": None,
+            }
+        except Exception as e:
+            log.debug(f"Finnhub quote {sym}→{fh_sym} error: {e}")
+            return {}
+
+    def get_fmp_market(self) -> dict:
+        """Fetch stock quotes from FMP (primary) with Finnhub fallback for
+        anything FMP can't deliver — dead key, 401, 429, missing symbol.
+        Serves last-known-good cache when fresh fetches fail entirely so
+        the MARKET MOVERS / INDEXES / top-bar panels don't go blank for
+        an entire day after one outage."""
+        import json as _j
         if time.time() - self._fmp_cache_time < self.FMP_CACHE_TTL and self._fmp_cache:
             return self._fmp_cache
         # Track whether THIS call hit a rate limit so we don't poison the
         # cache with partial data when only the first 1-2 tickers landed.
         rate_limited = False
         results = {}
-        for sym in self.FMP_TICKERS:
-            try:
-                url = f"https://financialmodelingprep.com/stable/quote?symbol={sym}&apikey={FMP_API_KEY}"
-                with _ureq.urlopen(url, timeout=5) as r:
-                    data = _j.loads(r.read())
-                if data:
-                    q = data[0]
-                    results[sym] = {
-                        "price": q.get("price"),
-                        "change": round(q.get("change", 0), 2),
-                        "change_pct": round(q.get("changePercentage", 0), 2),
-                        "volume": q.get("volume"),
-                        "day_high": q.get("dayHigh"),
-                        "day_low": q.get("dayLow"),
-                        "prev_close": q.get("previousClose"),
-                        "mktcap": q.get("marketCap"),
-                    }
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "Too Many Requests" in err_str:
-                    rate_limited = True
-                log.debug(f"FMP quote {sym} error: {e}")
+        if FMP_API_KEY:
+            for sym in self.FMP_TICKERS:
+                try:
+                    url = f"https://financialmodelingprep.com/stable/quote?symbol={sym}&apikey={FMP_API_KEY}"
+                    with _ureq.urlopen(url, timeout=5) as r:
+                        data = _j.loads(r.read())
+                    if data:
+                        q = data[0]
+                        results[sym] = {
+                            "price": q.get("price"),
+                            "change": round(q.get("change", 0), 2),
+                            "change_pct": round(q.get("changePercentage", 0), 2),
+                            "volume": q.get("volume"),
+                            "day_high": q.get("dayHigh"),
+                            "day_low": q.get("dayLow"),
+                            "prev_close": q.get("previousClose"),
+                            "mktcap": q.get("marketCap"),
+                        }
+                except Exception as e:
+                    err_str = str(e)
+                    if "429" in err_str or "Too Many Requests" in err_str:
+                        rate_limited = True
+                    log.debug(f"FMP quote {sym} error: {e}")
         # Don't poison the cache on a rate-limit blip — keep serving the
         # last-known-good payload so the dashboard panels stay populated
         # until the FMP quota resets. Bump _fmp_cache_time so we don't
@@ -1724,6 +1762,18 @@ class PolymarketBot:
             log.warning(f"FMP rate-limited (got {len(results)}/{len(self.FMP_TICKERS)}); serving cached payload")
             self._fmp_cache_time = time.time()
             return self._fmp_cache
+        # Fill any tickers FMP couldn't deliver (dead key, missing symbol,
+        # non-rate-limit error) from Finnhub. Indices route to ETF proxies.
+        missing = [s for s in self.FMP_TICKERS if s not in results]
+        if missing and FINNHUB_API_KEY:
+            filled = 0
+            for sym in missing:
+                q = self._finnhub_quote(sym)
+                if q:
+                    results[sym] = q
+                    filled += 1
+            if filled:
+                log.info(f"Finnhub filled {filled}/{len(missing)} tickers FMP missed")
         if results:
             # Market sentiment: % of tickers up, weighted by magnitude
             changes = [v["change_pct"] for v in results.values()]
@@ -3644,6 +3694,32 @@ class PolymarketBot:
         except Exception as e:
             log.debug(f"get_realized_pnl_summary error: {e}")
             return {}
+
+    def get_realized_pnl_series(self, window_days: int = 0) -> list:
+        """Cumulative realized P&L as a time series of (resolved_at, cum_pnl)
+        points, ordered chronologically. Used by the dashboard chart so the
+        curve reflects actual settled P&L instead of a synthetic accumulator.
+        window_days=0 → all-time. Returns [] when there are no resolved
+        trades so the caller can render an empty state."""
+        try:
+            if window_days and window_days > 0:
+                where = f"AND resolved_at >= datetime('now','-{int(window_days)} days')"
+            else:
+                where = ""
+            rows = self.db.execute(
+                "SELECT resolved_at, realized_pnl FROM trades "
+                "WHERE resolved=1 AND dry_run=0 AND realized_pnl IS NOT NULL "
+                f"AND resolved_at IS NOT NULL {where} "
+                "ORDER BY resolved_at ASC"
+            ).fetchall()
+            out, cum = [], 0.0
+            for r in rows:
+                cum += float(r[1] or 0.0)
+                out.append({"t": r[0], "cum": round(cum, 2)})
+            return out
+        except Exception as e:
+            log.debug(f"get_realized_pnl_series error: {e}")
+            return []
 
     def get_pnl_by_price_bucket(self, window_days: int = 30) -> list:
         """Realized P&L bucketed by entry-price decile (0-10c, 10-20c, ...,
@@ -9842,6 +9918,15 @@ def get_realized_pnl():
     whose markets have resolved. Computed from (payout − cost) per
     resolved position."""
     return JSONResponse(bot.get_realized_pnl_summary())
+
+
+@app.get("/pnl/series")
+def get_pnl_series(days: int = 0):
+    """Cumulative realized P&L over time. days=0 → all-time. Returns
+    a list of {t, cum} points sorted by resolution time, used by the
+    dashboard P&L chart."""
+    days = max(0, min(int(days or 0), 3650))
+    return JSONResponse({"days": days, "points": bot.get_realized_pnl_series(window_days=days)})
 
 
 @app.get("/pnl/cuts")
