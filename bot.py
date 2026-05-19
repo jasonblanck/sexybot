@@ -4612,6 +4612,110 @@ class PolymarketBot:
             log.warning(f"OddsAPI fetch failed for {sport_key}: {err}")
             return cache_entry["events"] if cache_entry else []
 
+    @staticmethod
+    def _american_to_prob(american: float) -> float:
+        """Convert American odds (+150 / -200) to implied probability 0-1."""
+        try:
+            a = float(american)
+            if a >= 0:
+                return 100.0 / (a + 100.0)
+            else:
+                return -a / (-a + 100.0)
+        except Exception:
+            return 0.5
+
+    def _oddsapi_arb_signal(self, market: dict, yes_p: float,
+                              yes_id: str, no_id: str, question: str) -> Optional[dict]:
+        """Cross-book arb signal: compares Polymarket mid-price to the
+        sportsbook implied probability for the same matchup. Fires when
+        the two diverge by more than ARB_THRESHOLD cents — buy the cheap
+        side. Devigs naively by averaging the two sides' implied probs
+        and renormalizing so they sum to 1 (removes the book's vig).
+
+        Returns None if no sport_key detected, no matching event found,
+        no valid odds in the cache, or gap below threshold.
+
+        Conservative on matching: requires BOTH home_team AND away_team
+        to appear as tokens in the question. Avoids matching e.g.
+        'Will Aaron Rodgers retire?' to a Jets-Bills game just because
+        'Rodgers' tokens overlap."""
+        sport_key = type(self)._detect_sport_key(question)
+        if not sport_key:
+            return None
+        events = self._oddsapi_cache.get(sport_key, {}).get("events", [])
+        if not events:
+            return None
+        q_low = (question or "").lower()
+        match = None
+        for ev in events:
+            home = (ev.get("home") or "").lower()
+            away = (ev.get("away") or "").lower()
+            if not home or not away:
+                continue
+            # Match only when at least one team name appears in the question.
+            # Most Polymarket sports markets are unilateral ("Will Team X win
+            # the series?") so single-side match is the common case. Pick
+            # which side the question is about based on which team appears.
+            home_in = home in q_low
+            away_in = away in q_low
+            if home_in or away_in:
+                match = (ev, home if home_in else away, home_in)
+                break
+        if not match:
+            return None
+        ev, our_team, our_team_is_home = match
+        # Average the moneyline implied probs across the top books, devig
+        # so the two sides sum to 1.
+        our_probs, opp_probs = [], []
+        for bk in ev.get("books", []):
+            outcomes = dict(bk.get("outcomes", []))
+            for name, price in outcomes.items():
+                if not isinstance(price, (int, float)):
+                    continue
+                ip = self._american_to_prob(price)
+                if name.lower() == our_team:
+                    our_probs.append(ip)
+                else:
+                    opp_probs.append(ip)
+        if not our_probs or not opp_probs:
+            return None
+        our_ip = sum(our_probs) / len(our_probs)
+        opp_ip = sum(opp_probs) / len(opp_probs)
+        # Devig — split the overround proportionally.
+        total = our_ip + opp_ip
+        if total <= 0:
+            return None
+        our_fair = our_ip / total
+        # Polymarket mid for "Will <our_team> win" — yes_p is the YES side.
+        # If question is "Will <our_team> win ...", YES corresponds to our_team.
+        pm_prob_for_team = yes_p
+        gap = our_fair - pm_prob_for_team
+        # Threshold: configurable, default 5 cents.
+        ARB_THRESHOLD = float(os.getenv("SEXYBOT_ARB_THRESHOLD", "0.05"))
+        if abs(gap) < ARB_THRESHOLD:
+            return None
+        # Sportsbook says higher prob than Polymarket → YES is cheap, buy YES.
+        # Sportsbook says lower prob than Polymarket → NO is cheap, buy NO.
+        if gap > 0:
+            side, tok, price = "YES", yes_id, yes_p
+        else:
+            side, tok, price = "NO", no_id, (1.0 - yes_p)
+        if not tok:
+            return None
+        conf = min(99, int(round(abs(gap) * 1000)))   # 5c gap → 50 conf, 10c → 99
+        return {
+            "strategy":    "arbitrage",
+            "signal":      f"BUY {side} (arb: book {our_fair:.2f} vs PM {pm_prob_for_team:.2f}, gap {gap:+.3f})",
+            "token_id":    tok,
+            "yes_token_id": yes_id,
+            "no_token_id":  no_id,
+            "price":       round(price, 4),
+            "confidence":  conf,
+            "market":      question,
+            "amount":      min(MAX_ORDER_SIZE, MAX_ORDER_SIZE * min(1.0, abs(gap) * 10)),
+            "ai_probability": int(round(our_fair * 100)),
+        }
+
     def get_manifold_top(self) -> list:
         """Top Manifold Markets by 24h volume — third prediction-market
         reference (after Kalshi and Predictit). Public, no auth, 5-min cache.
@@ -7393,6 +7497,17 @@ class PolymarketBot:
                         "confidence": round(spread * 500, 1),
                         "market": question,
                         "amount": MAX_ORDER_SIZE / 2}
+
+        # ── Sportsbook arb ──────────────────────────────────────────────────────
+        # Cross-book divergence trade: when Polymarket mid-price disagrees
+        # with sportsbook-implied probability on the same matchup, buy the
+        # cheap side. Highest-edge strategy at our bankroll if the matching
+        # works. Gated by SEXYBOT_ARB_ENABLED so a fresh deploy doesn't
+        # change behavior. Threshold via SEXYBOT_ARB_THRESHOLD (default 0.05).
+        if os.getenv("SEXYBOT_ARB_ENABLED", "0") == "1":
+            sig = self._oddsapi_arb_signal(market, yes_p, yes_id, no_id, question)
+            if sig:
+                return sig
 
         # ── EconFlow ────────────────────────────────────────────────────────────
         if STRATEGY in ("econFlow", "both"):
