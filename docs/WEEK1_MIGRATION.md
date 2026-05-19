@@ -82,7 +82,29 @@ Pulled from the 30-day equity-curve walk on 2026-05-19:
   −$11.35 / 25 trades.** `SEXYBOT_SPORTS_ONLY=1` is the highest-
   leverage single change.
 
+## Phase 2 (audit follow-ups, ship-yourself)
+
+The 2026-05-19 audit found additional bleeders. Recommended env block,
+copy/paste in addition to Phase 1:
+
+```
+# Phase 2 — audit follow-ups
+MIN_BUY_PRICE=0.40                # was 0.20 — kills the 30-40c loser bucket (-$4.69/tr) too
+SEXYBOT_MAX_TRADES_PER_HOUR=4     # cap churn: ~96/day max vs current ~42/day baseline
+SEXYBOT_PREFLIGHT_BALANCE=1       # skip orders when live USDC < trade size (kills 41/30d wasted submits)
+SEXYBOT_ORDER_TYPE_OVERRIDE=GTC   # FOK kills 11+ orders/30d when book moves; GTC sits briefly and captures
+SEXYBOT_INVERT_SPORTS_SIGNAL=1    # bet — counterfactual shows +$126/30d if same trades flipped
+```
+
+The signal-invert is the strategic bet. Counterfactual showed sports
+YES bets would have netted +$74.90 more had each been NO at the
+inverse price; sports NO bets would have netted +$51.53 more had
+each been YES. Caveat: counterfactual assumes identical entry
+conditions — the actual signal-fire price is different on the
+inverse side, so realized improvement may diverge. Watch the first
+24-48 hours of trades after enabling.
+
 ## Rollback
 
 One env edit + `systemctl restart`. The code path defaults match
-prior behavior with all flags at 0.
+prior behavior with all flags at 0/empty.

@@ -275,6 +275,29 @@ SEXYBOT_SPORTS_ONLY      = os.getenv("SEXYBOT_SPORTS_ONLY", "0") == "1"
 # Rizespor-class outliers the +15¢ rule undershoots on low-price
 # entries (12¢ → 39.5¢ is +27.5¢ AND +229%, either should trigger).
 SEXYBOT_BIG_WINNER_PCT   = float(os.getenv("SEXYBOT_BIG_WINNER_PCT", "0"))
+# Trade-rate throttle: cap on new positions opened in any rolling hour.
+# Audit showed ~42 trades/day on a $170 account — entire bankroll
+# churning every day, with spread costs alone (~2c per share roundtrip)
+# eating into edge. 0 disables; set on VPS to e.g. 4 for ~96/day max.
+SEXYBOT_MAX_TRADES_PER_HOUR = int(os.getenv("SEXYBOT_MAX_TRADES_PER_HOUR", "0"))
+# Sports signal inversion: when set, flip BUY YES <-> BUY NO on
+# sports-category signals. Counterfactual on the last 30 days shows
+# the bot's sports trades would have netted +$126 better had each
+# entry been on the opposite side. This is the strategy bet; default
+# OFF so a fresh deploy doesn't change behavior. Caveat: counterfactual
+# assumes same trade selection — actual signal-fire conditions differ
+# slightly on the inverse side, so realized improvement may diverge.
+SEXYBOT_INVERT_SPORTS_SIGNAL = os.getenv("SEXYBOT_INVERT_SPORTS_SIGNAL", "0") == "1"
+# Preflight balance check: when set, query live USDC balance before
+# submitting and skip if insufficient. Kills the 41 wasted-submission
+# class of failure observed in the 30-day audit.
+SEXYBOT_PREFLIGHT_BALANCE = os.getenv("SEXYBOT_PREFLIGHT_BALANCE", "0") == "1"
+# Order-type override: when set to "GTC", momentum market orders are
+# placed as good-till-cancelled limits at the touch instead of FOK.
+# FOK fail-to-fill happens when book moves mid-submission; GTC sits
+# briefly and captures the trade. Default empty = preserve current
+# behavior (executor decides per-strategy).
+SEXYBOT_ORDER_TYPE_OVERRIDE = os.getenv("SEXYBOT_ORDER_TYPE_OVERRIDE", "").upper()
 # Cooldown applied to a token after a failed (status="error") order. Prevents
 # the strategy loop from immediately retrying the same structurally-broken
 # market on the next scan cycle. Default 30 min — long enough that a
@@ -572,6 +595,9 @@ class PolymarketBot:
         }
         self._regime_cache_time: float = 0.0
         self._regime_fail_streak: int = 0   # consecutive Claude failures; resets to normal after threshold
+        # Trade-rate throttle: rolling deque of recent trade-open timestamps.
+        # Trimmed to last hour on every check, gated by SEXYBOT_MAX_TRADES_PER_HOUR.
+        self._recent_trade_times: deque = deque(maxlen=1000)
         # SEXYBOT_FEEDS_DAMPER per-instance state — explicit init avoids
         # the class-level-mutable-default footgun for these dicts.
         self._damper_today_date: str = ""
@@ -1373,7 +1399,7 @@ class PolymarketBot:
                     return self.client.create_market_order(order_args)
                 signed = _sign_market(neg_risk_flag)
                 try:
-                    resp = self.client.post_order(signed, OrderType.FOK)
+                    resp = self.client.post_order(signed, OrderType.GTC if SEXYBOT_ORDER_TYPE_OVERRIDE == "GTC" else OrderType.FOK)
                 except Exception as post_exc:
                     # Defensive retry: get_neg_risk is occasionally wrong for
                     # individual tokens (observed 2026-04-30 on a soccer
@@ -1391,7 +1417,7 @@ class PolymarketBot:
                             f"(token={token_id[:16]}…)"
                         )
                         signed = _sign_market(neg_risk_flag)
-                        resp = self.client.post_order(signed, OrderType.FOK)
+                        resp = self.client.post_order(signed, OrderType.GTC if SEXYBOT_ORDER_TYPE_OVERRIDE == "GTC" else OrderType.FOK)
                     else:
                         raise
                 result["status"] = resp.get("status", "unknown")
@@ -8376,6 +8402,35 @@ class PolymarketBot:
                                 self._log(f"[SPORTS-ONLY] skip — {mkt_name[:40]} (category={_cat_check})")
                                 sig_record["skip_reason"] = f"sports-only filter (category={_cat_check})"
                                 continue
+                        # ── Trade-rate throttle ──────────────────────────────
+                        # Cap new positions per rolling hour. Prevents the
+                        # 42-trade/day churn that the 30-day audit flagged
+                        # as the spread-cost bleeder.
+                        if SEXYBOT_MAX_TRADES_PER_HOUR > 0:
+                            _now_ts = time.time()
+                            # Trim deque to the last hour.
+                            while self._recent_trade_times and _now_ts - self._recent_trade_times[0] > 3600:
+                                self._recent_trade_times.popleft()
+                            if len(self._recent_trade_times) >= SEXYBOT_MAX_TRADES_PER_HOUR:
+                                self._bump_skip("rate_throttle")
+                                self._log(f"[RATE THROTTLE] skip — {mkt_name[:40]} ({len(self._recent_trade_times)}/{SEXYBOT_MAX_TRADES_PER_HOUR}/hr)")
+                                sig_record["skip_reason"] = f"rate throttle ({len(self._recent_trade_times)}/{SEXYBOT_MAX_TRADES_PER_HOUR}/hr)"
+                                continue
+                        # ── Sports signal inversion ──────────────────────────
+                        # When set, flip BUY YES <-> BUY NO on sports signals.
+                        # Counterfactual says +$126/30d improvement on same
+                        # trades. Caveat: realized trades differ slightly since
+                        # signal-fire conditions are price-dependent.
+                        if SEXYBOT_INVERT_SPORTS_SIGNAL and self.classify_market(question) == "sports":
+                            _orig_sig = signal.get("signal", "")
+                            if "YES" in _orig_sig and signal.get("no_token_id"):
+                                signal["signal"] = _orig_sig.replace("YES", "NO")
+                                signal["token_id"] = signal["no_token_id"]
+                                self._log(f"[SPORTS INVERT] flipped YES→NO for {mkt_name[:40]}")
+                            elif "NO" in _orig_sig and signal.get("yes_token_id"):
+                                signal["signal"] = _orig_sig.replace("NO", "YES")
+                                signal["token_id"] = signal["yes_token_id"]
+                                self._log(f"[SPORTS INVERT] flipped NO→YES for {mkt_name[:40]}")
                         # Use asyncio.to_thread so blocking network I/O (CLOB API calls) in
                         # place_market_order / place_limit_order don't stall the event loop.
                         result = None
@@ -8589,12 +8644,29 @@ class PolymarketBot:
                                 except Exception as _conc_e:
                                     log.debug(f"concentration check error (allowing trade): {_conc_e}")
 
+                            # ── Preflight live-balance check ─────────────
+                            # Audit showed 41 wasted insufficient_balance
+                            # submissions over 30d. Skip submission entirely
+                            # if live USDC balance can't cover the trade.
+                            if SEXYBOT_PREFLIGHT_BALANCE:
+                                try:
+                                    live_bal = await asyncio.to_thread(self.get_balance)
+                                    if live_bal is not None and live_bal < amt:
+                                        self._bump_skip("preflight_low_balance")
+                                        self._log(f"[PREFLIGHT] skip — {mkt_name[:40]} need ${amt:.2f}, have ${live_bal:.2f}")
+                                        sig_record["skip_reason"] = f"preflight low balance ${live_bal:.2f}<${amt:.2f}"
+                                        continue
+                                except Exception as _pfb_e:
+                                    log.debug(f"preflight balance check failed (allowing trade): {_pfb_e}")
                             result = await self._execute_order(
                                 signal["token_id"], "BUY", amt, mkt_name,
                                 attribution=_attribution_base,
                             )
                             self._note_order_outcome(result)
                             _traded_tokens_this_cycle.add(signal["token_id"])
+                            # Record successful trade open for rate throttle
+                            if result and result.get("status") not in ("error", None):
+                                self._recent_trade_times.append(time.time())
                             cycle_cash -= amt
                             if result and result.get("status") not in ("error", None):
                                 sig_record["traded"] = True
