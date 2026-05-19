@@ -56,6 +56,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
   grid-template-columns:repeat(4,minmax(0,1fr));
   grid-template-areas:
     "positions positions chart    chart"
+    "score     score     score    score"
     "markets   markets   signals  signals"
     "movers    movers    vmx      trades"
     "stats     fred      crypto   weather"
@@ -92,6 +93,30 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 #spend-panel{grid-area:spend;display:flex;flex-direction:column;height:420px;}
 #exec-health-panel{grid-area:exec;display:flex;flex-direction:column;height:420px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
 #today-panel{grid-area:today;display:flex;flex-direction:column;height:420px;}
+#scoreboard-panel{grid-area:score;display:flex;flex-direction:column;}
+.sb-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-top:4px;}
+.sb-cell{background:var(--bg);border:1px solid var(--border2);border-radius:8px;padding:12px 14px;position:relative;overflow:hidden;}
+.sb-cell.green{border-color:#00cc6655;box-shadow:inset 0 0 0 1px #00cc6622;}
+.sb-cell.yellow{border-color:#ffaa0055;box-shadow:inset 0 0 0 1px #ffaa0022;}
+.sb-cell.red{border-color:#ff335555;box-shadow:inset 0 0 0 1px #ff335522;}
+.sb-name{color:var(--text3);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px;}
+.sb-val{font-family:var(--mono);font-size:22px;font-weight:500;letter-spacing:-0.5px;line-height:1;}
+.sb-cell.green .sb-val{color:var(--green);}
+.sb-cell.yellow .sb-val{color:var(--accent2);}
+.sb-cell.red .sb-val{color:var(--red);}
+.sb-thresh{font-size:9px;color:var(--text3);margin-top:6px;font-family:var(--mono);letter-spacing:0.3px;}
+.sb-blurb{font-size:10px;color:var(--text2);margin-top:4px;line-height:1.35;}
+.sb-dot{position:absolute;top:10px;right:12px;width:8px;height:8px;border-radius:50%;}
+.sb-cell.green .sb-dot{background:var(--green);box-shadow:0 0 8px #00cc66aa;}
+.sb-cell.yellow .sb-dot{background:var(--accent2);box-shadow:0 0 8px #ffaa00aa;}
+.sb-cell.red .sb-dot{background:var(--red);box-shadow:0 0 8px #ff3355aa;}
+.sb-summary{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px;padding-top:10px;border-top:1px solid var(--border2);}
+.sb-verdict{font-family:var(--mono);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;}
+.sb-verdict.green{color:var(--green);}
+.sb-verdict.yellow{color:var(--accent2);}
+.sb-verdict.red{color:var(--red);}
+@media(max-width:1200px){.sb-grid{grid-template-columns:repeat(3,minmax(0,1fr));}}
+@media(max-width:720px){.sb-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
 .panel.panel-term{grid-area:terminal;}
 
 /* Chart sizes to its card, not the other way around. */
@@ -122,6 +147,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
     grid-template-columns:repeat(2,minmax(0,1fr));
     grid-template-areas:
       "positions chart"
+      "score     score"
       "markets   signals"
       "movers    vmx"
       "trades    stats"
@@ -142,6 +168,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
     grid-template-areas:
       "positions"
       "chart"
+      "score"
       "markets"
       "signals"
       "movers"
@@ -939,6 +966,25 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <table class="mkt-table"><thead><tr><th>MARKET</th><th>YES</th><th>NO</th><th>VOL 24H</th></tr></thead>
       <tbody id="mkt-body"><tr><td colspan="4" style="color:var(--text3);padding:12px 0;text-align:center">loading…</td></tr></tbody></table>
     </div>
+    <div class="panel" id="scoreboard-panel">
+      <div class="panel-title">CAPITAL READINESS SCOREBOARD
+        <span style="display:inline-flex;align-items:center;gap:8px">
+          <span id="sb-verdict" class="sb-verdict yellow">— · —/6 green</span>
+          <span class="pill pill-live">LIVE</span>
+        </span>
+      </div>
+      <div style="font-size:11px;color:var(--text2);line-height:1.5;margin-bottom:4px">
+        Six metrics that gate deploying additional capital. All six green for 14 consecutive days = ready to fund.
+        Thresholds live in <span style="color:var(--text)">docs/WEEK1_MIGRATION.md</span> and the <span style="color:var(--text)">/scoreboard</span> endpoint.
+      </div>
+      <div class="sb-grid" id="sb-grid">
+        <div class="sb-cell yellow"><div class="sb-dot"></div><div class="sb-name">loading…</div></div>
+      </div>
+      <div class="sb-summary">
+        <div style="font-size:10px;color:var(--text3)">Window: <span id="sb-window">30d</span> · Refreshes every 5 min</div>
+        <div id="sb-rule" style="font-size:10px;color:var(--text3)">Rule: deploy capital only after 14 consecutive days at 6/6 green</div>
+      </div>
+    </div>
     <div class="panel" id="positions-panel">
       <div class="panel-title">OPEN POSITIONS <span class="pill pill-count" id="pos-count">0</span></div>
       <div class="conviction-card" id="conviction-card" style="display:none;">
@@ -1517,6 +1563,49 @@ async function fetchPnlSeries(){
     let prev=0;_pnlSeries=pts.map(p=>{const delta=(p.cum||0)-prev;prev=p.cum||0;return{t:p.t,cum:p.cum,delta:delta};});
     renderChart();
     renderToday();
+  }catch(e){}
+}
+
+/* ── CAPITAL READINESS SCOREBOARD ──
+   Six metrics returned by /scoreboard, each with status (green/yellow
+   /red) and a one-line context blurb. The verdict pill summarizes —
+   "GO" if all six green, "WAIT" if 5/6, "HOLD" otherwise. The 14-day
+   rule is the operator's, not the bot's — we surface the current
+   state and let the operator track consecutive days manually until a
+   persistence counter is added. */
+async function fetchScoreboard(){
+  try{
+    const r=await fetch(`${BOT}/scoreboard?days=30`);if(!r.ok)return;
+    const d=await r.json();
+    const grid=document.getElementById('sb-grid');
+    const verd=document.getElementById('sb-verdict');
+    const winEl=document.getElementById('sb-window');
+    if(winEl)winEl.textContent=(d.window_days||30)+'d';
+    if(!grid)return;
+    const metrics=Array.isArray(d.metrics)?d.metrics:[];
+    grid.innerHTML=metrics.map(m=>{
+      const status=m.status||'yellow';
+      const name=safeHtml(String(m.name||''));
+      const val=safeHtml(String(m.value_fmt||'—'));
+      const thr=safeHtml(String(m.threshold||''));
+      const blurb=safeHtml(String(m.blurb||''));
+      return `<div class="sb-cell ${status}">
+        <div class="sb-dot"></div>
+        <div class="sb-name">${name}</div>
+        <div class="sb-val">${val}</div>
+        <div class="sb-thresh">target ${thr}</div>
+        <div class="sb-blurb">${blurb}</div>
+      </div>`;
+    }).join('');
+    if(verd){
+      const overall=d.overall||'yellow';
+      const g=d.green_count||0,t=d.total||6;
+      const label=overall==='green'?(g===t?'GO · deploy ready':'NEAR · '+g+'/'+t+' green')
+                : overall==='yellow'?'WAIT · '+g+'/'+t+' green'
+                :'HOLD · '+g+'/'+t+' green';
+      verd.className='sb-verdict '+overall;
+      verd.textContent=label;
+    }
   }catch(e){}
 }
 
@@ -2981,7 +3070,7 @@ async function applyReview(reviewId,idx,btn){
   }
 }
 initChart();psCalc();
-fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchActivity();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchPnlSeries();fetchPnlCuts();fetchExecHealth();fetchDeep();fetchBacktest();_pollBacktestStatus();fetchClaudeMax();fetchCalibration();fetchSpend();renderToday();
+fetchBot();fetchIndices();fetchMarketData();fetchFred();fetchWeather();fetchCrypto();fetchPortfolio();fetchActivity();fetchMarkets();fetchFMP();fetchPaperPortfolio();fetchRegime();fetchReviews();fetchPretrade();fetchRealizedPnl();fetchPnlSeries();fetchPnlCuts();fetchExecHealth();fetchDeep();fetchBacktest();_pollBacktestStatus();fetchClaudeMax();fetchCalibration();fetchSpend();fetchScoreboard();renderToday();
 setInterval(fetchBot,15000);
 setInterval(fetchActivity,30000);
 setInterval(fetchPortfolio,30000);
@@ -2998,6 +3087,7 @@ setInterval(fetchReviews,600000);
 setInterval(fetchPretrade,90000);
 setInterval(fetchCalibration,600000);  // 10 min — data only changes when Brier resolver fires (every 6h)
 setInterval(fetchSpend,60000);          // 1 min — Claude spend can move fast during heavy scanning
+setInterval(fetchScoreboard,300000);    // 5 min — capital readiness scoreboard
 setInterval(renderToday,60000);         // 1 min — aggregates counters already on the page
 setInterval(fetchRealizedPnl,180000);
 setInterval(fetchPnlSeries,180000);   // 3 min — same cadence as headline P&L

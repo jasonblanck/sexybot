@@ -4180,6 +4180,216 @@ class PolymarketBot:
             log.debug(f"get_execution_breakdown error: {e}")
             return {}
 
+    def get_capital_scoreboard(self, window_days: int = 30) -> dict:
+        """Six-metric readiness score for deploying additional capital.
+        Each metric returns: value, threshold, status (green/yellow/red),
+        and a one-line context blurb. Overall status is the worst of the
+        six. Use the dashboard panel to decide when to fund more.
+
+        Thresholds chosen from the Week-1 plan in docs/WEEK1_MIGRATION.md:
+          - EV/trade ≥ +$0.30 with 95% CI lower bound > $0
+          - Sample ≥ 150 resolved trades in window
+          - Brier ≤ 0.18 (calibration panel computes per-category; we
+            use the trade-weighted mean across categories here)
+          - Sharpe ratio ≥ 1.5 on daily realized returns, annualized
+          - Max drawdown ≤ 15% of bankroll
+          - Op fail rate < 5%
+        """
+        import math
+        out_metrics = []
+        # Helper: classify a value against (green, yellow) thresholds with
+        # higher-is-better OR lower-is-better semantics.
+        def _status(value, green, yellow, higher_better=True):
+            if value is None or (isinstance(value, float) and math.isnan(value)):
+                return "yellow"
+            if higher_better:
+                if value >= green:   return "green"
+                if value >= yellow:  return "yellow"
+                return "red"
+            else:
+                if value <= green:   return "green"
+                if value <= yellow:  return "yellow"
+                return "red"
+
+        # ── 1. EV per trade with 95% CI ──────────────────────────────
+        try:
+            rows = self.db.execute(
+                "SELECT realized_pnl FROM trades "
+                "WHERE resolved=1 AND dry_run=0 AND realized_pnl IS NOT NULL "
+                f"AND resolved_at >= datetime('now','-{int(window_days)} days')"
+            ).fetchall()
+            vals = [float(r[0] or 0.0) for r in rows]
+            n = len(vals)
+            if n >= 2:
+                mean = sum(vals) / n
+                var  = sum((v - mean) ** 2 for v in vals) / (n - 1)
+                se   = (var / n) ** 0.5
+                ci_lo = mean - 1.96 * se
+                ci_hi = mean + 1.96 * se
+            else:
+                mean, ci_lo, ci_hi = (vals[0] if vals else 0.0), None, None
+            ev_status = _status(mean, 0.30, 0.0, higher_better=True)
+            # downgrade if CI lower bound isn't strictly positive — green
+            # requires confidence that the edge is real, not just point estimate
+            if ev_status == "green" and (ci_lo is None or ci_lo <= 0):
+                ev_status = "yellow"
+            out_metrics.append({
+                "name":         "EV per trade",
+                "value":        round(mean, 2),
+                "value_fmt":    f"{'+' if mean >= 0 else ''}${mean:.2f}",
+                "ci_lo":        round(ci_lo, 2) if ci_lo is not None else None,
+                "ci_hi":        round(ci_hi, 2) if ci_hi is not None else None,
+                "threshold":    "≥ +$0.30, CI > 0",
+                "status":       ev_status,
+                "blurb":        (
+                    f"n={n}, 95% CI [${ci_lo:.2f}, ${ci_hi:.2f}]"
+                    if ci_lo is not None else f"n={n} (need ≥2 for CI)"
+                ),
+            })
+        except Exception as e:
+            log.debug(f"scoreboard EV error: {e}")
+            out_metrics.append({"name": "EV per trade", "status": "yellow", "blurb": "computation error"})
+
+        # ── 2. Sample size ──────────────────────────────────────────
+        sample_n = len(vals) if 'vals' in dir() else 0
+        try:
+            sample_n = len(vals)
+        except Exception:
+            sample_n = 0
+        out_metrics.append({
+            "name":      "Sample size",
+            "value":     sample_n,
+            "value_fmt": str(sample_n),
+            "threshold": "≥ 150 resolved trades",
+            "status":    _status(sample_n, 150, 75, higher_better=True),
+            "blurb":     f"{sample_n} resolved trades in last {window_days}d",
+        })
+
+        # ── 3. Brier score (trade-weighted across categories) ────────
+        # Pull from calibrator for the same window; fall back to the
+        # category-bucket Brier rows we already store.
+        try:
+            cal = self.db.execute(
+                "SELECT category, AVG((COALESCE(ai_probability,50)/100.0 - "
+                "  CASE WHEN won=1 THEN 1 ELSE 0 END) * "
+                " (COALESCE(ai_probability,50)/100.0 - "
+                "  CASE WHEN won=1 THEN 1 ELSE 0 END)) AS brier, COUNT(*) "
+                "FROM trades WHERE resolved=1 AND dry_run=0 AND won IS NOT NULL "
+                f"  AND resolved_at >= datetime('now','-{int(window_days)} days') "
+                "GROUP BY category"
+            ).fetchall()
+            tot_n, weighted = 0, 0.0
+            for r in cal:
+                _, b, n_cat = r
+                if b is None or n_cat is None: continue
+                tot_n   += int(n_cat)
+                weighted += float(b) * int(n_cat)
+            brier = (weighted / tot_n) if tot_n > 0 else None
+            out_metrics.append({
+                "name":      "Brier score",
+                "value":     round(brier, 3) if brier is not None else None,
+                "value_fmt": f"{brier:.3f}" if brier is not None else "—",
+                "threshold": "≤ 0.18",
+                "status":    _status(brier if brier is not None else 1.0, 0.18, 0.22, higher_better=False),
+                "blurb":     f"trade-weighted across {len(cal)} categories",
+            })
+        except Exception as e:
+            log.debug(f"scoreboard Brier error: {e}")
+            out_metrics.append({"name": "Brier score", "status": "yellow", "blurb": "computation error"})
+
+        # ── 4. Sharpe ratio on daily realized returns ────────────────
+        # Annualized: mean(daily) / std(daily) * sqrt(252).
+        try:
+            day_rows = self.db.execute(
+                "SELECT DATE(resolved_at) AS d, SUM(realized_pnl) "
+                "FROM trades WHERE resolved=1 AND dry_run=0 AND realized_pnl IS NOT NULL "
+                f"  AND resolved_at >= datetime('now','-{int(window_days)} days') "
+                "GROUP BY d ORDER BY d"
+            ).fetchall()
+            daily = [float(r[1] or 0.0) for r in day_rows]
+            if len(daily) >= 2:
+                m = sum(daily) / len(daily)
+                v = sum((x - m) ** 2 for x in daily) / (len(daily) - 1)
+                sd = v ** 0.5
+                sharpe = (m / sd * (252 ** 0.5)) if sd > 0 else None
+            else:
+                sharpe = None
+            out_metrics.append({
+                "name":      "Sharpe ratio",
+                "value":     round(sharpe, 2) if sharpe is not None else None,
+                "value_fmt": f"{sharpe:.2f}" if sharpe is not None else "—",
+                "threshold": "≥ 1.5 (annualized)",
+                "status":    _status(sharpe if sharpe is not None else -99, 1.5, 0.5, higher_better=True),
+                "blurb":     f"{len(daily)} trading days in window",
+            })
+        except Exception as e:
+            log.debug(f"scoreboard Sharpe error: {e}")
+            out_metrics.append({"name": "Sharpe ratio", "status": "yellow", "blurb": "computation error"})
+
+        # ── 5. Max drawdown ──────────────────────────────────────────
+        # From the cumulative realized-P&L series — peak-to-trough %.
+        try:
+            series = self.get_realized_pnl_series(window_days=window_days)
+            if len(series) >= 2:
+                # Reconstruct deltas → equity curve assuming $150 starting
+                # bankroll (matches the bot's PCT_PNL baseline). DD as %
+                # of running peak.
+                start = 150.0
+                eq = start
+                peak = start
+                max_dd_pct = 0.0
+                prev = 0.0
+                for p in series:
+                    delta = p["cum"] - prev
+                    prev  = p["cum"]
+                    eq   += delta
+                    peak  = max(peak, eq)
+                    dd_pct = (peak - eq) / peak if peak > 0 else 0.0
+                    max_dd_pct = max(max_dd_pct, dd_pct)
+                dd_pct_pretty = round(max_dd_pct * 100, 1)
+            else:
+                dd_pct_pretty = None
+            out_metrics.append({
+                "name":      "Max drawdown",
+                "value":     dd_pct_pretty,
+                "value_fmt": f"{dd_pct_pretty:.1f}%" if dd_pct_pretty is not None else "—",
+                "threshold": "≤ 15%",
+                "status":    _status(dd_pct_pretty if dd_pct_pretty is not None else 99, 15, 25, higher_better=False),
+                "blurb":     "peak-to-trough on cumulative realized P&L",
+            })
+        except Exception as e:
+            log.debug(f"scoreboard DD error: {e}")
+            out_metrics.append({"name": "Max drawdown", "status": "yellow", "blurb": "computation error"})
+
+        # ── 6. Operational fail rate ────────────────────────────────
+        try:
+            exec_data = self.get_execution_breakdown(window_days=7)
+            fr = float(exec_data.get("failure_rate") or 0.0)
+            fr_pct = round(fr * 100, 1) if fr <= 1.0 else round(fr, 1)
+            out_metrics.append({
+                "name":      "Op fail rate (7d)",
+                "value":     fr_pct,
+                "value_fmt": f"{fr_pct:.1f}%",
+                "threshold": "< 5%",
+                "status":    _status(fr_pct, 5, 10, higher_better=False),
+                "blurb":     f"{exec_data.get('total','?')} live submissions",
+            })
+        except Exception as e:
+            log.debug(f"scoreboard op error: {e}")
+            out_metrics.append({"name": "Op fail rate (7d)", "status": "yellow", "blurb": "computation error"})
+
+        # Overall = worst of all six (red dominates yellow dominates green).
+        order = {"red": 0, "yellow": 1, "green": 2}
+        overall = min((m.get("status", "yellow") for m in out_metrics), key=lambda s: order.get(s, 1))
+        green_count = sum(1 for m in out_metrics if m.get("status") == "green")
+        return {
+            "window_days":  window_days,
+            "metrics":      out_metrics,
+            "overall":      overall,
+            "green_count":  green_count,
+            "total":        len(out_metrics),
+        }
+
     def get_courtlistener_data(self, query: str) -> str:
         """Search CourtListener for relevant court dockets/opinions (free API)."""
         try:
@@ -9974,6 +10184,15 @@ def get_pnl_series(days: int = 0):
     dashboard P&L chart."""
     days = max(0, min(int(days or 0), 3650))
     return JSONResponse({"days": days, "points": bot.get_realized_pnl_series(window_days=days)})
+
+
+@app.get("/scoreboard")
+def get_scoreboard(days: int = 30):
+    """Capital Readiness Scoreboard — six metrics that gate whether
+    additional bankroll should be deployed. See get_capital_scoreboard
+    for the thresholds. The dashboard panel polls this every 5 min."""
+    days = max(7, min(int(days or 30), 365))
+    return JSONResponse(bot.get_capital_scoreboard(window_days=days))
 
 
 @app.get("/pnl/cuts")
