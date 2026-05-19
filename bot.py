@@ -254,6 +254,20 @@ BRIER_RESOLVE_INTERVAL_S = int(os.getenv("BRIER_RESOLVE_INTERVAL_S", "3600"))
 #       region while keeping the only profitable band intact. Live .env
 #       can override; this is the floor a fresh deploy gets.
 MAX_ENTRY_PRICE          = float(os.getenv("MAX_ENTRY_PRICE", "0.80"))
+# Service-disable + category gates for the consolidate-onto-main_v2
+# migration. Both default to OFF so a fresh deploy with no env
+# changes behaves exactly as before; the operator flips them on the
+# VPS .env when ready to migrate. Position-monitor, redeemer, and
+# dashboard endpoints keep running regardless of these flags — only
+# new-trade entry is gated.
+SEXYBOT_TRADING_DISABLED = os.getenv("SEXYBOT_TRADING_DISABLED", "0") == "1"
+SEXYBOT_SPORTS_ONLY      = os.getenv("SEXYBOT_SPORTS_ONLY", "0") == "1"
+# Big-winner profit-take: when a position is up at least this many
+# percent from entry (cash_pnl / cost), the monitor exits regardless
+# of the cents-based TP rule. 0 disables. Set to e.g. 50 to lock in
+# Rizespor-class outliers the +15¢ rule undershoots on low-price
+# entries (12¢ → 39.5¢ is +27.5¢ AND +229%, either should trigger).
+SEXYBOT_BIG_WINNER_PCT   = float(os.getenv("SEXYBOT_BIG_WINNER_PCT", "0"))
 # Cooldown applied to a token after a failed (status="error") order. Prevents
 # the strategy loop from immediately retrying the same structurally-broken
 # market on the next scan cycle. Default 30 min — long enough that a
@@ -2202,8 +2216,18 @@ class PolymarketBot:
                         except Exception:
                             age_h = 0.0
 
+                        # Percent-gain check — added because the cents-based
+                        # TP rule undershoots big winners on low-price entries
+                        # (e.g. 12¢ → 39.5¢ is +27.5¢ AND +229%; either
+                        # condition should trigger). Computed before the cents
+                        # checks below so a +50% winner exits even when it's
+                        # under the +15¢ threshold (rare but possible on very
+                        # low entry prices).
+                        pct_gain = (pnl_c / (entry_price * 100)) * 100 if entry_price > 0 else 0.0
                         reason = None
-                        if pnl_c >= MOMENTUM_TP_CENTS:
+                        if SEXYBOT_BIG_WINNER_PCT > 0 and pct_gain >= SEXYBOT_BIG_WINNER_PCT:
+                            reason = f"BIG WIN +{pct_gain:.0f}% (PnL {pnl_c:+.1f}¢)"
+                        elif pnl_c >= MOMENTUM_TP_CENTS:
                             reason = f"TP +{pnl_c:.1f}¢"
                         elif pnl_c <= -MOMENTUM_SL_CENTS:
                             reason = f"SL {pnl_c:.1f}¢"
@@ -8092,6 +8116,29 @@ class PolymarketBot:
 
                     mkt_name = signal.get("market", question)
                     if float(signal.get("confidence", 0)) >= min_conf and signal.get("token_id"):
+                        # ── Service-disable gate ─────────────────────────────
+                        # When SEXYBOT_TRADING_DISABLED is set, bot.py refuses
+                        # to open any new positions but keeps managing existing
+                        # ones (position monitor, redeemer, dashboard endpoints
+                        # all stay live). Used for the consolidate-onto-main_v2
+                        # migration so the legacy service can be quiesced
+                        # without uninstalling the systemd unit.
+                        if SEXYBOT_TRADING_DISABLED:
+                            self._bump_skip("service_disabled")
+                            self._log(f"[SERVICE OFF] skip — {mkt_name[:40]} (SEXYBOT_TRADING_DISABLED=1)")
+                            sig_record["skip_reason"] = "service disabled (SEXYBOT_TRADING_DISABLED)"
+                            continue
+                        # ── Sports-only category gate ────────────────────────
+                        # Backtest: sports +$31.97 / 100% win rate vs other
+                        # categories net negative. When set, skip non-sports
+                        # signals entirely.
+                        if SEXYBOT_SPORTS_ONLY:
+                            _cat_check = self.classify_market(question)
+                            if _cat_check != "sports":
+                                self._bump_skip("sports_only_filter")
+                                self._log(f"[SPORTS-ONLY] skip — {mkt_name[:40]} (category={_cat_check})")
+                                sig_record["skip_reason"] = f"sports-only filter (category={_cat_check})"
+                                continue
                         # Use asyncio.to_thread so blocking network I/O (CLOB API calls) in
                         # place_market_order / place_limit_order don't stall the event loop.
                         result = None
