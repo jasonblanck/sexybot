@@ -1076,20 +1076,55 @@ class PolymarketBot:
 
     def _sync_positions(self, active_token_ids: set):
         """Remove positions for markets no longer active (resolved/expired).
-        Only removes positions older than 7 days to guard against the 30-market fetch window."""
+        Checks the live Polymarket API for real on-chain holdings, keeping
+        very recently opened positions (added within the last 5 minutes)
+        to guard against API indexing delay."""
         try:
-            from datetime import timedelta
-            cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
-            cur = self.db.execute("SELECT token_id FROM positions WHERE time < ?", (cutoff,))
-            to_remove = [row[0] for row in cur.fetchall() if row[0] not in active_token_ids]
+            proxy = os.getenv("POLYMARKET_FUNDER", "") or self.get_proxy_wallet()
+            if not proxy:
+                log.warning("sync_positions: POLYMARKET_FUNDER address not available, skipping on-chain sync")
+                return
+
+            import json as _j
+            import urllib.request as _ureq
+            from datetime import datetime, timedelta
+
+            url = f"https://data-api.polymarket.com/positions?user={proxy}"
+            req = _ureq.Request(url, headers=self._PM_HEADERS)
+            
+            with _ureq.urlopen(req, timeout=8) as r:
+                live_positions = _j.loads(r.read())
+            
+            if not isinstance(live_positions, list):
+                log.warning("sync_positions: Polymarket data-api returned invalid format")
+                return
+
+            # Ultimate source of truth: active token IDs reported by live wallet positions
+            onchain_tids = {p.get("asset") for p in live_positions if p.get("asset") and float(p.get("size", 0)) > 0}
+
+            # Any position added in the last 5 minutes is kept to avoid race conditions with indexing lag
+            cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+            
+            table = "positions"
+            cur = self.db.execute(f"SELECT token_id, time FROM {table}")
+            db_rows = cur.fetchall()
+            
+            to_remove = []
+            for tid, t_str in db_rows:
+                if tid in onchain_tids:
+                    continue
+                if t_str > cutoff:
+                    continue
+                to_remove.append(tid)
+
             if to_remove:
-                with self.db:  # all deletes commit atomically or all roll back
+                with self.db:
                     for tid in to_remove:
-                        self.db.execute("DELETE FROM positions WHERE token_id=?", (tid,))
+                        self.db.execute(f"DELETE FROM {table} WHERE token_id=?", (tid,))
                         self._momentum_position_peaks.pop(tid, None)
-                self._log(f"Cleared {len(to_remove)} resolved position(s) from DB")
+                self._log(f"Cleared {len(to_remove)} resolved/sold position(s) from DB (on-chain sync)")
         except Exception as e:
-            log.debug(f"sync_positions error: {e}")
+            log.warning(f"sync_positions error: {e!r}")
 
     def add_position(self, token_id: str, market: str, side: str, shares: float, cost: float):
         try:
