@@ -258,7 +258,7 @@ class PositionRedeemer:
             log.warning("PositionRedeemer: failed to fetch positions: %s", exc)
             return 0
 
-        redeemable = [p for p in positions if p.get("redeemable")]
+        redeemable = [p for p in positions if p.get("redeemable") and float(p.get("curPrice", 0)) > 0]
         mergeable_pairs = self._group_mergeable(positions)
 
         tx_count = 0
