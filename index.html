@@ -1421,6 +1421,10 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
 <script>
 if (location.protocol === 'file:') {
   let key = sessionStorage.getItem('sb_key');
+  if (key === 'null' || key === 'undefined' || key === '') {
+    key = null;
+    sessionStorage.removeItem('sb_key');
+  }
   if (!key) {
     key = prompt('Enter API key to connect to local bot:', '');
     if (key) {
@@ -1470,9 +1474,13 @@ const BOT = location.protocol === 'file:' ? 'http://localhost:8000' : `${locatio
     }
     const finalResource = typeof resource === 'string' ? url : resource;
     const res = await _origFetch(finalResource, options);
-    if (res && res.status === 401 && location.protocol !== 'file:') {
-      if (!url.includes('/auth/')) {
-        window.location.replace('/login.html');
+    if (res && res.status === 401) {
+      if (location.protocol === 'file:') {
+        sessionStorage.removeItem('sb_key');
+      } else {
+        if (!url.includes('/auth/')) {
+          window.location.replace('/login.html');
+        }
       }
     }
     return res;

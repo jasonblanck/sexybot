@@ -9658,6 +9658,8 @@ _AUTH_EXEMPT_EXACT = {
 
 @app.middleware("http")
 async def _session_gate(request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
     path = request.url.path
     # Fast path: exempt routes
     if path in _AUTH_EXEMPT_EXACT:
