@@ -1419,7 +1419,17 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
-const BOT=`${location.protocol}//${location.host}`;
+if (location.protocol === 'file:') {
+  let key = sessionStorage.getItem('sb_key');
+  if (!key) {
+    key = prompt('Enter API key to connect to local bot:', '');
+    if (key) {
+      sessionStorage.setItem('sb_key', key);
+    }
+  }
+}
+
+const BOT = location.protocol === 'file:' ? 'http://localhost:8000' : `${location.protocol}//${location.host}`;
 
 // ─── Auth gate ─────────────────────────────────────────────────
 // Server enforces the session cookie on every read endpoint; this
@@ -1428,6 +1438,7 @@ const BOT=`${location.protocol}//${location.host}`;
 // Also globally intercepts fetch() so any later 401 (session
 // expired mid-session) bounces the user back to /login.html.
 (async function _authGate(){
+  if (location.protocol === 'file:') return;
   try {
     const r = await fetch('/auth/check', {credentials:'same-origin'});
     if (!r.ok) { window.location.replace('/login.html'); }
@@ -1435,11 +1446,31 @@ const BOT=`${location.protocol}//${location.host}`;
 })();
 (function _wrapFetch(){
   const _origFetch = window.fetch;
-  window.fetch = async function(...args){
-    const res = await _origFetch.apply(this, args);
-    if (res && res.status === 401) {
-      // Avoid redirect loop if the 401 was itself the login call
-      const url = (typeof args[0] === 'string') ? args[0] : (args[0] && args[0].url) || '';
+  window.fetch = async function(resource, options = {}){
+    let url = typeof resource === 'string' ? resource : (resource && resource.url) || '';
+    if (url.startsWith('/')) {
+      url = `${BOT}${url}`;
+    }
+    if (location.protocol === 'file:') {
+      const key = sessionStorage.getItem('sb_key');
+      if (key) {
+        if (!options.headers) {
+          options.headers = {};
+        }
+        if (options.headers instanceof Headers) {
+          options.headers.set('X-API-Key', key);
+        } else if (Array.isArray(options.headers)) {
+          if (!options.headers.some(h => h[0].toLowerCase() === 'x-api-key')) {
+            options.headers.push(['X-API-Key', key]);
+          }
+        } else {
+          options.headers['X-API-Key'] = key;
+        }
+      }
+    }
+    const finalResource = typeof resource === 'string' ? url : resource;
+    const res = await _origFetch(finalResource, options);
+    if (res && res.status === 401 && location.protocol !== 'file:') {
       if (!url.includes('/auth/')) {
         window.location.replace('/login.html');
       }
@@ -2097,7 +2128,9 @@ function connectWS(){
   // Read the API key on every (re)connect so a key saved via saveSettings
   // after page load is picked up without a full refresh.
   const wsKey=sessionStorage.getItem('sb_key')||'';
-  const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+'/ws');
+  const ws_proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws_host = location.protocol === 'file:' ? 'localhost:8000' : location.host;
+  const ws = new WebSocket(`${ws_proto}://${ws_host}/ws`);
   ws.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.connected||d.error||(!d.hasOwnProperty('running')&&!d.trades))return;applyState(d);}catch(err){}};
   ws.onopen=()=>{if(wsKey)ws.send(JSON.stringify({cmd:'auth',key:wsKey}));};
   ws.onclose=()=>setTimeout(connectWS,3000);

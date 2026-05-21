@@ -9562,6 +9562,7 @@ _ALLOWED_ORIGINS = [
     "http://localhost",
     "http://localhost:80",
     "http://localhost:8000",
+    "null",
     *(
         [f"http://{_server_host}", f"https://{_server_host}"]
         if _server_host else []
