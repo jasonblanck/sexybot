@@ -317,7 +317,13 @@ def check_correlation_and_category_gates(mkt: PolyMarket, open_positions: dict[s
         "who", "what", "which", "how", "many", "than", "more", "less", "yes", "no",
         "play", "player", "players", "score", "scores", "match", "win", "lose", "first",
         "second", "third", "fourth", "quarter", "half", "total", "greater", "fewer", "between",
-        "season", "league", "championship", "finals", "playoffs", "series", "stage", "round"
+        "season", "league", "championship", "finals", "playoffs", "series", "stage", "round",
+        # Expanded common comparison and sports transition verbs/adjectives
+        "beat", "beats", "beaten", "defeat", "defeats", "defeated", "against", "each", "other",
+        "either", "any", "all", "only", "both", "from", "most", "best", "worst", "next", "last",
+        "some", "time", "date", "month", "year", "week", "day", "night", "today", "tomorrow",
+        "tonight", "this", "that", "these", "those", "versus", "matchup", "matchups", "win",
+        "wins", "won", "lose", "loses", "lost", "game", "games", "playoff", "final"
     }
     
     def extract_keywords(text: str) -> set[str]:
@@ -479,6 +485,8 @@ async def reconcile_positions_on_startup(executor: ClobExecutor, open_positions:
                 if now_ts - pos.entry_time < 300:
                     continue
                 if getattr(pos, "exit_order_id", None) is not None:
+                    continue
+                if getattr(pos, "entry_order_id", None) is not None:
                     continue
                 to_prune.append(tid)
 
