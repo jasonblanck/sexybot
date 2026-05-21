@@ -56,6 +56,27 @@ CTF_ABI = [
         "outputs": [],
         "stateMutability": "nonpayable",
     },
+    {
+        "name": "getCollectionId",
+        "type": "function",
+        "inputs": [
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId",        "type": "bytes32"},
+            {"name": "indexSet",           "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "bytes32"}],
+        "stateMutability": "view",
+    },
+    {
+        "name": "getPositionId",
+        "type": "function",
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "collectionId",    "type": "bytes32"},
+        ],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
 ]
 
 NEG_RISK_ABI = [
@@ -315,6 +336,42 @@ class PositionRedeemer:
         cid = condition_id.replace("0x", "")
         return bytes.fromhex(cid.zfill(64))
 
+    def _resolve_collateral_address(self, pos: dict) -> str:
+        """
+        Dynamically determine the collateral token address for standard positions
+        by comparing the fetched asset ID with the on-chain getPositionId for USDC.e and pUSD.
+        """
+        # Default to pUSD address because all new CLOB v2 markets use pUSD
+        pUSD_addr = Web3.to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
+        USDC_addr = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+        
+        try:
+            asset_id = int(pos.get("asset", "0"))
+            if asset_id == 0:
+                return pUSD_addr
+                
+            cid = self._condition_id_bytes(pos["conditionId"])
+            outcome_index = pos.get("outcomeIndex", 0)
+            index_set = 1 << outcome_index
+            
+            # Query the on-chain CTF contract
+            coll_id = self._ctf.functions.getCollectionId(NULL_BYTES32, cid, index_set).call()
+            
+            # Check USDC first
+            usdc_id = self._ctf.functions.getPositionId(USDC_addr, coll_id).call()
+            if usdc_id == asset_id:
+                return USDC_addr
+                
+            # Check pUSD
+            pusd_id = self._ctf.functions.getPositionId(pUSD_addr, coll_id).call()
+            if pusd_id == asset_id:
+                return pUSD_addr
+                
+        except Exception as exc:
+            log.warning("PositionRedeemer: failed to dynamically resolve collateral address: %s", exc)
+            
+        return pUSD_addr
+
     def _redeem(self, pos: dict) -> bool:
         """Redeem a resolved winning position."""
         title    = pos.get("title", "?")[:45]
@@ -346,10 +403,12 @@ class PositionRedeemer:
             data = self._neg_risk.encode_abi(abi_element_identifier="redeemPositions", args=[cid, amounts])
             target = NEG_RISK_ADAPTER
         else:
+            # Resolve collateral token address dynamically (pUSD vs USDC.e)
+            collateral_addr = self._resolve_collateral_address(pos)
             # Regular CTF: redeemPositions(collateral, parentCollectionId, conditionId, indexSets)
             data = self._ctf.encode_abi(
                 abi_element_identifier="redeemPositions",
-                args=[USDC_ADDRESS, NULL_BYTES32, cid, [index_set]],
+                args=[collateral_addr, NULL_BYTES32, cid, [index_set]],
             )
             target = CTF_ADDRESS
 
@@ -358,7 +417,7 @@ class PositionRedeemer:
         return True
 
     def _merge(self, pair: list[dict]) -> bool:
-        """Merge YES+NO token pair back to USDC."""
+        """Merge YES+NO token pair back to USDC/pUSD."""
         pos0, pos1 = pair
         title    = pos0.get("title", "?")[:45]
         cid      = self._condition_id_bytes(pos0["conditionId"])
@@ -383,10 +442,12 @@ class PositionRedeemer:
             data = self._neg_risk.encode_abi(abi_element_identifier="mergePositions", args=[cid, amounts])
             target = NEG_RISK_ADAPTER
         else:
+            # Resolve collateral token address dynamically (pUSD vs USDC.e)
+            collateral_addr = self._resolve_collateral_address(pos0)
             # indexSets [1, 2] = YES (bit 0) and NO (bit 1) for a binary market
             data = self._ctf.encode_abi(
                 abi_element_identifier="mergePositions",
-                args=[USDC_ADDRESS, NULL_BYTES32, cid, [1, 2], amount],
+                args=[collateral_addr, NULL_BYTES32, cid, [1, 2], amount],
             )
             target = CTF_ADDRESS
 

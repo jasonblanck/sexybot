@@ -998,6 +998,52 @@ class PolymarketBot:
         except Exception as e:
             log.warning(f"DB save failed: {e}")
 
+    def _update_position_in_db(self, token_id: str, market: str, side: str, shares: float, cost: float):
+        """Update or prune positions in the DB based on trade side (BUY vs SELL)."""
+        try:
+            cur = self.db.execute(
+                "SELECT side, shares, cost, market FROM positions WHERE token_id=?", 
+                (token_id,)
+            )
+            row = cur.fetchone()
+            
+            if row:
+                existing_side, existing_shares, existing_cost, existing_market = row
+                
+                # If we are BUYing, we add to the position
+                if side.upper() == "BUY":
+                    new_shares = existing_shares + shares
+                    new_cost = existing_cost + cost
+                    self.db.execute(
+                        """INSERT OR REPLACE INTO positions (token_id, market, side, shares, cost, time)
+                           VALUES (?,?,?,?,?,?)""",
+                        (token_id, market or existing_market, "BUY", new_shares, new_cost, datetime.utcnow().isoformat())
+                    )
+                # If we are SELLing, we subtract from the position
+                elif side.upper() == "SELL":
+                    new_shares = existing_shares - shares
+                    if new_shares <= 0.01:
+                        self.db.execute("DELETE FROM positions WHERE token_id=?", (token_id,))
+                    else:
+                        # scale down cost basis proportionally
+                        new_cost = max(0.0, existing_cost * (new_shares / existing_shares))
+                        self.db.execute(
+                            """INSERT OR REPLACE INTO positions (token_id, market, side, shares, cost, time)
+                               VALUES (?,?,?,?,?,?)""",
+                            (token_id, market or existing_market, "BUY", new_shares, new_cost, datetime.utcnow().isoformat())
+                        )
+            else:
+                # No existing position in DB
+                if side.upper() == "BUY":
+                    # Only insert a new position on BUY (shorting isn't possible on Polymarket tokens)
+                    self.db.execute(
+                        """INSERT OR REPLACE INTO positions (token_id, market, side, shares, cost, time)
+                           VALUES (?,?,?,?,?,?)""",
+                        (token_id, market, "BUY", shares, cost, datetime.utcnow().isoformat())
+                    )
+        except Exception as e:
+            log.warning(f"Error updating position in DB (token={token_id[:16]}… side={side}): {e}")
+
     def _save_trade_and_position(self, trade: dict, position_args: Optional[tuple] = None):
         """Atomically write trade record + optional position in one ACID transaction.
         position_args: (token_id, market, side, shares, cost) or None to skip position write.
@@ -1007,9 +1053,7 @@ class PolymarketBot:
                 self.db.execute(self._TRADE_INSERT_SQL, self._trade_row(trade))
                 if position_args:
                     tid, market, side, shares, cost = position_args
-                    self.db.execute("""INSERT OR REPLACE INTO positions
-                        (token_id, market, side, shares, cost, time) VALUES (?,?,?,?,?,?)""",
-                        (tid, market, side, shares, cost, datetime.utcnow().isoformat()))
+                    self._update_position_in_db(tid, market, side, shares, cost)
         except Exception as e:
             log.warning(f"DB transaction failed: {e}")
 
@@ -1129,9 +1173,7 @@ class PolymarketBot:
     def add_position(self, token_id: str, market: str, side: str, shares: float, cost: float):
         try:
             with self.db:
-                self.db.execute("""INSERT OR REPLACE INTO positions
-                    (token_id, market, side, shares, cost, time) VALUES (?,?,?,?,?,?)""",
-                    (token_id, market, side, shares, cost, datetime.utcnow().isoformat()))
+                self._update_position_in_db(token_id, market, side, shares, cost)
         except Exception as e:
             log.warning(f"Position save failed: {e}")
 
