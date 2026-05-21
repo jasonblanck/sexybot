@@ -138,7 +138,18 @@ BLOCK_INTERNAL_CATEGORIES = [
     c.strip().lower() for c in os.getenv("BLOCK_INTERNAL_CATEGORIES", "").split(",")
     if c.strip()
 ]
-SEXYBOT_SPORTS_ONLY = os.getenv("SEXYBOT_SPORTS_ONLY", "0") == "1"
+# Sports-only mandate active for exactly 10 days.
+# Started: 2026-05-21T15:05:48-04:00 (Unix: 1779390348.0)
+# Expires: 2026-05-31T15:05:48-04:00 (Unix: 1780254348.0)
+_SEXYBOT_SPORTS_ONLY_ENV = os.getenv("SEXYBOT_SPORTS_ONLY", "0") == "1"
+SPORTS_ONLY_CUTOFF_TS = 1780254348.0
+
+def is_sports_only_active() -> bool:
+    if not _SEXYBOT_SPORTS_ONLY_ENV:
+        return False
+    if time.time() > SPORTS_ONLY_CUTOFF_TS:
+        return False
+    return True
 
 # Strategy selection
 # STRATEGY=momentum  (default) — directional momentum + OBI signals
@@ -652,7 +663,7 @@ async def strategy_loop(
                     .top(20, key="volume_24h")
                     .results()
                 )
-                if SEXYBOT_SPORTS_ONLY:
+                if is_sports_only_active():
                     fresh = [m for m in fresh if classify_internal_category(m.question) == "sports"]
                 # Drop any new markets — only keep already-subscribed ones
                 still_active = [m for m in fresh if m.yes_token_id in subscribed_yes_ids]
@@ -1174,9 +1185,11 @@ async def main() -> None:
         .top(20, key="volume_24h")
         .results()
     )
-    if SEXYBOT_SPORTS_ONLY:
+    if is_sports_only_active():
         markets = [m for m in markets if classify_internal_category(m.question) == "sports"]
-        log.info("SEXYBOT_SPORTS_ONLY is active: filtered watch list down to %d sports markets", len(markets))
+        log.info("SEXYBOT_SPORTS_ONLY is active (expires %s): filtered watch list down to %d sports markets",
+                 datetime.fromtimestamp(SPORTS_ONLY_CUTOFF_TS, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                 len(markets))
     log.info(
         "Watching %d markets (excluding categories: %s; keywords: %s; internal: %s)",
         len(markets), EXCLUDE_CATEGORIES or "none", EXCLUDE_KEYWORDS or "none",
