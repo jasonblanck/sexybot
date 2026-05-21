@@ -1370,6 +1370,18 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
             <div><div class="slbl">Daily Loss Limit ($)</div><div class="ssub">Stop trading if daily loss exceeds this</div></div>
             <input class="sinput" type="number" id="s-losslimit" min="0" max="10000" step="10" oninput="settingsDirty()">
           </div>
+          <div class="srow">
+            <div><div class="slbl">Hourly Loss Limit ($)</div><div class="ssub">Stop trading if rolling 1h loss exceeds this</div></div>
+            <input class="sinput" type="number" id="s-hourlylosslimit" min="0" max="10000" step="1" oninput="settingsDirty()">
+          </div>
+          <div class="srow">
+            <div><div class="slbl">Max Hourly Trades</div><div class="ssub">Circuit breaker hourly trade count limit</div></div>
+            <input class="sinput" type="number" id="s-maxhourlytrades" min="1" max="1000" step="1" oninput="settingsDirty()">
+          </div>
+          <div class="srow">
+            <div><div class="slbl">Max Daily Trades</div><div class="ssub">Circuit breaker daily trade count limit</div></div>
+            <input class="sinput" type="number" id="s-maxdailytrades" min="1" max="10000" step="1" oninput="settingsDirty()">
+          </div>
         </div>
       </div>
     </div>
@@ -2336,6 +2348,9 @@ async function loadSettings(){
     document.getElementById('s-strategy').value=d.strategy||'momentum';
     document.getElementById('s-maxorder').value=d.max_order_size||10;
     document.getElementById('s-losslimit').value=d.daily_loss_limit||500;
+    document.getElementById('s-hourlylosslimit').value=d.hourly_loss_limit||8;
+    document.getElementById('s-maxhourlytrades').value=d.max_hourly_trades||10;
+    document.getElementById('s-maxdailytrades').value=d.max_daily_trades||50;
     _settingsDirty=false;document.getElementById('s-save').disabled=true;
     document.getElementById('s-msg').style.color='var(--text3)';document.getElementById('s-msg').textContent='Settings loaded.';
   }catch(e){document.getElementById('s-msg').style.color='var(--red)';document.getElementById('s-msg').textContent='Could not load settings — bot offline?';}
@@ -2344,7 +2359,16 @@ async function saveSettings(){
   const key=sessionStorage.getItem('sb_key')||prompt('Enter API key:','');
   if(!key)return;
   sessionStorage.setItem('sb_key',key);
-  const body={paper_mode:document.getElementById('s-paper').checked,dry_run:document.getElementById('s-dryrun').checked,strategy:document.getElementById('s-strategy').value,max_order_size:parseFloat(document.getElementById('s-maxorder').value)||10,daily_loss_limit:parseFloat(document.getElementById('s-losslimit').value)||500};
+  const body={
+    paper_mode:document.getElementById('s-paper').checked,
+    dry_run:document.getElementById('s-dryrun').checked,
+    strategy:document.getElementById('s-strategy').value,
+    max_order_size:parseFloat(document.getElementById('s-maxorder').value)||10,
+    daily_loss_limit:parseFloat(document.getElementById('s-losslimit').value)||500,
+    hourly_loss_limit:parseFloat(document.getElementById('s-hourlylosslimit').value)||8,
+    max_hourly_trades:parseInt(document.getElementById('s-maxhourlytrades').value)||10,
+    max_daily_trades:parseInt(document.getElementById('s-maxdailytrades').value)||50
+  };
   try{
     const r=await fetch(`${BOT}/settings`,{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':key},body:JSON.stringify(body)});
     const d=await r.json();

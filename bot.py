@@ -69,6 +69,9 @@ STRATEGY       = os.getenv("STRATEGY", "momentum")
 MAX_ORDER_SIZE = float(os.getenv("MAX_ORDER_SIZE", "10"))
 DRY_RUN        = os.getenv("DRY_RUN", "true").lower() != "false"
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "50"))
+HOURLY_LOSS_LIMIT = float(os.getenv("HOURLY_LOSS_LIMIT", "8.0"))
+MAX_HOURLY_TRADES = int(os.getenv("MAX_HOURLY_TRADES", "10"))
+MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "50"))
 # Same env var as risk.py ExecutionGate — kept in sync so the dashboard path
 # and the main_v2.py pipeline share one underdog-guard threshold.
 MIN_YES_BUY_PRICE = float(os.getenv("MIN_YES_BUY_PRICE", "0.30"))
@@ -10306,6 +10309,9 @@ def get_settings():
         "strategy": STRATEGY,
         "max_order_size": MAX_ORDER_SIZE,
         "daily_loss_limit": DAILY_LOSS_LIMIT,
+        "hourly_loss_limit": HOURLY_LOSS_LIMIT,
+        "max_hourly_trades": MAX_HOURLY_TRADES,
+        "max_daily_trades": MAX_DAILY_TRADES,
     })
 
 
@@ -11265,8 +11271,11 @@ def _write_env_update(key: str, value: str) -> None:
 
 @app.post("/settings", dependencies=[Depends(require_api_key)])
 async def update_settings(body: dict):
-    global PAPER_MODE, DRY_RUN, STRATEGY, MAX_ORDER_SIZE, DAILY_LOSS_LIMIT
-    allowed = {"paper_mode", "dry_run", "strategy", "max_order_size", "daily_loss_limit"}
+    global PAPER_MODE, DRY_RUN, STRATEGY, MAX_ORDER_SIZE, DAILY_LOSS_LIMIT, HOURLY_LOSS_LIMIT, MAX_HOURLY_TRADES, MAX_DAILY_TRADES
+    allowed = {
+        "paper_mode", "dry_run", "strategy", "max_order_size", "daily_loss_limit",
+        "hourly_loss_limit", "max_hourly_trades", "max_daily_trades"
+    }
     unknown = set(body.keys()) - allowed
     if unknown:
         raise HTTPException(status_code=400, detail=f"Unknown fields: {unknown}")
@@ -11324,6 +11333,24 @@ async def update_settings(body: dict):
             raise HTTPException(status_code=400, detail="daily_loss_limit must be 0–1000000")
         DAILY_LOSS_LIMIT = val
         updates["DAILY_LOSS_LIMIT"] = str(val)
+    if "hourly_loss_limit" in body:
+        val = float(body["hourly_loss_limit"])
+        if not (0 <= val <= 1_000_000):
+            raise HTTPException(status_code=400, detail="hourly_loss_limit must be 0–1000000")
+        HOURLY_LOSS_LIMIT = val
+        updates["HOURLY_LOSS_LIMIT"] = str(val)
+    if "max_hourly_trades" in body:
+        val = int(body["max_hourly_trades"])
+        if not (1 <= val <= 1_000):
+            raise HTTPException(status_code=400, detail="max_hourly_trades must be 1–1000")
+        MAX_HOURLY_TRADES = val
+        updates["MAX_HOURLY_TRADES"] = str(val)
+    if "max_daily_trades" in body:
+        val = int(body["max_daily_trades"])
+        if not (1 <= val <= 10_000):
+            raise HTTPException(status_code=400, detail="max_daily_trades must be 1–10000")
+        MAX_DAILY_TRADES = val
+        updates["MAX_DAILY_TRADES"] = str(val)
 
     # Rewrite .env preserving all other values
     new_lines = []
