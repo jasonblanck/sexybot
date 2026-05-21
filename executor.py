@@ -421,6 +421,26 @@ class ClobExecutor:
         token_id_str = str(token_id)
 
         book = self._books.get_book(token_id_str)
+        if book is None or book.is_stale:
+            try:
+                log.warning("Close position: live WS book for %s is %s. Attempting REST fallback fetch...",
+                            token_id_str[:14], "missing" if book is None else "stale")
+                rest_book = self._client.get_order_book(token_id_str)
+                if rest_book:
+                    from orderbook_ws import Level, BookSnapshot
+                    bids = [Level(price=float(b["price"]), size=float(b["size"])) for b in rest_book.get("bids", [])]
+                    asks = [Level(price=float(a["price"]), size=float(a["size"])) for a in rest_book.get("asks", [])]
+                    book = BookSnapshot(
+                        token_id=token_id_str,
+                        bids=bids,
+                        asks=asks,
+                        timestamp=time.time(),
+                        sequence=0,
+                        mid_history=[]
+                    )
+            except Exception as e:
+                log.error("REST fallback orderbook fetch failed in close_position: %s", e)
+
         if book is None:
             return OrderResult(success=False, error=f"no live book for {token_id_str[:16]}…")
 

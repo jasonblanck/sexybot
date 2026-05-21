@@ -209,6 +209,10 @@ class DrawdownGuard:
     drawdown within a rolling window exceeds `max_drawdown`, raises
     DrawdownHalt (cancels restart loop) and logs a CRITICAL alert.
 
+    Also tracks a 24-hour rolling balance snapshot history to enforce a hard
+    daily loss limit (DAILY_LOSS_LIMIT) kill-switch that prevents overnight
+    wipeouts over many hours.
+
     Usage
     -----
     guard = DrawdownGuard()
@@ -223,7 +227,9 @@ class DrawdownGuard:
     ):
         self.max_drawdown = max_drawdown
         self.window       = window
+        self.daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "20.0"))
         self._history:    list[tuple[float, float]] = []   # (ts, balance)
+        self._history_24h: list[tuple[float, float]] = []  # (ts, balance) rolling 24h
         self._triggered   = False
 
     @property
@@ -239,32 +245,54 @@ class DrawdownGuard:
             raise DrawdownHalt("drawdown kill-switch already triggered — manual reset required")
 
         now = time.time()
+        
+        # 1. 10-minute short-term drawdown check
         self._history.append((now, balance))
         cutoff = now - self.window
         self._history = [(t, b) for t, b in self._history if t >= cutoff]
 
-        if len(self._history) < 2:
-            return
+        if len(self._history) >= 2:
+            peak     = max(b for _, b in self._history)
+            drawdown = peak - balance
+            if drawdown >= self.max_drawdown:
+                self._triggered = True
+                log.critical(
+                    "⛔ DRAWDOWN KILL-SWITCH | peak=$%.2f  current=$%.2f  drop=$%.2f >= limit=$%.2f  "
+                    "window=%ds — all quoting halted, manual restart required",
+                    peak, balance, drawdown, self.max_drawdown, int(self.window),
+                )
+                raise DrawdownHalt(
+                    f"balance dropped ${drawdown:.2f} "
+                    f"(peak=${peak:.2f} → current=${balance:.2f}) "
+                    f"within {self.window / 60:.0f}min window"
+                )
 
-        peak     = max(b for _, b in self._history)
-        drawdown = peak - balance
-        if drawdown >= self.max_drawdown:
-            self._triggered = True
-            log.critical(
-                "⛔ DRAWDOWN KILL-SWITCH | peak=$%.2f  current=$%.2f  drop=$%.2f >= limit=$%.2f  "
-                "window=%ds — all quoting halted, manual restart required",
-                peak, balance, drawdown, self.max_drawdown, int(self.window),
-            )
-            raise DrawdownHalt(
-                f"balance dropped ${drawdown:.2f} "
-                f"(peak=${peak:.2f} → current=${balance:.2f}) "
-                f"within {self.window / 60:.0f}min window"
-            )
+        # 2. 24-hour daily loss drawdown check
+        self._history_24h.append((now, balance))
+        cutoff_24h = now - 86400.0
+        self._history_24h = [(t, b) for t, b in self._history_24h if t >= cutoff_24h]
+
+        if len(self._history_24h) >= 2:
+            peak_24h     = max(b for _, b in self._history_24h)
+            drawdown_24h = peak_24h - balance
+            if drawdown_24h >= self.daily_loss_limit:
+                self._triggered = True
+                log.critical(
+                    "⛔ DAILY LOSS KILL-SWITCH | 24h peak=$%.2f  current=$%.2f  drop=$%.2f >= limit=$%.2f  "
+                    "— all quoting halted, manual restart required",
+                    peak_24h, balance, drawdown_24h, self.daily_loss_limit,
+                )
+                raise DrawdownHalt(
+                    f"balance dropped ${drawdown_24h:.2f} "
+                    f"(24h peak=${peak_24h:.2f} → current=${balance:.2f}) "
+                    f"within rolling 24h window"
+                )
 
     def reset(self) -> None:
         """Manually reset after investigating the drawdown. Use with caution."""
         self._triggered = False
         self._history.clear()
+        self._history_24h.clear()
         log.warning("DrawdownGuard manually reset — strategy will resume on next restart")
 
 

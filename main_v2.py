@@ -13,6 +13,8 @@ import asyncio
 import logging
 import os
 import time
+from dotenv import load_dotenv
+load_dotenv()
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -30,7 +32,7 @@ from observability import (
     record_shadow_batch,
     record_trade,
 )
-from orderbook_ws import BookManager, BookSnapshot
+from orderbook_ws import BookManager, BookSnapshot, Level
 from redeemer import PositionRedeemer
 from risk import (
     BalanceErrorCircuitBreaker,
@@ -79,6 +81,7 @@ OBI_SOLO_MIN     = float(os.getenv("OBI_SOLO_MIN", "0.55"))
 # trustworthy than this raw bar suggests, so 0.025 may be reasonable once
 # calibration is active.
 MIN_EDGE         = float(os.getenv("MIN_EDGE", "0.03"))
+MIN_EDGE_YES     = float(os.getenv("MIN_EDGE_YES", "0.07"))
 MIN_BOOK_DEPTH_USDC = float(os.getenv("MIN_BOOK_DEPTH_USDC", "200"))  # skip threadbare books
 # Hard ceiling on the *side we're buying*. At fills ≥ MAX_ENTRY_PRICE the
 # remaining ask side of the book is typically empty or dust, so FOK BUYs
@@ -135,6 +138,7 @@ BLOCK_INTERNAL_CATEGORIES = [
     c.strip().lower() for c in os.getenv("BLOCK_INTERNAL_CATEGORIES", "").split(",")
     if c.strip()
 ]
+SEXYBOT_SPORTS_ONLY = os.getenv("SEXYBOT_SPORTS_ONLY", "0") == "1"
 
 # Strategy selection
 # STRATEGY=momentum  (default) — directional momentum + OBI signals
@@ -560,7 +564,8 @@ async def estimate_true_probability(
     else:
         edge = (book.best_bid or yes_price) - true_prob
 
-    if edge < MIN_EDGE:
+    required_edge = MIN_EDGE_YES if dominant_side == "YES" else MIN_EDGE
+    if edge < required_edge:
         _shadow(
             "edge_below",
             spike_has=spike.has_spike,
@@ -647,6 +652,8 @@ async def strategy_loop(
                     .top(20, key="volume_24h")
                     .results()
                 )
+                if SEXYBOT_SPORTS_ONLY:
+                    fresh = [m for m in fresh if classify_internal_category(m.question) == "sports"]
                 # Drop any new markets — only keep already-subscribed ones
                 still_active = [m for m in fresh if m.yes_token_id in subscribed_yes_ids]
                 if still_active:
@@ -734,6 +741,25 @@ async def strategy_loop(
         # ── Exit open positions that hit profit target, stop-loss, or time-stop ─
         for token_id, pos in list(open_positions.items()):
             book = book_manager.get_book(token_id)
+            if book is None or book.is_stale or book.best_bid is None:
+                try:
+                    log.warning("Exit check: live WS book for %s is %s. Attempting REST fallback fetch...",
+                                token_id[:14], "missing" if book is None else ("stale" if book.is_stale else "lacks best bid"))
+                    rest_book = await asyncio.to_thread(executor._client.get_order_book, token_id)
+                    if rest_book:
+                        bids = [Level(price=float(b["price"]), size=float(b["size"])) for b in rest_book.get("bids", [])]
+                        asks = [Level(price=float(a["price"]), size=float(a["size"])) for a in rest_book.get("asks", [])]
+                        book = BookSnapshot(
+                            token_id=token_id,
+                            bids=bids,
+                            asks=asks,
+                            timestamp=time.time(),
+                            sequence=0,
+                            mid_history=[]
+                        )
+                except Exception as e:
+                    log.error("REST fallback orderbook fetch failed in exit loop: %s", e)
+
             if book is None or book.is_stale or book.best_bid is None:
                 continue
             if pos.entry_price <= 0:
@@ -1148,6 +1174,9 @@ async def main() -> None:
         .top(20, key="volume_24h")
         .results()
     )
+    if SEXYBOT_SPORTS_ONLY:
+        markets = [m for m in markets if classify_internal_category(m.question) == "sports"]
+        log.info("SEXYBOT_SPORTS_ONLY is active: filtered watch list down to %d sports markets", len(markets))
     log.info(
         "Watching %d markets (excluding categories: %s; keywords: %s; internal: %s)",
         len(markets), EXCLUDE_CATEGORIES or "none", EXCLUDE_KEYWORDS or "none",
