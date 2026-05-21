@@ -209,9 +209,12 @@ class DrawdownGuard:
     drawdown within a rolling window exceeds `max_drawdown`, raises
     DrawdownHalt (cancels restart loop) and logs a CRITICAL alert.
 
-    Also tracks a 24-hour rolling balance snapshot history to enforce a hard
-    daily loss limit (DAILY_LOSS_LIMIT) kill-switch that prevents overnight
-    wipeouts over many hours.
+    Also tracks a 1-hour rolling balance history (HOURLY_LOSS_LIMIT) and a
+    24-hour rolling balance snapshot history to enforce a hard daily loss limit
+    (DAILY_LOSS_LIMIT) kill-switch that prevents overnight wipeouts.
+
+    Finally, tracks a rolling history of trade execution timestamps to enforce
+    hourly and daily trade frequency limits, protecting against runaway loops.
 
     Usage
     -----
@@ -227,9 +230,15 @@ class DrawdownGuard:
     ):
         self.max_drawdown = max_drawdown
         self.window       = window
-        self.daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "20.0"))
-        self._history:    list[tuple[float, float]] = []   # (ts, balance)
-        self._history_24h: list[tuple[float, float]] = []  # (ts, balance) rolling 24h
+        self.hourly_loss_limit = float(os.getenv("HOURLY_LOSS_LIMIT", "8.0"))
+        self.daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "15.0"))
+        self.max_hourly_trades = int(os.getenv("MAX_HOURLY_TRADES", "10"))
+        self.max_daily_trades  = int(os.getenv("MAX_DAILY_TRADES", "50"))
+        
+        self._history:     list[tuple[float, float]] = []   # (ts, balance)
+        self._history_1h:  list[tuple[float, float]] = []   # (ts, balance) rolling 1h
+        self._history_24h: list[tuple[float, float]] = []   # (ts, balance) rolling 24h
+        self._trades_history: list[float] = []               # rolling 24h trade timestamps
         self._triggered   = False
 
     @property
@@ -267,7 +276,28 @@ class DrawdownGuard:
                     f"within {self.window / 60:.0f}min window"
                 )
 
-        # 2. 24-hour daily loss drawdown check
+        # 2. 1-hour rolling drawdown check
+        self._history_1h.append((now, balance))
+        cutoff_1h = now - 3600.0
+        self._history_1h = [(t, b) for t, b in self._history_1h if t >= cutoff_1h]
+
+        if len(self._history_1h) >= 2:
+            peak_1h     = max(b for _, b in self._history_1h)
+            drawdown_1h = peak_1h - balance
+            if drawdown_1h >= self.hourly_loss_limit:
+                self._triggered = True
+                log.critical(
+                    "⛔ HOURLY LOSS KILL-SWITCH | 1h peak=$%.2f  current=$%.2f  drop=$%.2f >= limit=$%.2f  "
+                    "— all quoting halted, manual restart required",
+                    peak_1h, balance, drawdown_1h, self.hourly_loss_limit,
+                )
+                raise DrawdownHalt(
+                    f"balance dropped ${drawdown_1h:.2f} "
+                    f"(1h peak=${peak_1h:.2f} → current=${balance:.2f}) "
+                    f"within rolling 1h window"
+                )
+
+        # 3. 24-hour daily loss drawdown check
         self._history_24h.append((now, balance))
         cutoff_24h = now - 86400.0
         self._history_24h = [(t, b) for t, b in self._history_24h if t >= cutoff_24h]
@@ -288,11 +318,56 @@ class DrawdownGuard:
                     f"within rolling 24h window"
                 )
 
+    def record_trade(self) -> None:
+        """
+        Record a trade placement (or exit close). Checks trade frequency limits
+        and raises DrawdownHalt if hourly or daily trade counts are breached.
+        """
+        if self._triggered:
+            raise DrawdownHalt("circuit breaker already triggered — manual reset required")
+            
+        now = time.time()
+        self._trades_history.append(now)
+        
+        # Prune older than 24h
+        cutoff_daily = now - 86400.0
+        self._trades_history = [t for t in self._trades_history if t >= cutoff_daily]
+        
+        # Count hourly and daily trades
+        cutoff_hourly = now - 3600.0
+        hourly_count = sum(1 for t in self._trades_history if t >= cutoff_hourly)
+        daily_count  = len(self._trades_history)
+        
+        log.info("TRADE RECORDED | rolling trade counts: 1h=%d/%d, 24h=%d/%d",
+                 hourly_count, self.max_hourly_trades, daily_count, self.max_daily_trades)
+        
+        if hourly_count > self.max_hourly_trades:
+            self._triggered = True
+            log.critical(
+                "⛔ TRADE FREQUENCY HALT | Hourly trade count (%d) exceeded limit (%d) — halting bot!",
+                hourly_count, self.max_hourly_trades
+            )
+            raise DrawdownHalt(
+                f"Trade frequency limit breached: {hourly_count} trades in last hour (max={self.max_hourly_trades})"
+            )
+            
+        if daily_count > self.max_daily_trades:
+            self._triggered = True
+            log.critical(
+                "⛔ TRADE FREQUENCY HALT | Daily trade count (%d) exceeded limit (%d) — halting bot!",
+                daily_count, self.max_daily_trades
+            )
+            raise DrawdownHalt(
+                f"Trade frequency limit breached: {daily_count} trades in last 24h (max={self.max_daily_trades})"
+            )
+
     def reset(self) -> None:
         """Manually reset after investigating the drawdown. Use with caution."""
         self._triggered = False
         self._history.clear()
+        self._history_1h.clear()
         self._history_24h.clear()
+        self._trades_history.clear()
         log.warning("DrawdownGuard manually reset — strategy will resume on next restart")
 
 

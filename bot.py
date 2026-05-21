@@ -260,7 +260,7 @@ BRIER_RESOLVE_INTERVAL_S = int(os.getenv("BRIER_RESOLVE_INTERVAL_S", "3600"))
 #       Lowering the default ceiling to 0.80 cuts the entire 80-100c
 #       region while keeping the only profitable band intact. Live .env
 #       can override; this is the floor a fresh deploy gets.
-MAX_ENTRY_PRICE          = float(os.getenv("MAX_ENTRY_PRICE", "0.80"))
+MAX_ENTRY_PRICE          = float(os.getenv("MAX_ENTRY_PRICE", "0.70"))
 # Service-disable + category gates for the consolidate-onto-main_v2
 # migration. Both default to OFF so a fresh deploy with no env
 # changes behaves exactly as before; the operator flips them on the

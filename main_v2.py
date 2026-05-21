@@ -87,10 +87,9 @@ MIN_BOOK_DEPTH_USDC = float(os.getenv("MIN_BOOK_DEPTH_USDC", "200"))  # skip thr
 # remaining ask side of the book is typically empty or dust, so FOK BUYs
 # reject ("no_match") and pile up as status="error" trades. There is also
 # almost no upside to buying at 0.99 — best case ~1c, worst case −99c.
-# Default lowered from 0.97 to 0.80 after the entry-price-decile cut
-# (commit cea1582) showed 80-100c was -$45 over 107 trades in 30d, with
-# only the 70-80c band positive. See bot.py for the full data table.
-MAX_ENTRY_PRICE  = float(os.getenv("MAX_ENTRY_PRICE", "0.80"))
+# Default lowered from 0.80 to 0.70 to prevent asymmetric, negative-EV entries.
+# 80-100c and 70-80c regions were assessed, and the lower ceiling caps capital bleedout.
+MAX_ENTRY_PRICE  = float(os.getenv("MAX_ENTRY_PRICE", "0.70"))
 
 # Position management
 TRADE_COOLDOWN_SEC    = 300   # seconds before re-buying the same token
@@ -98,6 +97,8 @@ MARKET_REFRESH_CYCLES = 20   # re-discover markets every N scan cycles
 PROFIT_TARGET         = float(os.getenv("PROFIT_TARGET", "0.08"))   # 8% gain → close (base; dynamic)
 STOP_LOSS             = float(os.getenv("STOP_LOSS",     "0.05"))   # 5% loss → close (base; dynamic)
 KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.25"))  # Quarter Kelly
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))  # Max open positions to limit correlated risk
+MAX_POSITION_COST_PCT    = float(os.getenv("MAX_POSITION_COST_PCT", "0.15"))  # Max 15% of wallet balance per position
 # Time-based exit: if a position doesn't hit profit/stop within this window,
 # close at current bid rather than continuing to hold dead inventory. Helps
 # recycle capital into fresher signals and caps "slow bleed" losses that
@@ -107,6 +108,7 @@ MAX_HOLD_SEC          = int(os.getenv("MAX_HOLD_SEC", "3600"))   # 1 h default
 # the standard percentage stop hasn't triggered. Prevents being stuck in a
 # chronically drifting-lower position.
 TIME_STOP_MIN_GAIN    = float(os.getenv("TIME_STOP_MIN_GAIN", "-0.01"))
+MIN_EXIT_PRICE        = float(os.getenv("MIN_EXIT_PRICE", "0.05"))
 # Comma-separated list of category substrings to skip at discovery. Defaults
 # to 'crypto' per the 2026-04-22 backtest recommendation (short-horizon crypto
 # price markets; 0% resolved win rate and structurally efficient). Override
@@ -220,6 +222,277 @@ class Position:
     market_question:    Optional[str]   = None
     entry_signal_source: Optional[str]  = None
     entry_signal_strength: Optional[float] = None
+    # Sweep-to-fill exit order tracking
+    exit_order_id:      Optional[str]   = None
+    exit_order_time:    Optional[float] = None
+    exit_qty_filled:    float           = 0.0
+    exit_reason:        Optional[str]   = None
+    # Entry order tracking
+    entry_order_id:     Optional[str]   = None
+    entry_order_time:   Optional[float] = None
+
+
+def save_open_positions(open_positions: dict[str, Position]) -> None:
+    import json
+    data = {}
+    for tid, pos in open_positions.items():
+        data[tid] = {
+            "token_id": pos.token_id,
+            "entry_price": pos.entry_price,
+            "token_qty": pos.token_qty,
+            "entry_time": pos.entry_time,
+            "profit_target": pos.profit_target,
+            "stop_loss": pos.stop_loss,
+            "peak_bid": pos.peak_bid,
+            "trough_bid": pos.trough_bid,
+            "market_question": pos.market_question,
+            "entry_signal_source": pos.entry_signal_source,
+            "entry_signal_strength": pos.entry_signal_strength,
+            "exit_order_id": pos.exit_order_id,
+            "exit_order_time": pos.exit_order_time,
+            "exit_qty_filled": pos.exit_qty_filled,
+            "exit_reason": pos.exit_reason,
+            "entry_order_id": pos.entry_order_id,
+            "entry_order_time": pos.entry_order_time,
+        }
+    try:
+        with open("open_positions.json", "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log.error("Failed to save open_positions.json: %s", e)
+
+
+def load_open_positions() -> dict[str, Position]:
+    import json
+    if not os.path.exists("open_positions.json"):
+        return {}
+    try:
+        with open("open_positions.json", "r") as f:
+            data = json.load(f)
+        positions = {}
+        for tid, d in data.items():
+            positions[tid] = Position(
+                token_id=d["token_id"],
+                entry_price=d["entry_price"],
+                token_qty=d["token_qty"],
+                entry_time=d["entry_time"],
+                profit_target=d.get("profit_target", PROFIT_TARGET),
+                stop_loss=d.get("stop_loss", STOP_LOSS),
+                peak_bid=d.get("peak_bid"),
+                trough_bid=d.get("trough_bid"),
+                market_question=d.get("market_question"),
+                entry_signal_source=d.get("entry_signal_source"),
+                entry_signal_strength=d.get("entry_signal_strength"),
+                exit_order_id=d.get("exit_order_id"),
+                exit_order_time=d.get("exit_order_time"),
+                exit_qty_filled=d.get("exit_qty_filled", 0.0),
+                exit_reason=d.get("exit_reason"),
+                entry_order_id=d.get("entry_order_id"),
+                entry_order_time=d.get("entry_order_time"),
+            )
+        return positions
+    except Exception as e:
+        log.error("Failed to load open_positions.json: %s", e)
+        return {}
+
+
+def check_correlation_and_category_gates(mkt: PolyMarket, open_positions: dict[str, Position]) -> tuple[bool, str]:
+    # 1. Coarse Category Check
+    mkt_category = classify_internal_category(mkt.question or "")
+    category_count = 0
+    for pos in open_positions.values():
+        if pos.market_question:
+            pos_category = classify_internal_category(pos.market_question)
+            if pos_category == mkt_category:
+                category_count += 1
+                
+    MAX_POSITIONS_PER_CATEGORY = 2
+    if category_count >= MAX_POSITIONS_PER_CATEGORY:
+        return False, f"Category concentration breach: already have {category_count} positions in category '{mkt_category}' (max={MAX_POSITIONS_PER_CATEGORY})"
+
+    # 2. Correlation Check (Event-level keyword matching)
+    STOP_WORDS = {
+        "will", "over", "under", "game", "points", "team", "vs", "the", "and", "or", 
+        "to", "in", "of", "for", "on", "at", "by", "with", "a", "an", "is", "be", 
+        "who", "what", "which", "how", "many", "than", "more", "less", "yes", "no",
+        "play", "player", "players", "score", "scores", "match", "win", "lose", "first",
+        "second", "third", "fourth", "quarter", "half", "total", "greater", "fewer", "between",
+        "season", "league", "championship", "finals", "playoffs", "series", "stage", "round"
+    }
+    
+    def extract_keywords(text: str) -> set[str]:
+        if not text:
+            return set()
+        import re
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+        return {w for w in words if w not in STOP_WORDS}
+
+    mkt_keywords = extract_keywords(mkt.question)
+    if not mkt_keywords:
+        return True, ""
+
+    for pos in open_positions.values():
+        if pos.market_question:
+            pos_keywords = extract_keywords(pos.market_question)
+            overlap = mkt_keywords.intersection(pos_keywords)
+            if overlap:
+                return False, f"Event correlation breach: overlapping keywords {overlap} with active position '{pos.market_question}'"
+
+    return True, ""
+
+
+def get_last_buy_trade(token_id: str) -> Optional[dict]:
+    import sqlite3
+    db_path = os.getenv("CALIBRATION_DB_PATH", "trades.db")
+    try:
+        conn = sqlite3.connect(db_path, timeout=3.0)
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trades'")
+        if not cur.fetchone():
+            return None
+        cur = conn.execute(
+            "SELECT market, price, shares, time, strategy FROM trades "
+            "WHERE token_id = ? AND side = 'BUY' "
+            "ORDER BY time DESC LIMIT 1",
+            (token_id,)
+        )
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+        return None
+    except Exception as e:
+        log.warning("get_last_buy_trade error for %s: %s", token_id[:14], e)
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+async def reconcile_positions_on_startup(executor: ClobExecutor, open_positions: dict[str, Position]) -> None:
+    log.info("Starting on-chain position reconciliation...")
+    loaded = load_open_positions()
+    open_positions.clear()
+    open_positions.update(loaded)
+
+    user_addr = FUNDER_ADDRESS or (executor._client.get_address() if executor else None)
+    if not user_addr:
+        log.warning("No user/funder wallet address available. Skipping on-chain position reconciliation.")
+        return
+
+    try:
+        import json as _j
+        import urllib.request as _ureq
+
+        url = f"https://data-api.polymarket.com/positions?user={user_addr}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Origin": "https://polymarket.com",
+            "Referer": "https://polymarket.com/",
+        }
+
+        req = _ureq.Request(url, headers=headers)
+
+        def fetch_url():
+            with _ureq.urlopen(req, timeout=8) as r:
+                return _j.loads(r.read())
+
+        live_positions = await asyncio.get_event_loop().run_in_executor(None, fetch_url)
+
+        if not isinstance(live_positions, list):
+            log.warning("Polymarket positions data-api returned invalid format. Skipping on-chain reconciliation.")
+            return
+
+        onchain_tids = {}
+        for p in live_positions:
+            asset = p.get("asset")
+            size = float(p.get("size", 0) or 0)
+            avg_price = float(p.get("avgPrice", 0) or 0)
+            title = p.get("title", "")
+            if asset and size > 0:
+                onchain_tids[asset] = {
+                    "size": size,
+                    "avg_price": avg_price,
+                    "title": title
+                }
+
+        log.info("Found %d active position(s) on-chain.", len(onchain_tids))
+
+        # Reconcile on-chain assets into open_positions
+        for tid, o_info in onchain_tids.items():
+            size = o_info["size"]
+            avg_price = o_info["avg_price"]
+            title = o_info["title"]
+
+            if tid in open_positions:
+                pos = open_positions[tid]
+                if abs(pos.token_qty - size) > 1e-4:
+                    log.info("Reconciliation: updating %s qty from %.4f to %.4f",
+                             tid[:14], pos.token_qty, size)
+                    pos.token_qty = size
+            else:
+                log.warning("Reconciliation: untracked active on-chain position found for %s (%s). Reconstructing...",
+                            tid[:14], title[:40])
+
+                db_trade = get_last_buy_trade(tid)
+                if db_trade:
+                    entry_price = float(db_trade.get("price", avg_price) or avg_price)
+                    try:
+                        entry_time = datetime.fromisoformat(db_trade["time"].replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        entry_time = time.time()
+                    strategy = db_trade.get("strategy", "reconstructed")
+                    market_question = db_trade.get("market", title)
+                else:
+                    entry_price = avg_price if avg_price > 0 else 0.50
+                    entry_time = time.time()
+                    strategy = "reconstructed"
+                    market_question = title
+
+                pt, sl = dynamic_exit_levels(
+                    entry_price,
+                    base_profit = PROFIT_TARGET,
+                    base_stop   = STOP_LOSS,
+                )
+                open_positions[tid] = Position(
+                    token_id              = tid,
+                    entry_price           = entry_price,
+                    token_qty             = size,
+                    entry_time            = entry_time,
+                    profit_target         = pt,
+                    stop_loss             = sl,
+                    peak_bid              = entry_price,
+                    trough_bid            = entry_price,
+                    market_question       = market_question,
+                    entry_signal_source   = strategy,
+                )
+                log.info("Reconstructed position: %s, entry=%.4f, qty=%.4f",
+                         tid[:14], entry_price, size)
+
+        # Prune tracking for positions no longer held on-chain (excluding very recent ones < 5 min old)
+        now_ts = time.time()
+        to_prune = []
+        for tid, pos in list(open_positions.items()):
+            if tid not in onchain_tids:
+                if now_ts - pos.entry_time < 300:
+                    continue
+                if getattr(pos, "exit_order_id", None) is not None:
+                    continue
+                to_prune.append(tid)
+
+        if to_prune:
+            for tid in to_prune:
+                log.warning("Reconciliation: pruning inactive/phantom position from local tracking: %s (%s)",
+                            tid[:14], open_positions[tid].market_question or "")
+                del open_positions[tid]
+
+        save_open_positions(open_positions)
+        log.info("Position reconciliation complete. Currently tracking %d position(s).", len(open_positions))
+
+    except Exception as e:
+        log.error("Error during position reconciliation: %s", e)
 
 
 @dataclass
@@ -708,6 +981,88 @@ async def strategy_loop(
             except Exception as exc:
                 log.warning("REDEEMER error (non-fatal): %s", exc)
 
+        # ── Active Entry Order Sweeper ────────────────────────────────────────
+        for token_id, pos in list(open_positions.items()):
+            entry_id = getattr(pos, "entry_order_id", None)
+            if entry_id is None:
+                continue
+
+            if entry_id == "DRY_RUN":
+                pos.entry_order_id = None
+                pos.entry_order_time = None
+                save_open_positions(open_positions)
+                continue
+
+            # Live order polling
+            info = await asyncio.to_thread(executor.get_order, entry_id)
+            if not isinstance(info, dict):
+                log.warning("Entry order sweeper: get_order for %s failed. Retrying next cycle.", entry_id)
+                continue
+
+            status = (info.get("status") or "").lower()
+            try:
+                size_matched = float(info.get("size_matched", 0) or 0)
+            except (TypeError, ValueError):
+                size_matched = 0.0
+
+            original_qty = pos.token_qty
+            remaining_qty = max(0.0, original_qty - size_matched)
+
+            # If matched/filled or negligible remaining
+            if status in ("matched", "filled") or remaining_qty <= 1e-4:
+                log.info("ENTRY ORDER FILLED | %s fully filled %.4f shares.", token_id[:14], size_matched)
+                pos.token_qty = size_matched
+                pos.entry_order_id = None
+                pos.entry_order_time = None
+                save_open_positions(open_positions)
+                continue
+
+            # If terminated (canceled/expired)
+            if status in ("canceled", "cancelled", "expired"):
+                log.warning("ENTRY ORDER TERMINATED (%s) | %s had size_matched=%.4f/%.4f.",
+                            status, token_id[:14], size_matched, original_qty)
+                value = size_matched * pos.entry_price
+                if value >= 1.0:
+                    log.info("Keeping partially filled entry position for %s: qty=%.4f (value=$%.2f)",
+                             token_id[:14], size_matched, value)
+                    pos.token_qty = size_matched
+                    pos.entry_order_id = None
+                    pos.entry_order_time = None
+                else:
+                    log.warning("Partially filled value $%.2f < $1.00 min notional, pruning position %s",
+                                value, token_id[:14])
+                    del open_positions[token_id]
+                save_open_positions(open_positions)
+                continue
+
+            # If open and stale (>= 60 seconds)
+            elapsed = time.time() - (pos.entry_order_time or time.time())
+            if elapsed >= 60.0:
+                log.info("ENTRY ORDER STALLED (%.0fs) | Cancelling entry order %s...", elapsed, token_id[:14])
+                await asyncio.to_thread(executor.cancel_order, entry_id)
+
+                # Fetch final state post-cancel to see what filled
+                info_post = await asyncio.to_thread(executor.get_order, entry_id)
+                if isinstance(info_post, dict):
+                    try:
+                        size_matched = float(info_post.get("size_matched", size_matched) or size_matched)
+                    except (TypeError, ValueError):
+                        pass
+
+                value = size_matched * pos.entry_price
+                if value >= 1.0:
+                    log.info("Keeping partially filled entry position post-cancel for %s: qty=%.4f (value=$%.2f)",
+                             token_id[:14], size_matched, value)
+                    pos.token_qty = size_matched
+                    pos.entry_order_id = None
+                    pos.entry_order_time = None
+                else:
+                    log.warning("Unfilled or tiny filled value $%.2f < $1.00 post-cancel, pruning position %s",
+                                value, token_id[:14])
+                    del open_positions[token_id]
+                save_open_positions(open_positions)
+                continue
+
         # ── Regime gate ─────────────────────────────────────────────────────────
         # bot.py's Claude regime detector writes to regime_log. We read the latest
         # entry here and use it to throttle or halt risk-taking.  No-op when the
@@ -751,6 +1106,171 @@ async def strategy_loop(
 
         # ── Exit open positions that hit profit target, stop-loss, or time-stop ─
         for token_id, pos in list(open_positions.items()):
+            # If position is still in pending entry phase, skip exit evaluations
+            if getattr(pos, "entry_order_id", None) is not None:
+                continue
+
+            # 1. Process pending exit order if any (exiting state)
+            if getattr(pos, "exit_order_id", None) is not None:
+                if pos.exit_order_id == "DRY_RUN":
+                    log.info("EXIT DRY RUN COMPLETED | %s was in exiting state.", token_id[:14])
+                    try:
+                        await asyncio.to_thread(
+                            record_postmortem,
+                            token_id              = token_id,
+                            market                = pos.market_question,
+                            entry_price           = pos.entry_price,
+                            entry_time            = datetime.fromtimestamp(pos.entry_time, tz=timezone.utc).isoformat(),
+                            exit_price            = pos.entry_price,
+                            exit_time             = datetime.now(timezone.utc).isoformat(),
+                            held_seconds          = int(time.time() - pos.entry_time),
+                            peak_bid              = pos.peak_bid or pos.entry_price,
+                            trough_bid            = pos.trough_bid or pos.entry_price,
+                            max_gain_pct          = 0.0,
+                            min_gain_pct          = 0.0,
+                            realized_gain_pct     = 0.0,
+                            exit_reason           = pos.exit_reason or "dry_run_exit",
+                            entry_signal_source   = pos.entry_signal_source,
+                            entry_signal_strength = pos.entry_signal_strength,
+                            profit_target         = pos.profit_target,
+                            stop_loss             = pos.stop_loss,
+                            exit_order_id         = "DRY_RUN",
+                            exit_status           = "dry_run",
+                        )
+                    except Exception as exc:
+                        log.debug("record_postmortem dry_run failed: %s", exc)
+                    try:
+                        await asyncio.to_thread(
+                            record_trade,
+                            market       = pos.market_question or "",
+                            side         = "SELL",
+                            amount_usdc  = pos.entry_price * pos.token_qty,
+                            price        = pos.entry_price,
+                            shares       = pos.token_qty,
+                            token_id     = token_id,
+                            order_id     = "DRY_RUN",
+                            order_type   = "limit",
+                            strategy     = pos.entry_signal_source,
+                            category     = classify_internal_category(pos.market_question or ""),
+                            status_detail = pos.exit_reason or "dry_run_exit",
+                            dry_run      = True,
+                        )
+                    except Exception as exc:
+                        log.debug("record_trade dry_run failed: %s", exc)
+                    del open_positions[token_id]
+                    save_open_positions(open_positions)
+                    last_traded[token_id] = time.time()
+                    continue
+
+                info = await asyncio.to_thread(executor.get_order, pos.exit_order_id)
+                if not isinstance(info, dict):
+                    log.warning("Exit order monitoring: get_order for %s failed. Retrying next cycle.", pos.exit_order_id)
+                    continue
+
+                status = (info.get("status") or "").lower()
+                try:
+                    size_matched = float(info.get("size_matched", 0) or 0)
+                except (TypeError, ValueError):
+                    size_matched = 0.0
+
+                original_qty = pos.token_qty
+                remaining_qty = max(0.0, original_qty - size_matched)
+
+                if status in ("matched", "filled") or remaining_qty <= 1e-4:
+                    log.info("EXIT ORDER FILLED | %s fully filled %.4f shares.", token_id[:14], original_qty)
+                    try:
+                        fill_price = float(info.get("price", 0) or pos.entry_price)
+                        peak = pos.peak_bid if pos.peak_bid is not None else fill_price
+                        trough = pos.trough_bid if pos.trough_bid is not None else fill_price
+                        max_gain = (peak - pos.entry_price) / pos.entry_price
+                        min_gain = (trough - pos.entry_price) / pos.entry_price
+                        realized = (fill_price - pos.entry_price) / pos.entry_price
+
+                        await asyncio.to_thread(
+                            record_postmortem,
+                            token_id              = token_id,
+                            market                = pos.market_question,
+                            entry_price           = pos.entry_price,
+                            entry_time            = datetime.fromtimestamp(pos.entry_time, tz=timezone.utc).isoformat(),
+                            exit_price            = fill_price,
+                            exit_time             = datetime.now(timezone.utc).isoformat(),
+                            held_seconds          = int(time.time() - pos.entry_time),
+                            peak_bid              = peak,
+                            trough_bid            = trough,
+                            max_gain_pct          = max_gain * 100,
+                            min_gain_pct          = min_gain * 100,
+                            realized_gain_pct     = realized * 100,
+                            exit_reason           = pos.exit_reason or "exit",
+                            entry_signal_source   = pos.entry_signal_source,
+                            entry_signal_strength = pos.entry_signal_strength,
+                            profit_target         = pos.profit_target,
+                            stop_loss             = pos.stop_loss,
+                            exit_order_id         = pos.exit_order_id,
+                            exit_status           = status,
+                        )
+                    except Exception as exc:
+                        log.debug("record_postmortem in monitoring failed: %s", exc)
+
+                    try:
+                        fill_price = float(info.get("price", 0) or pos.entry_price)
+                        await asyncio.to_thread(
+                            record_trade,
+                            market       = pos.market_question or "",
+                            side         = "SELL",
+                            amount_usdc  = fill_price * original_qty,
+                            price        = fill_price,
+                            shares       = original_qty,
+                            token_id     = token_id,
+                            order_id     = pos.exit_order_id,
+                            order_type   = "limit",
+                            strategy     = pos.entry_signal_source,
+                            category     = classify_internal_category(pos.market_question or ""),
+                            status_detail = pos.exit_reason or "exit",
+                            dry_run      = DRY_RUN,
+                        )
+                    except Exception as exc:
+                        log.debug("record_trade in monitoring failed: %s", exc)
+
+                    del open_positions[token_id]
+                    save_open_positions(open_positions)
+                    last_traded[token_id] = time.time()
+                    continue
+
+                if status in ("canceled", "cancelled", "expired"):
+                    log.warning("EXIT ORDER TERMINATED (%s) | %s had size_matched=%.4f/%.4f. Re-queueing remainder...",
+                                status, token_id[:14], size_matched, original_qty)
+                    pos.token_qty = remaining_qty
+                    pos.exit_order_id = None
+                    pos.exit_order_time = None
+                    book = book_manager.get_book(token_id)
+                    bid_price = book.best_bid if (book and book.best_bid) else 0.5
+                    if pos.token_qty * bid_price < 1.0:
+                        log.warning("Remaining exit quantity too small (<$1), abandoning: %s (qty=%.4f)", token_id[:14], pos.token_qty)
+                        del open_positions[token_id]
+                    save_open_positions(open_positions)
+                    continue
+
+                elapsed = time.time() - (pos.exit_order_time or time.time())
+                if elapsed >= 30:
+                    log.info("EXIT ORDER STALLED (%.0fs) | Cancelling and re-quoting %s...", elapsed, token_id[:14])
+                    try:
+                        await asyncio.to_thread(executor.cancel_order, pos.exit_order_id)
+                    except Exception as exc:
+                        log.error("Failed to cancel stalled exit order %s: %s", pos.exit_order_id, exc)
+
+                    pos.token_qty = remaining_qty
+                    pos.exit_order_id = None
+                    pos.exit_order_time = None
+                    book = book_manager.get_book(token_id)
+                    bid_price = book.best_bid if (book and book.best_bid) else 0.5
+                    if pos.token_qty * bid_price < 1.0:
+                        log.warning("Remaining exit quantity too small (<$1) after stall cancel, abandoning: %s (qty=%.4f)", token_id[:14], pos.token_qty)
+                        del open_positions[token_id]
+                    save_open_positions(open_positions)
+                    continue
+
+                continue
+
             book = book_manager.get_book(token_id)
             if book is None or book.is_stale or book.best_bid is None:
                 try:
@@ -777,16 +1297,14 @@ async def strategy_loop(
                 log.warning("skip exit check: %s has invalid entry_price=%s",
                             token_id[:14], pos.entry_price)
                 continue
-            # Update peak/trough bid before exit check — observability only,
-            # never affects the exit decision below.
+
             if pos.peak_bid is None or book.best_bid > pos.peak_bid:
                 pos.peak_bid = book.best_bid
             if pos.trough_bid is None or book.best_bid < pos.trough_bid:
                 pos.trough_bid = book.best_bid
+
             gain    = (book.best_bid - pos.entry_price) / pos.entry_price
             held_s  = time.time() - pos.entry_time
-            # Per-position exit bands (computed at entry with the entry regime).
-            # Fall back to module constants for positions opened before this upgrade.
             profit_band = pos.profit_target or PROFIT_TARGET
             stop_band   = pos.stop_loss     or STOP_LOSS
             if gain >= profit_band:
@@ -794,10 +1312,15 @@ async def strategy_loop(
             elif gain <= -stop_band:
                 reason = f"stop-loss {gain * 100:.1f}% (band {stop_band * 100:.1f}%)"
             elif held_s >= MAX_HOLD_SEC and gain <= TIME_STOP_MIN_GAIN:
-                # Trade stalled past MAX_HOLD_SEC and isn't meaningfully winning →
-                # recycle capital rather than holding dead inventory indefinitely.
                 reason = f"time-stop {held_s / 60:.0f}m gain={gain * 100:+.1f}%"
             else:
+                continue
+
+            if book.best_bid < MIN_EXIT_PRICE:
+                log.warning(
+                    "EXIT BLOCKED | %s best bid %.4f < MIN_EXIT_PRICE %.4f (liquidity floor guard) — exit aborted!",
+                    token_id[:14], book.best_bid, MIN_EXIT_PRICE
+                )
                 continue
 
             log.info(
@@ -812,86 +1335,18 @@ async def strategy_loop(
                 log.error("close_position error for %s: %s", token_id[:14], exc)
                 continue
 
-            if exit_result:
-                # Post-mortem write (best-effort, never blocks). Captures the
-                # full life of the position so the nightly review can answer
-                # "did we exit at the right moment?" Peak/trough are bid-side
-                # snapshots only — they understate actual high-water marks
-                # between scan cycles, but they're the same metric the exit
-                # check uses so the comparison is apples-to-apples.
-                try:
-                    peak  = pos.peak_bid  if pos.peak_bid  is not None else book.best_bid
-                    trough = pos.trough_bid if pos.trough_bid is not None else book.best_bid
-                    max_gain = (peak - pos.entry_price) / pos.entry_price
-                    min_gain = (trough - pos.entry_price) / pos.entry_price
-                    exit_fill = (
-                        exit_result.fill_price
-                        if exit_result.fill_price is not None
-                        else book.best_bid
-                    )
-                    realized = (
-                        (exit_fill - pos.entry_price) / pos.entry_price
-                        if exit_fill is not None
-                        else None
-                    )
-                    await asyncio.to_thread(
-                        record_postmortem,
-                        token_id              = token_id,
-                        market                = pos.market_question,
-                        entry_price           = pos.entry_price,
-                        entry_time            = datetime.fromtimestamp(
-                            pos.entry_time, tz=timezone.utc
-                        ).isoformat(),
-                        exit_price            = exit_fill,
-                        exit_time             = datetime.now(timezone.utc).isoformat(),
-                        held_seconds          = int(held_s),
-                        peak_bid              = peak,
-                        trough_bid            = trough,
-                        max_gain_pct          = max_gain * 100,
-                        min_gain_pct          = min_gain * 100,
-                        realized_gain_pct     = realized * 100 if realized is not None else None,
-                        exit_reason           = reason,
-                        entry_signal_source   = pos.entry_signal_source,
-                        entry_signal_strength = pos.entry_signal_strength,
-                        profit_target         = pos.profit_target,
-                        stop_loss             = pos.stop_loss,
-                        exit_order_id         = exit_result.order_id,
-                        exit_status           = exit_result.status,
-                    )
-                except Exception as exc:
-                    log.debug("record_postmortem failed (non-fatal): %s", exc)
-                # Mirror the SELL into the shared trades table — pairs with
-                # the BUY recorded at entry so /pnl/cuts can FIFO-attribute
-                # exit P&L. Uses post-fix USDC convention (amount = price ×
-                # shares, c4c93db). Best-effort; never blocks the loop.
-                try:
-                    if exit_fill is not None:
-                        await asyncio.to_thread(
-                            record_trade,
-                            market       = pos.market_question or "",
-                            side         = "SELL",
-                            amount_usdc  = float(exit_fill) * float(pos.token_qty),
-                            price        = float(exit_fill),
-                            shares       = float(pos.token_qty),
-                            token_id     = token_id,
-                            order_id     = exit_result.order_id,
-                            order_type   = "limit",
-                            strategy     = pos.entry_signal_source,
-                            category     = classify_internal_category(pos.market_question or ""),
-                            status_detail = reason,
-                            dry_run      = DRY_RUN,
-                        )
-                except Exception as exc:
-                    log.debug("record_trade (SELL) failed: %s", exc)
-                del open_positions[token_id]
-                last_traded[token_id] = time.time()   # cooldown after exit
+            if exit_result and exit_result.success:
+                if drawdown_guard is not None:
+                    drawdown_guard.record_trade()
+                pos.exit_order_id = exit_result.order_id
+                pos.exit_order_time = time.time()
+                pos.exit_reason = reason
+                save_open_positions(open_positions)
                 log.info(
-                    "EXITED | %s  reason=%s  id=%s  status=%s",
-                    token_id[:14], reason, exit_result.order_id, exit_result.status,
+                    "EXIT INITIATED | %s  reason=%s  order_id=%s",
+                    token_id[:14], reason, exit_result.order_id,
                 )
-            elif exit_result.error and "too small" in (exit_result.error or ""):
-                # Position value < $1 — Polymarket won't accept the order.
-                # Abandon it rather than retrying every cycle forever.
+            elif exit_result and exit_result.error and "too small" in (exit_result.error or ""):
                 log.warning(
                     "ABANDON | %s  value<$1  entry=%.4f  qty=%.4f  bid=%.4f",
                     token_id[:14], pos.entry_price, pos.token_qty, book.best_bid,
@@ -919,18 +1374,22 @@ async def strategy_loop(
                 except Exception as exc:
                     log.debug("record_postmortem (abandon) failed: %s", exc)
                 del open_positions[token_id]
+                save_open_positions(open_positions)
 
         # Collect live books — skip markets with an open position (no stacking)
         live: list[tuple[PolyMarket, BookSnapshot]] = []
-        for mkt in markets:
-            if mkt.yes_token_id in open_positions or mkt.no_token_id in open_positions:
-                log.debug("SKIP (position held): %s", mkt.question[:40])
-                continue
-            yes_book = book_manager.get_book(mkt.yes_token_id)
-            if yes_book is None or yes_book.is_stale:
-                log.debug("No live book for %s", mkt.question[:40])
-                continue
-            live.append((mkt, yes_book))
+        if len(open_positions) >= MAX_CONCURRENT_POSITIONS:
+            log.info("MAX OPEN POSITIONS REACHED (%d/%d) — skipping momentum entries", len(open_positions), MAX_CONCURRENT_POSITIONS)
+        else:
+            for mkt in markets:
+                if mkt.yes_token_id in open_positions or mkt.no_token_id in open_positions:
+                    log.debug("SKIP (position held): %s", mkt.question[:40])
+                    continue
+                yes_book = book_manager.get_book(mkt.yes_token_id)
+                if yes_book is None or yes_book.is_stale:
+                    log.debug("No live book for %s", mkt.question[:40])
+                    continue
+                live.append((mkt, yes_book))
 
         # Hostile regime — run exits above, but don't open new positions.
         if regime_kelly_scale == 0.0:
@@ -960,6 +1419,11 @@ async def strategy_loop(
                 log.error("Signal error for %s: %s", mkt.question[:40], result)
                 continue
             if result is None:
+                continue
+
+            passed, gate_msg = check_correlation_and_category_gates(mkt, open_positions)
+            if not passed:
+                log.info("CONCENTRATION GATE BLOCKED | %s: %s", mkt.question[:40], gate_msg)
                 continue
 
             signal: Signal = result   # type: ignore[assignment]
@@ -1013,6 +1477,12 @@ async def strategy_loop(
                 signal_strength = signal.strength,
                 regime          = regime,
             )
+            if cycle_balance is not None:
+                max_pos_dollars = cycle_balance.balance * MAX_POSITION_COST_PCT
+                if kelly_dollars > max_pos_dollars:
+                    log.info("SIZING GATE | %s: capped Kelly size $%.2f to $%.2f (max %d%% of balance)",
+                             mkt.question[:40], kelly_dollars, max_pos_dollars, int(MAX_POSITION_COST_PCT * 100))
+                    kelly_dollars = max_pos_dollars
             if kelly_dollars < 1.0:
                 log.debug(
                     "KELLY SKIP | %s  kelly=$%.2f strength=%.2f regime_mult=%.2f",
@@ -1072,6 +1542,8 @@ async def strategy_loop(
                 # Exit bands are computed at entry using the entry regime so they
                 # scale with the book's volatility at the time the position was taken.
                 if result.fill_price is not None and result.token_qty is not None:
+                    if drawdown_guard is not None:
+                        drawdown_guard.record_trade()
                     pt, sl = dynamic_exit_levels(
                         result.fill_price,
                         base_profit = PROFIT_TARGET,
@@ -1090,7 +1562,10 @@ async def strategy_loop(
                         market_question       = mkt.question,
                         entry_signal_source   = signal.source,
                         entry_signal_strength = signal.strength,
+                        entry_order_id        = result.order_id,
+                        entry_order_time      = time.time(),
                     )
+                    save_open_positions(open_positions)
                     log.info(
                         "EXIT BANDS | %s  entry=%.4f profit=+%.1f%% stop=-%.1f%%",
                         mkt.question[:45], result.fill_price, pt * 100, sl * 100,
@@ -1268,6 +1743,17 @@ async def main() -> None:
         markets_box:    list[list[PolyMarket]] = [markets]   # mutable box — survives restarts
         drawdown_guard  = DrawdownGuard()                     # account-level kill-switch
         balance_breaker = BalanceErrorCircuitBreaker()        # retry-storm guard
+        
+        # Cancel any active/stray orders before we reconcile and trade
+        log.info("Startup safety sweep: cancelling all active orders...")
+        try:
+            await asyncio.to_thread(executor.cancel_all_orders)
+        except Exception as exc:
+            log.warning("Startup safety sweep failed to cancel all orders (non-fatal): %s", exc)
+            
+        # Reconcile local state with on-chain holdings on startup/restart
+        await reconcile_positions_on_startup(executor, open_positions)
+        
         while True:
             try:
                 await strategy_loop(
