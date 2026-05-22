@@ -302,18 +302,52 @@ class DrawdownGuard:
         cutoff_24h = now - 86400.0
         self._history_24h = [(t, b) for t, b in self._history_24h if t >= cutoff_24h]
 
+        db_daily_loss = 0.0
+        db_path = os.getenv("CALIBRATION_DB_PATH", "trades.db")
+        if os.path.exists(db_path):
+            try:
+                import sqlite3
+                from datetime import datetime, timezone
+                conn = sqlite3.connect(db_path, timeout=3.0)
+                today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                cur = conn.execute(
+                    "SELECT SUM(realized_pnl) FROM trades "
+                    "WHERE resolved_at LIKE ? AND dry_run=0 AND resolved=1 "
+                    "  AND realized_pnl IS NOT NULL AND realized_pnl < 0",
+                    (f"{today_utc}%",),
+                )
+                val = cur.fetchone()[0]
+                db_daily_loss = abs(float(val)) if val is not None else 0.0
+                conn.close()
+            except Exception as e:
+                log.error("DrawdownGuard DB daily loss query error: %s", e)
+
+        in_mem_drop = 0.0
+        peak_24h = balance
         if len(self._history_24h) >= 2:
             peak_24h     = max(b for _, b in self._history_24h)
-            drawdown_24h = peak_24h - balance
-            if drawdown_24h >= self.daily_loss_limit:
-                self._triggered = True
+            in_mem_drop  = peak_24h - balance
+
+        if db_daily_loss >= self.daily_loss_limit or in_mem_drop >= self.daily_loss_limit:
+            self._triggered = True
+            if db_daily_loss >= self.daily_loss_limit:
                 log.critical(
-                    "⛔ DAILY LOSS KILL-SWITCH | 24h peak=$%.2f  current=$%.2f  drop=$%.2f >= limit=$%.2f  "
+                    "⛔ DAILY LOSS KILL-SWITCH (DB) | Today's realized loss=$%.2f >= limit=$%.2f "
                     "— all quoting halted, manual restart required",
-                    peak_24h, balance, drawdown_24h, self.daily_loss_limit,
+                    db_daily_loss, self.daily_loss_limit
                 )
                 raise DrawdownHalt(
-                    f"balance dropped ${drawdown_24h:.2f} "
+                    f"Today's realized daily loss of ${db_daily_loss:.2f} "
+                    f"exceeded limit of ${self.daily_loss_limit:.2f}"
+                )
+            else:
+                log.critical(
+                    "⛔ DAILY LOSS KILL-SWITCH (MEM) | 24h peak=$%.2f  current=$%.2f  drop=$%.2f >= limit=$%.2f  "
+                    "— all quoting halted, manual restart required",
+                    peak_24h, balance, in_mem_drop, self.daily_loss_limit,
+                )
+                raise DrawdownHalt(
+                    f"balance dropped ${in_mem_drop:.2f} "
                     f"(24h peak=${peak_24h:.2f} → current=${balance:.2f}) "
                     f"within rolling 24h window"
                 )

@@ -17,7 +17,7 @@ def main():
         SELECT id, token_id, side, price, shares, amount, resolved, realized_pnl, time, market
         FROM trades
         WHERE dry_run = 0 AND token_id IS NOT NULL AND token_id != ''
-          AND status IN ('matched', 'filled', 'delayed', 'live')
+          AND status IN ('matched', 'filled')
         ORDER BY time, id
     """).fetchall()
 

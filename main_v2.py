@@ -296,6 +296,26 @@ def load_open_positions() -> dict[str, Position]:
         return {}
 
 
+def run_inline_reconciliation() -> None:
+    """Run reconcile_closed_out.main() inline.
+    Since main_v2.py runs an async loop, this is run inside asyncio.to_thread
+    to prevent blocking the main event loop.
+    """
+    try:
+        import sys
+        import os
+        scripts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.append(scripts_dir)
+        import reconcile_closed_out
+        log.info("Starting inline P&L reconciliation...")
+        reconcile_closed_out.main()
+        log.info("Inline P&L reconciliation completed successfully.")
+    except Exception as e:
+        log.error("Inline P&L reconciliation failed: %s", e)
+
+
+
 def check_correlation_and_category_gates(mkt: PolyMarket, open_positions: dict[str, Position]) -> tuple[bool, str]:
     # 1. Coarse Category Check
     mkt_category = classify_internal_category(mkt.question or "")
@@ -1238,6 +1258,11 @@ async def strategy_loop(
                         )
                     except Exception as exc:
                         log.debug("record_trade in monitoring failed: %s", exc)
+
+                    try:
+                        await asyncio.to_thread(run_inline_reconciliation)
+                    except Exception as exc:
+                        log.error("Failed to run inline reconciliation: %s", exc)
 
                     del open_positions[token_id]
                     save_open_positions(open_positions)
