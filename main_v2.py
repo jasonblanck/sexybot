@@ -544,6 +544,8 @@ class Signal:
     side:      OrderSide
     strength:  float
     source:    str   # "spike+obi" | "spike" | "obi"
+    confidence: float = 0.0
+    is_sports: bool = False
 
 
 def _hours_to_resolution(end_date: str) -> Optional[float]:
@@ -568,6 +570,170 @@ def _build_regime(market: PolyMarket, book: BookSnapshot) -> MarketRegime:
         spread_cents             = book.spread_cents,
         time_to_resolution_hours = _hours_to_resolution(market.end_date),
     )
+
+
+# In-memory cache for Odds API to boost/dampen momentum signals
+# sport_key -> {"t": timestamp, "events": list_of_events}
+_ODDSAPI_CACHE: dict[str, dict] = {}
+_ODDSAPI_REMAINING: Optional[int] = None
+THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "")
+
+
+def _detect_sport_key(question: str) -> Optional[str]:
+    q = (question or "").lower()
+    league_map = (
+        (("nba ", " nba", "national basketball"),     "basketball_nba"),
+        (("nfl ", " nfl", "super bowl"),              "americanfootball_nfl"),
+        (("mlb ", " mlb", "world series"),            "baseball_mlb"),
+        (("nhl ", " nhl", "stanley cup"),             "icehockey_nhl"),
+        (("ufc ", " ufc"),                            "mma_mixed_martial_arts"),
+        (("premier league", "epl "),                  "soccer_epl"),
+        (("champions league",),                       "soccer_uefa_champs_league"),
+        (("ncaa basketball", "march madness"),        "basketball_ncaab"),
+        (("ncaa football",),                          "americanfootball_ncaaf"),
+        (("mls ",),                                    "soccer_usa_mls"),
+    )
+    padded = f" {q} "
+    for keywords, sport_key in league_map:
+        if any(k in padded for k in keywords):
+            return sport_key
+    return None
+
+
+def _american_to_prob(american: float) -> float:
+    try:
+        a = float(american)
+        if a >= 0:
+            return 100.0 / (a + 100.0)
+        else:
+            return -a / (-a + 100.0)
+    except Exception:
+        return 0.5
+
+
+def _fetch_oddsapi_events_sync(sport_key: str) -> list:
+    global _ODDSAPI_REMAINING
+    if not THE_ODDS_API_KEY or not sport_key:
+        return []
+
+    try:
+        url = (
+            f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+            f"?apiKey={THE_ODDS_API_KEY}&regions=us&markets=h2h&oddsFormat=american"
+        )
+        resp = requests.get(url, timeout=8)
+        if resp.status_code == 200:
+            events = resp.json()
+            rem_hdr = resp.headers.get("x-requests-remaining")
+            if rem_hdr is not None:
+                try:
+                    _ODDSAPI_REMAINING = int(rem_hdr)
+                except ValueError:
+                    pass
+            rows = []
+            for ev in events[:10]:
+                books = ev.get("bookmakers", [])[:2]
+                book_data = []
+                for bk in books:
+                    h2h = next((m for m in bk.get("markets", []) if m.get("key") == "h2h"), None)
+                    if h2h:
+                        outcomes = [(o.get("name", ""), o.get("price")) for o in h2h.get("outcomes", [])]
+                        book_data.append({"book": bk.get("title", ""), "outcomes": outcomes})
+                rows.append({
+                    "home":     ev.get("home_team"),
+                    "away":     ev.get("away_team"),
+                    "commence": ev.get("commence_time", "")[:16],
+                    "books":    book_data,
+                })
+            return rows
+        else:
+            log.warning("OddsAPI fetch returned status %d for %s", resp.status_code, sport_key)
+            return []
+    except Exception as e:
+        log.warning("OddsAPI fetch failed for %s: %s", sport_key, e)
+        return []
+
+
+async def get_recent_sportsbook_odds(question: str) -> Optional[float]:
+    global _ODDSAPI_REMAINING
+    sport_key = _detect_sport_key(question)
+    if not sport_key:
+        return None
+
+    # Check cache
+    now = time.time()
+    cache_entry = _ODDSAPI_CACHE.get(sport_key)
+    if cache_entry and now - cache_entry["t"] < 1800:
+        events = cache_entry["events"]
+    else:
+        if _ODDSAPI_REMAINING is not None and _ODDSAPI_REMAINING < 50:
+            events = cache_entry["events"] if cache_entry else []
+        else:
+            # Fetch asynchronously in executor thread to keep event loop completely non-blocking
+            events = await asyncio.to_thread(_fetch_oddsapi_events_sync, sport_key)
+            if events or not cache_entry:
+                _ODDSAPI_CACHE[sport_key] = {"t": now, "events": events}
+            else:
+                events = cache_entry["events"]
+
+    if not events:
+        return None
+
+    q_low = (question or "").lower()
+    match = None
+    for ev in events:
+        home = (ev.get("home") or "").lower()
+        away = (ev.get("away") or "").lower()
+        if not home or not away:
+            continue
+        
+        home_idx = q_low.find(home) if home in q_low else -1
+        away_idx = q_low.find(away) if away in q_low else -1
+        
+        if home_idx != -1 or away_idx != -1:
+            # If both match, choose the one mentioned first in the question.
+            if home_idx != -1 and away_idx != -1:
+                if home_idx < away_idx:
+                    match = (ev, home, True)  # (event, our_team, is_home)
+                else:
+                    match = (ev, away, False)
+            else:
+                if home_idx != -1:
+                    match = (ev, home, True)
+                else:
+                    match = (ev, away, False)
+            break
+
+    if not match:
+        return None
+
+    ev, our_team, our_team_is_home = match
+    our_probs, opp_probs = [], []
+    for bk in ev.get("books", []):
+        outcomes = dict(bk.get("outcomes", []))
+        for name, price in outcomes.items():
+            if not isinstance(price, (int, float)):
+                continue
+            ip = _american_to_prob(price)
+            if name.lower() == our_team:
+                our_probs.append(ip)
+            else:
+                opp_probs.append(ip)
+
+    if not our_probs or not opp_probs:
+        return None
+
+    our_ip = sum(our_probs) / len(our_probs)
+    opp_ip = sum(opp_probs) / len(opp_probs)
+    total = our_ip + opp_ip
+    if total <= 0:
+        return None
+    our_fair = our_ip / total
+
+    # Since our_team matches the team that is the subject of the YES outcome
+    # (being first mentioned or the only one mentioned), our_fair is the
+    # sportsbook implied probability for the YES side.
+    return our_fair
 
 
 def _audit_discovery(raw_markets: list[PolyMarket]) -> list[dict]:
@@ -887,6 +1053,18 @@ async def estimate_true_probability(
     # 5. Estimate true probability + edge check
     conf_boost = (confidence / 100.0) * 0.12
 
+    # Active sportsbook odds discrepancy boost
+    implied_yes_prob = await get_recent_sportsbook_odds(market.question)
+    if implied_yes_prob is not None:
+        if dominant_side == "YES" and implied_yes_prob - yes_price >= 0.05:
+            conf_boost += 0.05
+            log.info("ODDS DISCREPANCY BOOST (YES) | %s: Sportsbooks imply %.3f vs Polymarket %.3f (+5%% boost applied)", 
+                     market.question[:40], implied_yes_prob, yes_price)
+        elif dominant_side == "NO" and yes_price - implied_yes_prob >= 0.05:
+            conf_boost += 0.05
+            log.info("ODDS DISCREPANCY BOOST (NO) | %s: Sportsbooks imply %.3f vs Polymarket %.3f (+5%% boost applied)", 
+                     market.question[:40], implied_yes_prob, yes_price)
+
     if dominant_side == "YES":
         raw_true_prob = min(yes_price + conf_boost, 0.97)
         side          = OrderSide.BUY
@@ -943,7 +1121,14 @@ async def estimate_true_probability(
         edge=edge,
         fill_price=side_fill_price,
     )
-    return Signal(true_prob=true_prob, side=side, strength=strength, source=source)
+    return Signal(
+        true_prob=true_prob,
+        side=side,
+        strength=strength,
+        source=source,
+        confidence=confidence,
+        is_sports=is_sports,
+    )
 
 
 # ── Strategy loop ──────────────────────────────────────────────────────────────
@@ -1534,14 +1719,25 @@ async def strategy_loop(
             # weaker / noisier signals in thinner books take smaller bets.
             trade_price = (trade_book.best_ask if trade_book and trade_book.best_ask
                            else trade_prob)
+            # Dynamic Kelly Fraction based on historical profitability bands
+            current_fraction = KELLY_FRACTION
+            if signal.is_sports:
+                if 60.0 <= signal.confidence <= 79.9:
+                    # Historically highly profitable cohort (+ $8.95 expected P&L)
+                    current_fraction = 0.50  # Half-Kelly to maximize recovery
+                elif signal.confidence < 40.0:
+                    # Lower conviction signals
+                    current_fraction = 0.15  # Scale down to minimize risk
+
             kelly_dollars = kelly_size(
                 trade_prob, trade_price,
                 cycle_balance.balance if cycle_balance else MAX_ORDER_SIZE,
-                # Regime scale is applied on top of the static KELLY_FRACTION so
+                # Regime scale is applied on top of the dynamic current_fraction so
                 # a macro-cautious call from the detector further throttles sizing
                 # even when book-level regime multiplier would allow more.
-                kelly_fraction  = KELLY_FRACTION * regime_kelly_scale,
+                kelly_fraction  = current_fraction * regime_kelly_scale,
                 max_size        = MAX_ORDER_SIZE,
+                max_pct_of_balance = MAX_POSITION_COST_PCT,
                 signal_strength = signal.strength,
                 regime          = regime,
             )
@@ -1671,7 +1867,7 @@ async def strategy_loop(
                             side           = "BUY",
                             predicted_prob = trade_prob,
                             market_price   = result.fill_price,
-                            kelly_fraction = KELLY_FRACTION * regime_kelly_scale,
+                            kelly_fraction = current_fraction * regime_kelly_scale,
                             kelly_size     = kelly_dollars,
                             ai_reasoning   = f"src={signal.source} strength={signal.strength:.2f}",
                         )

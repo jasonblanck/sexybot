@@ -169,13 +169,14 @@ class Calibrator:
             # populated) don't poison calibration.
             rows = conn.execute(
                 """
-                SELECT predicted_prob, actual_outcome
+                SELECT predicted_prob, actual_outcome, time
                 FROM brier_scores
                 WHERE resolved = 1
                   AND predicted_prob IS NOT NULL
                   AND actual_outcome IS NOT NULL
                   AND (source = ? OR (? = 'default'))
                   AND time >= datetime('now', ?)
+                ORDER BY time ASC
                 """,
                 (self.source, self.source, f"-{self.LOOKBACK_DAYS} days"),
             ).fetchall()
@@ -190,23 +191,46 @@ class Calibrator:
             self._stats = None
             return
 
-        n               = len(rows)
-        signed_errors   = [float(p) - float(a) for p, a in rows]
-        abs_errors      = [abs(e) for e in signed_errors]
-        mean_bias       = sum(signed_errors) / n
-        mae             = sum(abs_errors)    / n
-        hi              = [e for e, (p, _) in zip(signed_errors, rows) if abs(float(p) - 0.5) > 0.2]
-        hi_bias         = (sum(hi) / len(hi)) if hi else 0.0
+        # Apply Exponential Decay (Recent-Weighting)
+        decay_factor = float(os.getenv("SEXYBOT_CALIBRATOR_DECAY", "0.97"))
+        n = len(rows)
+        
+        # Calculate weights: oldest (index 0) has decay_factor^(n-1), newest (index n-1) has decay_factor^0 = 1.0.
+        weights = [decay_factor ** (n - 1 - i) for i in range(n)]
+        sum_weights = sum(weights)
+        if sum_weights <= 0:
+            sum_weights = 1.0
+
+        signed_errors = [float(r[0]) - float(r[1]) for r in rows]
+        abs_errors = [abs(e) for e in signed_errors]
+
+        weighted_mean_bias = sum(w * e for w, e in zip(weights, signed_errors)) / sum_weights
+        weighted_mae = sum(w * ae for w, ae in zip(weights, abs_errors)) / sum_weights
+
+        # High confidence bias
+        hi_signed_errors = []
+        hi_weights = []
+        for r, e, w in zip(rows, signed_errors, weights):
+            if abs(float(r[0]) - 0.5) > 0.2:
+                hi_signed_errors.append(e)
+                hi_weights.append(w)
+        
+        sum_hi_weights = sum(hi_weights)
+        if sum_hi_weights > 0:
+            weighted_hi_bias = sum(w * e for w, e in zip(hi_weights, hi_signed_errors)) / sum_hi_weights
+        else:
+            weighted_hi_bias = 0.0
+
         self._stats = CalibrationStats(
             samples        = n,
-            mean_bias      = round(mean_bias, 4),
-            mae            = round(mae, 4),
-            high_conf_bias = round(hi_bias, 4),
+            mean_bias      = round(weighted_mean_bias, 4),
+            mae            = round(weighted_mae, 4),
+            high_conf_bias = round(weighted_hi_bias, 4),
             generated_at   = time.time(),
         )
         log.info(
-            "Calibrator loaded | source=%s n=%d mean_bias=%+.3f mae=%.3f hi_conf_bias=%+.3f",
-            self.source, n, mean_bias, mae, hi_bias,
+            "Calibrator loaded (exponential decay=%.2f) | source=%s n=%d weighted_mean_bias=%+.3f weighted_mae=%.3f hi_conf_bias=%+.3f",
+            decay_factor, self.source, n, weighted_mean_bias, weighted_mae, weighted_hi_bias,
         )
 
 
