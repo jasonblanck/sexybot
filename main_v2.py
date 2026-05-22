@@ -814,6 +814,26 @@ async def estimate_true_probability(
         strength      = 0.15 + 0.15 * (abs(obi) - OBI_SOLO_MIN) / max(1e-6, 1.0 - OBI_SOLO_MIN)
         confidence    = abs(obi) * 100
 
+    # 4. Sports Confidence Band Filter: Skip unprofitable 40-59 band (inclusive)
+    is_sports = classify_internal_category(market.question or "") == "sports"
+    if is_sports and 40.0 <= confidence <= 59.9:
+        log.info(
+            "SPORTS CONFIDENCE BAND FILTER BLOCKED | %s  conf=%.1f (skipped unprofitable 40-59 band)",
+            market.question[:40],
+            confidence
+        )
+        _shadow(
+            "sports_confidence_filter",
+            spike_has=spike.has_spike,
+            spike_dominant_side=spike.dominant_side,
+            spike_confidence=spike.confidence,
+            spike_ratio=spike.spike_ratio,
+            signal_source=source,
+            signal_strength=strength,
+            confidence=confidence,
+        )
+        return None
+
     # 4. OBI must not actively oppose the signal
     if dominant_side == "YES" and obi < -OBI_CONFIRM_MIN:
         log.debug("OBI opposes YES trade (obi=%+.3f) — skip %s", obi, market.question[:40])
