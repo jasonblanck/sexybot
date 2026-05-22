@@ -34,8 +34,8 @@ already in your shell on the VPS.
 ## 1. Service alive + auth working?
 
 ```bash
-systemctl is-active sexybot
-journalctl -u sexybot --since '2 min ago' --no-pager | grep -E 'Connection failed|Could not derive|Unauthorized|Connected'
+systemctl is-active sexybot-v2
+journalctl -u sexybot-v2 --since '2 min ago' --no-pager | grep -E 'Connection failed|Could not derive|Unauthorized|Connected'
 ```
 
 - `Connected to Polymarket CLOB — OK` → auth fine, jump to #2.
@@ -119,7 +119,7 @@ likely:
 
 Look at recent SIGNAL/ABORT messages:
 ```bash
-journalctl -u sexybot --since '10 min ago' --no-pager | grep -E 'SIGNAL|ABORT' | tail
+journalctl -u sexybot-v2 --since '10 min ago' --no-pager | grep -E 'SIGNAL|ABORT' | tail
 ```
 
 If the same market repeats every cycle, the `pretrade_abort_cooldown` should
@@ -129,7 +129,7 @@ in `skip_counts.cumulative`.
 ## 5. Anthropic dead?
 
 ```bash
-journalctl -u sexybot --since '5 min ago' --no-pager | grep -E 'api.anthropic.com.*HTTP/1.1 [45]' | tail -3
+journalctl -u sexybot-v2 --since '5 min ago' --no-pager | grep -E 'api.anthropic.com.*HTTP/1.1 [45]' | tail -3
 ```
 
 If you see `400 ... credit balance is too low`, top up at
@@ -156,10 +156,10 @@ curl -sk -H "x-api-key: $APIKEY" https://159.65.201.165/status \
   | python3 -m json.tool | head -50
 echo
 echo "=== last 30m errors ==="
-journalctl -u sexybot --since '30 min ago' --no-pager | grep -cE 'ERROR|WARNING'
+journalctl -u sexybot-v2 --since '30 min ago' --no-pager | grep -cE 'ERROR|WARNING'
 echo
 echo "=== last 30m signals ==="
-journalctl -u sexybot --since '30 min ago' --no-pager | grep SIGNAL | wc -l
+journalctl -u sexybot-v2 --since '30 min ago' --no-pager | grep SIGNAL | wc -l
 BC
 ```
 
@@ -193,7 +193,7 @@ curl -sk -H "x-api-key: $APIKEY" https://159.65.201.165/status \
   | python3 -c "import sys,json; sc=json.load(sys.stdin)['skip_counts']['cumulative']; [print(f'{v:>5} {k}') for k,v in sorted(sc.items(), key=lambda x: -x[1])]"
 
 # Recent activity
-journalctl -u sexybot --since '5 min ago' --no-pager | grep -E 'SIGNAL|EXECUTED|ABORT|EDGE SKIP|KELLY SKIP' | tail -10
+journalctl -u sexybot-v2 --since '5 min ago' --no-pager | grep -E 'SIGNAL|EXECUTED|ABORT|EDGE SKIP|KELLY SKIP' | tail -10
 
 # Force a deploy (bypassing the 1-min cron)
 bash /root/polybot/deploy-pull.sh && tail -2 /var/log/sexybot-deploy.log

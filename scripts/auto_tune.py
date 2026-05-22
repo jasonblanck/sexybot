@@ -133,7 +133,7 @@ def main() -> None:
         print(f"KELLY_FRACTION={best['kelly_fraction']}")
         print(f"MAX_ENTRY_PRICE={best['max_entry_price']}")
         print()
-        print("To apply: edit /root/polybot/.env, then `systemctl restart sexybot`.")
+        print("To apply: edit /root/polybot/.env, then `systemctl restart sexybot-v2`.")
         print("Validate via paper-trade or a few small positions before enabling")
         print("on full size — the linear PnL scaling is approximate.")
 

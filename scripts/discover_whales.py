@@ -8,7 +8,7 @@ manually copy the addresses they want to track into:
 
     POLYMARKET_WHALE_WALLETS=0xaaa...,0xbbb...,...
 
-in /root/polybot/.env, then `systemctl restart sexybot`.
+in /root/polybot/.env, then `systemctl restart sexybot-v2`.
 
 Notes:
 - "Top by volume" ≠ "consistently profitable". Volume is a first-pass
@@ -152,7 +152,7 @@ def main() -> None:
     print(f"  1. Review {STAGING_FILE} — verify each wallet's public Polymarket profile.")
     print("  2. Volume ≠ profitable. Filter to ones with positive realized PnL on the leaderboard.")
     print("  3. Replace the POLYMARKET_WHALE_WALLETS line in /root/polybot/.env.")
-    print("  4. systemctl restart sexybot")
+    print("  4. systemctl restart sexybot-v2")
     print("  5. Their on-chain positions in candidate markets become AI signal.")
 
 

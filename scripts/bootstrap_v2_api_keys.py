@@ -29,7 +29,7 @@ Usage:
 Then paste the three values into POLYMARKET_API_KEY / POLYMARKET_API_SECRET /
 POLYMARKET_API_PASSPHRASE in /root/polybot/.env on the VPS, and:
 
-  systemctl restart sexybot
+  systemctl restart sexybot-v2
 
 Refs: github.com/Polymarket/py-clob-client issues #335 #337
 """
@@ -97,7 +97,7 @@ def main() -> int:
     print(f"POLYMARKET_API_PASSPHRASE={creds['passphrase']}")
     print("\nPaste those three lines into /root/polybot/.env (replace the "
           "existing POLYMARKET_API_* lines), then:", file=sys.stderr)
-    print("  systemctl restart sexybot", file=sys.stderr)
+    print("  systemctl restart sexybot-v2", file=sys.stderr)
     return 0
 
 

@@ -40,7 +40,7 @@ curl "https://data-api.polymarket.com/positions?user=$(ssh root@159.65.201.165 '
 ## 1. Is the service running?
 
 ```sh
-ssh root@159.65.201.165 "systemctl is-active sexybot && journalctl -u sexybot -n 20 --no-pager"
+ssh root@159.65.201.165 "systemctl is-active sexybot-v2 && journalctl -u sexybot-v2 -n 20 --no-pager"
 ```
 
 If it's `failed` or `inactive`, look at the journal tail for the
@@ -63,7 +63,7 @@ that happens.
 Bucket the error first — that tells you which fix:
 
 ```sh
-ssh root@159.65.201.165 "journalctl -u sexybot --since '4 hours ago' --no-pager \
+ssh root@159.65.201.165 "journalctl -u sexybot-v2 --since '4 hours ago' --no-pager \
   | grep -oE 'status_code=[0-9]+|order_version_mismatch|allowance|Could not derive' \
   | sort | uniq -c | sort -rn"
 ```
@@ -79,7 +79,7 @@ ssh root@159.65.201.165 "journalctl -u sexybot --since '4 hours ago' --no-pager 
 ## 4. Can the bot read its balance?
 
 ```sh
-ssh root@159.65.201.165 "journalctl -u sexybot --since '5 minutes ago' --no-pager \
+ssh root@159.65.201.165 "journalctl -u sexybot-v2 --since '5 minutes ago' --no-pager \
   | grep -E 'Cash:|on-chain|get_balance' | tail -10"
 ```
 
@@ -104,7 +104,7 @@ pip install curl_cffi py_clob_client_v2 python-dotenv
 scp root@159.65.201.165:/root/polybot/.env /tmp/polybot.env
 python scripts/bootstrap_v2_api_keys.py /tmp/polybot.env
 # paste the three POLYMARKET_API_* lines into /root/polybot/.env
-ssh root@159.65.201.165 systemctl restart sexybot
+ssh root@159.65.201.165 systemctl restart sexybot-v2
 shred -u /tmp/polybot.env
 ```
 
@@ -135,7 +135,7 @@ gpg --batch --decrypt \
     --passphrase "$(cat ~/Library/Mobile\ Documents/com~apple~CloudDocs/sexybot-backup-passphrase.txt)" \
     sexybot-backup-YYYYMMDD-HHMM.tgz.gpg | tar xzv
 # yields .env and trades.db — drop into /root/polybot/ on a new VPS,
-# install dependencies (see CLAUDE.md), and `systemctl start sexybot`.
+# install dependencies (see CLAUDE.md), and `systemctl start sexybot-v2`.
 ```
 
 If you need to decrypt on the Mac and don't have GPG yet:

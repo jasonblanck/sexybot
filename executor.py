@@ -120,16 +120,20 @@ def _parse_balance(raw: dict) -> BalanceInfo:
     """
     Parse the V2 /balance-allowance response.
     Response: {'balance': '213800000', 'allowances': {'0x4bFb...': '0', ...}}
-    Returns the maximum allowance across CTF Exchange V2 and NegRisk Exchange
-    (both use the same USDC.e collateral; whichever has allowance is usable).
-    Lookup is case-insensitive to guard against mixed-case API responses.
+    Returns the maximum allowance across all returned spenders. This is robust
+    to future on-chain contract and spender address rotations.
     """
     balance_raw = int(float(raw.get("balance", "0") or "0"))
     allowances  = raw.get("allowances", {})
-    lc          = {k.lower(): v for k, v in allowances.items()}
-    allow_ctf   = int(float(lc.get(CTF_EXCHANGE.lower(),  "0") or "0"))
-    allow_nr    = int(float(lc.get(NEG_RISK_CTF.lower(),  "0") or "0"))
-    allowance_raw = max(allow_ctf, allow_nr)
+    
+    parsed_allowances = []
+    for k, v in allowances.items():
+        try:
+            parsed_allowances.append(int(float(v or "0")))
+        except (ValueError, TypeError):
+            continue
+            
+    allowance_raw = max(parsed_allowances) if parsed_allowances else 0
     return BalanceInfo(balance_raw=balance_raw, allowance_raw=allowance_raw)
 
 

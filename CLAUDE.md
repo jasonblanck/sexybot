@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Infrastructure
 
 - **VPS**: DigitalOcean at `159.65.201.165` — always-on, runs the bot 24/7
-- **Service**: `sexybot` (systemd) — auto-starts on boot. Unit file lives at `/etc/systemd/system/sexybot.service` on the VPS; canonical copy in repo at [scripts/sexybot.service](scripts/sexybot.service).
+- **Service**: `sexybot-v2` (systemd) — auto-starts on boot. Unit file lives at `/etc/systemd/system/sexybot-v2.service` on the VPS.
 - **Code root**: `/root/polybot/` on the VPS
 - **Dashboard**: nginx serves `index.html` from `/var/www/html/`, proxies API to port 8000
 - **GitHub**: `github.com/jasonblanck/sexybot` — source of truth for all code
@@ -19,9 +19,9 @@ See [docs/disaster_recovery.md](docs/disaster_recovery.md) — runbook for `orde
 ```bash
 # VPS management
 ssh root@159.65.201.165
-systemctl restart sexybot
-systemctl status sexybot
-journalctl -u sexybot -f          # live logs
+systemctl restart sexybot-v2
+systemctl status sexybot-v2
+journalctl -u sexybot-v2 -f          # live logs
 tail -f /var/log/sexybot-deploy.log  # auto-deploy log (cron writes here on every deploy)
 
 # Deploy local changes to VPS — just push to main. The VPS cron pulls + restarts within 60s.
@@ -36,7 +36,7 @@ ssh root@159.65.201.165 "cd /root/polybot && /root/polybot/deploy-pull.sh"
 ssh root@159.65.201.165 "nginx -t && systemctl reload nginx"
 
 # Emergency kill switch — drops the bot to rule-based strategies, no Claude calls
-ssh root@159.65.201.165 "echo 'CLAUDE_MAX_DISABLE=true' >> /root/polybot/.env && systemctl restart sexybot"
+ssh root@159.65.201.165 "echo 'CLAUDE_MAX_DISABLE=true' >> /root/polybot/.env && systemctl restart sexybot-v2"
 ```
 
 ## Architecture
@@ -98,7 +98,7 @@ The `.env` file lives on the VPS at `/root/polybot/.env` and is **never committe
 
 ## Auto-Deploy (VPS cron pull)
 
-The VPS pulls `main` from GitHub every minute via cron and restarts sexybot + nginx on any change.
+The VPS pulls `main` from GitHub every minute via cron and restarts sexybot-v2 + nginx on any change.
 
 ```bash
 # Installed script
@@ -111,7 +111,7 @@ The VPS pulls `main` from GitHub every minute via cron and restarts sexybot + ng
 /var/log/sexybot-deploy.log
 ```
 
-Flow: merge PR → `main` updates → within ≤60s the cron tick pulls, resets, copies `index.html` + `login.html` to nginx root, syncs `nginx.conf` to `/etc/nginx/sites-enabled/default` (auto-reverts if `nginx -t` rejects the new config), reloads nginx, restarts sexybot, logs the deploy. Failures are captured in `/var/log/sexybot-deploy.log`. To reinstall if it ever gets removed, see `scripts/deploy-pull.sh` header for the install commands.
+Flow: merge PR → `main` updates → within ≤60s the cron tick pulls, resets, copies `index.html` + `login.html` to nginx root, syncs `nginx.conf` to `/etc/nginx/sites-enabled/default` (auto-reverts if `nginx -t` rejects the new config), reloads nginx, restarts sexybot-v2, logs the deploy. Failures are captured in `/var/log/sexybot-deploy.log`. To reinstall if it ever gets removed, see `scripts/deploy-pull.sh` header for the install commands.
 
 ## New Mac / New Machine Setup
 
