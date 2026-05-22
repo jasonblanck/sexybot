@@ -124,7 +124,16 @@ def main():
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)
         res = client.get_balance_allowance(params)
         clob_bal = float(res.get("balance", 0)) / 1_000_000
-        clob_allow = float(res.get("allowance", 0)) / 1_000_000
+        
+        allowances = res.get("allowances", {})
+        parsed_allowances = []
+        for k, v in allowances.items():
+            try:
+                parsed_allowances.append(float(v or 0) / 1_000_000)
+            except (ValueError, TypeError):
+                continue
+        clob_allow = max(parsed_allowances) if parsed_allowances else 0.0
+        
         print(f"  CLOB Cash Balance:  ${clob_bal:.4f}")
         print(f"  CLOB Cash Allowance: ${clob_allow:.4f}")
     except Exception as e:
