@@ -97,7 +97,7 @@ MARKET_REFRESH_CYCLES = 20   # re-discover markets every N scan cycles
 PROFIT_TARGET         = float(os.getenv("PROFIT_TARGET", "0.08"))   # 8% gain → close (base; dynamic)
 STOP_LOSS             = float(os.getenv("STOP_LOSS",     "0.05"))   # 5% loss → close (base; dynamic)
 KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.25"))  # Quarter Kelly
-MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))  # Max open positions to limit correlated risk
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", os.getenv("MAX_OPEN_POSITIONS", "3")))  # Max open positions to limit correlated risk
 MAX_POSITION_COST_PCT    = float(os.getenv("MAX_POSITION_COST_PCT", "0.15"))  # Max 15% of wallet balance per position
 # Time-based exit: if a position doesn't hit profit/stop within this window,
 # close at current bid rather than continuing to hold dead inventory. Helps

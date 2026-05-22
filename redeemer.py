@@ -128,6 +128,24 @@ SAFE_ABI = [
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
     },
+    {
+        "name": "getTransactionHash",
+        "type": "function",
+        "inputs": [
+            {"name": "to",             "type": "address"},
+            {"name": "value",          "type": "uint256"},
+            {"name": "data",           "type": "bytes"},
+            {"name": "operation",      "type": "uint8"},
+            {"name": "safeTxGas",      "type": "uint256"},
+            {"name": "baseGas",        "type": "uint256"},
+            {"name": "gasPrice",       "type": "uint256"},
+            {"name": "gasToken",       "type": "address"},
+            {"name": "refundReceiver", "type": "address"},
+            {"name": "nonce",          "type": "uint256"}
+        ],
+        "outputs": [{"name": "", "type": "bytes32"}],
+        "stateMutability": "view"
+    }
 ]
 
 # EIP-712 type hashes for Gnosis Safe
@@ -197,9 +215,23 @@ def _exec_safe_tx(
     to:          str,
     data:        bytes,
 ) -> str:
-    """Build, sign, and broadcast a Safe transaction. Returns tx hash."""
+    """Build, sign, and broadcast a Safe transaction. Returns tx hash after confirmation."""
     nonce = safe.functions.nonce().call()
-    tx_hash = _safe_tx_hash(safe.address, to, data, nonce)
+    
+    # Query the on-chain Safe contract to get the exact expected transaction hash
+    tx_hash = safe.functions.getTransactionHash(
+        to,
+        0,
+        data,
+        0, # operation = CALL
+        0, # safeTxGas
+        0, # baseGas
+        0, # gasPrice
+        "0x0000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000",
+        nonce
+    ).call()
+    
     sig = _sign_safe_tx(private_key, tx_hash)
 
     gas_price = w3.eth.gas_price
@@ -224,6 +256,13 @@ def _exec_safe_tx(
 
     signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
     tx_hash_sent = w3.eth.send_raw_transaction(signed.raw_transaction)
+    
+    # Wait for the transaction to be mined to guarantee sequential nonce updates
+    log.info("Safe Tx sent, hash: %s. Waiting for confirmation...", tx_hash_sent.hex())
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash_sent, timeout=120)
+    if receipt.get("status") != 1:
+        raise RuntimeError(f"Safe transaction failed: {tx_hash_sent.hex()}")
+    log.info("Safe Tx confirmed in block %d", receipt.get("blockNumber"))
     return tx_hash_sent.hex()
 
 
