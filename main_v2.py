@@ -436,7 +436,16 @@ async def reconcile_positions_on_startup(executor: ClobExecutor, open_positions:
             asset = p.get("asset")
             size = float(p.get("size", 0) or 0)
             avg_price = float(p.get("avgPrice", 0) or 0)
+            cur_price = float(p.get("curPrice", 0) or 0)
+            redeemable = p.get("redeemable", False)
             title = p.get("title", "")
+            
+            # Skip resolved/redeemable positions (their on-chain size remains > 0 until redeemed,
+            # but they have zero trading value and trying to exit them results in 404/invalid errors).
+            if cur_price == 0 or redeemable:
+                log.info("Reconciliation: skipping resolved/redeemable on-chain asset %s (%s)", asset[:14], title[:40])
+                continue
+                
             if asset and size > 0:
                 onchain_tids[asset] = {
                     "size": size,
@@ -985,6 +994,12 @@ async def strategy_loop(
                     log.debug("discovery audit (refresh) failed: %s", exc)
             except Exception as exc:
                 log.warning("Market refresh failed (keeping old list): %s", exc)
+
+            # Periodically reconcile local state with on-chain holdings to prune resolved/stale positions
+            try:
+                await reconcile_positions_on_startup(executor, open_positions)
+            except Exception as exc:
+                log.error("Periodic on-chain position reconciliation failed: %s", exc)
 
         # Fetch balance once per cycle via thread so the event loop stays free
         try:

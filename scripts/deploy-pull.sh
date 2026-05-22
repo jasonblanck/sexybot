@@ -70,13 +70,13 @@ nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
 # fire a Telegram alert so the operator notices before the next trade window.
 # Reads TELEGRAM_TOKEN / TELEGRAM_CHAT_ID out of .env; silent no-op if either
 # is missing (e.g. fresh install before telegram is configured).
-if ! systemctl restart sexybot; then
+if ! systemctl restart sexybot-v2; then
     echo "$(date -u '+%F %T'): RESTART FAILED after pull to ${NEW:0:8}" >> /var/log/sexybot-deploy.log
 
     TG_TOKEN=$(grep -E '^TELEGRAM_TOKEN=' /root/polybot/.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')
     TG_CHAT=$(grep -E '^TELEGRAM_CHAT_ID=' /root/polybot/.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')
     if [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ]; then
-        MSG="🚨 sexybot RESTART FAILED after deploy to ${NEW:0:8}. Bot is DOWN. Check: journalctl -u sexybot -n 50"
+        MSG="🚨 sexybot-v2 RESTART FAILED after deploy to ${NEW:0:8}. Bot is DOWN. Check: journalctl -u sexybot-v2 -n 50"
         curl -s --max-time 5 -X POST \
             "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -d "chat_id=${TG_CHAT}" \
