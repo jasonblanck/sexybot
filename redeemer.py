@@ -256,10 +256,77 @@ class PositionRedeemer:
         self._signer_addr = Web3.to_checksum_address(signer_address)
         self._dry_run     = dry_run
         self._last_check  = 0.0
-        self._w3          = Web3(Web3.HTTPProvider(POLYGON_RPC, request_kwargs={"timeout": 20}))
-        self._safe        = self._w3.eth.contract(address=self._safe_addr, abi=SAFE_ABI)
-        self._ctf         = self._w3.eth.contract(address=CTF_ADDRESS, abi=CTF_ABI)
-        self._neg_risk    = self._w3.eth.contract(address=NEG_RISK_ADAPTER, abi=NEG_RISK_ABI)
+        
+        # Build robust multi-RPC fallback pool
+        import os
+        alchemy_key = os.getenv("ALCHEMY_API_KEY", "")
+        self._rpc_urls = []
+        if alchemy_key:
+            self._rpc_urls.append(f"https://polygon-mainnet.g.alchemy.com/v2/{alchemy_key}")
+        
+        # Add public endpoints as fallbacks
+        self._rpc_urls.extend([
+            "https://polygon-rpc.com",
+            POLYGON_RPC,  # "https://polygon.drpc.org"
+            "https://polygon.llamarpc.com",
+            "https://polygon-bor-rpc.publicnode.com"
+        ])
+        
+        self._current_rpc_index = 0
+        self._active_w3 = None
+        self._safe = None
+        self._ctf = None
+        self._neg_risk = None
+        
+        # Eagerly initialize Web3 with the first working endpoint
+        self._get_w3()
+
+    def _get_w3(self) -> Web3:
+        """
+        Returns a Web3 instance using the currently active RPC.
+        Does not recreate the Web3 instance unless necessary.
+        """
+        if self._active_w3 is None:
+            rpc_url = self._rpc_urls[self._current_rpc_index]
+            # Mask API key in print/log
+            print_url = rpc_url
+            if "alchemy" in rpc_url:
+                print_url = rpc_url[:35] + "..." + rpc_url[-5:]
+            log.info("PositionRedeemer: initializing Web3 with RPC %s", print_url)
+            
+            self._active_w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 20}))
+            self._safe      = self._active_w3.eth.contract(address=self._safe_addr, abi=SAFE_ABI)
+            self._ctf       = self._active_w3.eth.contract(address=CTF_ADDRESS, abi=CTF_ABI)
+            self._neg_risk  = self._active_w3.eth.contract(address=NEG_RISK_ADAPTER, abi=NEG_RISK_ABI)
+        return self._active_w3
+
+    def _execute_with_rpc_fallback(self, func, *args, **kwargs):
+        """
+        Executes a function that makes RPC calls.
+        If it fails, rotates the RPC endpoint and retries.
+        """
+        max_attempts = len(self._rpc_urls)
+        last_exc = None
+        for attempt in range(max_attempts):
+            try:
+                w3 = self._get_w3()
+                return func(w3, *args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                active_url = self._rpc_urls[self._current_rpc_index]
+                if "alchemy" in active_url:
+                    active_url = active_url[:35] + "..." + active_url[-5:]
+                log.warning(
+                    "PositionRedeemer: RPC error on attempt %d/%d (using %s): %s",
+                    attempt + 1, max_attempts, active_url, exc
+                )
+                # Rotate to the next RPC
+                self._current_rpc_index = (self._current_rpc_index + 1) % len(self._rpc_urls)
+                self._active_w3 = None  # Force re-creation
+        
+        # If all attempts fail, raise the last exception
+        if last_exc:
+            raise last_exc
 
     def run_once(self) -> int:
         """
@@ -279,7 +346,7 @@ class PositionRedeemer:
             log.warning("PositionRedeemer: failed to fetch positions: %s", exc)
             return 0
 
-        redeemable = [p for p in positions if p.get("redeemable") and float(p.get("curPrice", 0)) > 0]
+        redeemable = [p for p in positions if p.get("redeemable") and float(p.get("size", 0)) > 0]
         mergeable_pairs = self._group_mergeable(positions)
 
         tx_count = 0
@@ -354,18 +421,23 @@ class PositionRedeemer:
             outcome_index = pos.get("outcomeIndex", 0)
             index_set = 1 << outcome_index
             
-            # Query the on-chain CTF contract
-            coll_id = self._ctf.functions.getCollectionId(NULL_BYTES32, cid, index_set).call()
-            
-            # Check USDC first
-            usdc_id = self._ctf.functions.getPositionId(USDC_addr, coll_id).call()
-            if usdc_id == asset_id:
-                return USDC_addr
+            def _do_rpc(w3):
+                # Query the on-chain CTF contract
+                coll_id = self._ctf.functions.getCollectionId(NULL_BYTES32, cid, index_set).call()
                 
-            # Check pUSD
-            pusd_id = self._ctf.functions.getPositionId(pUSD_addr, coll_id).call()
-            if pusd_id == asset_id:
+                # Check USDC first
+                usdc_id = self._ctf.functions.getPositionId(USDC_addr, coll_id).call()
+                if usdc_id == asset_id:
+                    return USDC_addr
+                    
+                # Check pUSD
+                pusd_id = self._ctf.functions.getPositionId(pUSD_addr, coll_id).call()
+                if pusd_id == asset_id:
+                    return pUSD_addr
+                    
                 return pUSD_addr
+
+            return self._execute_with_rpc_fallback(_do_rpc)
                 
         except Exception as exc:
             log.warning("PositionRedeemer: failed to dynamically resolve collateral address: %s", exc)
@@ -394,12 +466,6 @@ class PositionRedeemer:
             # Build array large enough for this outcome index (NegRisk can have >2 outcomes)
             amounts = [0] * max(2, outcome_index + 1)
             amounts[outcome_index] = size_scaled
-            # web3.py 7.x renamed encodeABI(fn_name=…) to
-            # encode_abi(abi_element_identifier=…) — the old camelCase
-            # name silently raised AttributeError on every redeem,
-            # leaving winning positions stuck on Polymarket as
-            # unredeemed value (showed up as a cash mismatch between
-            # the bot dashboard and polymarket.com).
             data = self._neg_risk.encode_abi(abi_element_identifier="redeemPositions", args=[cid, amounts])
             target = NEG_RISK_ADAPTER
         else:
@@ -412,7 +478,10 @@ class PositionRedeemer:
             )
             target = CTF_ADDRESS
 
-        tx = _exec_safe_tx(self._w3, self._safe, self._pk, self._signer_addr, target, bytes.fromhex(data[2:]))
+        def _do_redeem(w3):
+            return _exec_safe_tx(w3, self._safe, self._pk, self._signer_addr, target, bytes.fromhex(data[2:]))
+
+        tx = self._execute_with_rpc_fallback(_do_redeem)
         log.info("REDEEMED | %s  tx=%s", title, tx)
         return True
 
@@ -451,6 +520,9 @@ class PositionRedeemer:
             )
             target = CTF_ADDRESS
 
-        tx = _exec_safe_tx(self._w3, self._safe, self._pk, self._signer_addr, target, bytes.fromhex(data[2:]))
+        def _do_merge(w3):
+            return _exec_safe_tx(w3, self._safe, self._pk, self._signer_addr, target, bytes.fromhex(data[2:]))
+
+        tx = self._execute_with_rpc_fallback(_do_merge)
         log.info("MERGED | %s  tx=%s", title, tx)
         return True
