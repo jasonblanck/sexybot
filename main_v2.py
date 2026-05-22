@@ -234,8 +234,9 @@ class Position:
 
 def save_open_positions(open_positions: dict[str, Position]) -> None:
     import json
+    import threading
     data = {}
-    for tid, pos in open_positions.items():
+    for tid, pos in list(open_positions.items()):
         data[tid] = {
             "token_id": pos.token_id,
             "entry_price": pos.entry_price,
@@ -255,11 +256,15 @@ def save_open_positions(open_positions: dict[str, Position]) -> None:
             "entry_order_id": pos.entry_order_id,
             "entry_order_time": pos.entry_order_time,
         }
-    try:
-        with open("open_positions.json", "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        log.error("Failed to save open_positions.json: %s", e)
+    
+    def _write():
+        try:
+            with open("open_positions.json", "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            log.error("Failed to save open_positions.json: %s", e)
+
+    threading.Thread(target=_write, daemon=True).start()
 
 
 def load_open_positions() -> dict[str, Position]:
@@ -471,7 +476,7 @@ async def reconcile_positions_on_startup(executor: ClobExecutor, open_positions:
                 log.warning("Reconciliation: untracked active on-chain position found for %s (%s). Reconstructing...",
                             tid[:14], title[:40])
 
-                db_trade = get_last_buy_trade(tid)
+                db_trade = await asyncio.to_thread(get_last_buy_trade, tid)
                 if db_trade:
                     entry_price = float(db_trade.get("price", avg_price) or avg_price)
                     try:
@@ -1076,7 +1081,7 @@ async def estimate_true_probability(
     # history to have learned the model's bias). The calibrator shrinks
     # overconfident tails toward 0.5; under-confident middle predictions
     # are nudged outward. No-op when the DB / calibration data is missing.
-    true_prob = calibrator.adjust(raw_true_prob) if calibrator is not None else raw_true_prob
+    true_prob = await asyncio.to_thread(calibrator.adjust, raw_true_prob) if calibrator is not None else raw_true_prob
 
     if side == OrderSide.BUY:
         edge = true_prob - (book.best_ask or yes_price)
@@ -1165,8 +1170,11 @@ async def strategy_loop(
         # receive WS data since BookManager subscriptions are fixed at startup.
         if cycle_count[0] % MARKET_REFRESH_CYCLES == 0:
             try:
-                fresh_raw = fetch_markets(
-                    min_liquidity=MIN_LIQUIDITY, min_volume=MIN_VOLUME_24H, max_pages=3
+                fresh_raw = await asyncio.to_thread(
+                    fetch_markets,
+                    min_liquidity=MIN_LIQUIDITY,
+                    min_volume=MIN_VOLUME_24H,
+                    max_pages=3
                 )
                 fresh = (
                     MarketFilter(fresh_raw)
@@ -1317,7 +1325,7 @@ async def strategy_loop(
         # detector is disabled or the DB is missing — behaviour then matches the
         # pre-integration baseline.
         regime_state: Optional[RegimeState] = (
-            regime_reader.current() if (regime_reader is not None and REGIME_RESPECT) else None
+            await asyncio.to_thread(regime_reader.current) if (regime_reader is not None and REGIME_RESPECT) else None
         )
         regime_kelly_scale = 1.0
         skip_obi_only     = False

@@ -60,18 +60,41 @@ def _connect(db_path: str) -> Optional[sqlite3.Connection]:
         return None
 
 
+_SCHEMA_CALIB_ENSURED = False
+
+
 def _ensure_source_column(conn: sqlite3.Connection) -> None:
     """
-    Add `source` column to brier_scores if it doesn't exist.
+    Add `source` column and index to brier_scores if they don't exist.
     Lets multiple prediction models share the same table without their
     biases contaminating each other's calibration.
     """
+    global _SCHEMA_CALIB_ENSURED
+    if _SCHEMA_CALIB_ENSURED:
+        return
     try:
-        conn.execute("ALTER TABLE brier_scores ADD COLUMN source TEXT")
-        conn.commit()
-        log.info("calibrator: added source column to brier_scores")
-    except sqlite3.OperationalError:
-        pass   # already present, or table doesn't exist yet
+        # Check if table exists first before running ALTER/INDEX
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='brier_scores'")
+        if not cur.fetchone():
+            return
+
+        try:
+            conn.execute("ALTER TABLE brier_scores ADD COLUMN source TEXT")
+            conn.commit()
+            log.info("calibrator: added source column to brier_scores")
+        except sqlite3.OperationalError:
+            pass  # already present
+
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_brier_scores_calib ON brier_scores(source, resolved, time)")
+            conn.commit()
+            log.info("calibrator: created index idx_brier_scores_calib on brier_scores")
+        except sqlite3.OperationalError as e:
+            log.debug("calibrator: index creation failed: %s", e)
+
+        _SCHEMA_CALIB_ENSURED = True
+    except Exception as e:
+        log.debug("_ensure_source_column failed: %s", e)
 
 
 # ── Calibrator ─────────────────────────────────────────────────────────────────
