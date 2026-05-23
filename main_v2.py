@@ -1539,8 +1539,15 @@ async def strategy_loop(
                                 token_id[:14], "missing" if book is None else ("stale" if book.is_stale else "lacks best bid"))
                     rest_book = await asyncio.to_thread(executor._client.get_order_book, token_id)
                     if rest_book:
-                        bids = [Level(price=float(b["price"]), size=float(b["size"])) for b in rest_book.get("bids", [])]
-                        asks = [Level(price=float(a["price"]), size=float(a["size"])) for a in rest_book.get("asks", [])]
+                        bids = sorted(
+                            [Level(price=float(b["price"]), size=float(b["size"])) for b in rest_book.get("bids", [])],
+                            key=lambda x: x.price,
+                            reverse=True
+                        )
+                        asks = sorted(
+                            [Level(price=float(a["price"]), size=float(a["size"])) for a in rest_book.get("asks", [])],
+                            key=lambda x: x.price
+                        )
                         book = BookSnapshot(
                             token_id=token_id,
                             bids=bids,

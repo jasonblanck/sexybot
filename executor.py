@@ -432,8 +432,15 @@ class ClobExecutor:
                 rest_book = self._client.get_order_book(token_id_str)
                 if rest_book:
                     from orderbook_ws import Level, BookSnapshot
-                    bids = [Level(price=float(b["price"]), size=float(b["size"])) for b in rest_book.get("bids", [])]
-                    asks = [Level(price=float(a["price"]), size=float(a["size"])) for a in rest_book.get("asks", [])]
+                    bids = sorted(
+                        [Level(price=float(b["price"]), size=float(b["size"])) for b in rest_book.get("bids", [])],
+                        key=lambda x: x.price,
+                        reverse=True
+                    )
+                    asks = sorted(
+                        [Level(price=float(a["price"]), size=float(a["size"])) for a in rest_book.get("asks", [])],
+                        key=lambda x: x.price
+                    )
                     book = BookSnapshot(
                         token_id=token_id_str,
                         bids=bids,

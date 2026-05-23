@@ -135,6 +135,10 @@ class PolymarketPaperHandler:
         bids  = book.get("bids", [])
         asks  = book.get("asks", [])
 
+        # Sort bids descending (highest/best first) and asks ascending (lowest/best first)
+        bids = sorted(bids, key=lambda x: float(x["price"]), reverse=True)
+        asks = sorted(asks, key=lambda x: float(x["price"]))
+
         best_bid = float(bids[0]["price"]) if bids else 0.45
         best_ask = float(asks[0]["price"]) if asks else 0.55
         mid = round((best_bid + best_ask) / 2, 6)
@@ -384,7 +388,9 @@ class PolymarketPaperHandler:
                 bids = book.get("bids", [])
                 asks = book.get("asks", [])
                 if bids and asks:
-                    mid = round((float(bids[0]["price"]) + float(asks[0]["price"])) / 2, 4)
+                    best_bid = max(float(b["price"]) for b in bids)
+                    best_ask = min(float(a["price"]) for a in asks)
+                    mid = round((best_bid + best_ask) / 2, 4)
                 else:
                     mid = pos["avg_price"]
                 cur_val = round(mid * pos["shares"], 4)
@@ -447,8 +453,8 @@ class PolymarketPaperHandler:
                 asks = book.get("asks", [])
                 if not bids and not asks:
                     continue
-                best_bid = float(bids[0]["price"]) if bids else 0.5
-                best_ask = float(asks[0]["price"]) if asks else 0.5
+                best_bid = max(float(b["price"]) for b in bids) if bids else 0.5
+                best_ask = min(float(a["price"]) for a in asks) if asks else 0.5
                 mid = (best_bid + best_ask) / 2
 
                 if mid >= 0.99:
