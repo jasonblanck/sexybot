@@ -314,7 +314,7 @@ def run_inline_reconciliation() -> None:
             sys.path.append(scripts_dir)
         import reconcile_closed_out
         log.info("Starting inline P&L reconciliation...")
-        reconcile_closed_out.main()
+        reconcile_closed_out.main([])
         log.info("Inline P&L reconciliation completed successfully.")
     except Exception as e:
         log.error("Inline P&L reconciliation failed: %s", e)

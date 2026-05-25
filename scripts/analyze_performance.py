@@ -63,11 +63,22 @@ def _print_table(title: str, rows: list[tuple], header: tuple[str, ...]) -> None
         print("  (no rows)")
 
 
+def _is_won(r: sqlite3.Row) -> bool:
+    won = r["won"]
+    if won is not None:
+        return bool(won)
+    pnl = r["realized_pnl"]
+    if pnl is not None:
+        return pnl > 0
+    return False
+
+
 # ── Data model ─────────────────────────────────────────────────────────────────
 
-def fetch_resolved_trades(conn: sqlite3.Connection, days: int) -> list[sqlite3.Row]:
+def fetch_resolved_trades(conn: sqlite3.Connection, days: int, include_dry_run: bool = False) -> list[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
-    q = """
+    dry_run_clause = "" if include_dry_run else "AND (dry_run IS NULL OR dry_run = 0)"
+    q = f"""
     SELECT
         id, market, side, amount, price, shares, status,
         dry_run, time, token_id,
@@ -77,7 +88,7 @@ def fetch_resolved_trades(conn: sqlite3.Connection, days: int) -> list[sqlite3.R
     FROM trades
     WHERE resolved = 1
       AND realized_pnl IS NOT NULL
-      AND (dry_run IS NULL OR dry_run = 0)
+      {dry_run_clause}
       AND time >= datetime('now', ?)
     ORDER BY time ASC
     """
@@ -109,7 +120,7 @@ def summarize_group(rows: Iterable[sqlite3.Row], key: str) -> list[tuple]:
         k = (r[key] or "(none)")
         b = buckets[str(k)]
         b["n"]        += 1
-        b["won"]      += 1 if (r["won"] or 0) else 0
+        b["won"]      += 1 if _is_won(r) else 0
         b["pnl"]      += float(r["realized_pnl"] or 0)
         b["notional"] += abs(float(r["amount"] or 0))
 
@@ -136,7 +147,7 @@ def confidence_buckets(rows: Iterable[sqlite3.Row]) -> list[tuple]:
         label = labels[idx]
         b = buckets[label]
         b["n"]        += 1
-        b["won"]      += 1 if (r["won"] or 0) else 0
+        b["won"]      += 1 if _is_won(r) else 0
         b["pnl"]      += float(r["realized_pnl"] or 0)
         b["notional"] += abs(float(r["amount"] or 0))
 
@@ -186,7 +197,7 @@ def calibration_curve(brier_rows: list[sqlite3.Row]) -> list[tuple]:
 
 def overall_metrics(rows: list[sqlite3.Row]) -> dict:
     n     = len(rows)
-    won   = sum(1 for r in rows if (r["won"] or 0))
+    won   = sum(1 for r in rows if _is_won(r))
     pnl   = sum(float(r["realized_pnl"] or 0) for r in rows)
     notional = sum(abs(float(r["amount"] or 0)) for r in rows)
     return {
@@ -282,6 +293,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[2])
     parser.add_argument("--db",   default=DEFAULT_DB, help="path to trades.db")
     parser.add_argument("--days", type=int, default=30, help="lookback in days (default 30)")
+    parser.add_argument("--dry-run", action="store_true", help="include dry-run trades in the analysis")
     args = parser.parse_args()
 
     db_path = os.path.abspath(args.db)
@@ -291,7 +303,7 @@ def main() -> int:
 
     conn = sqlite3.connect(db_path)
     try:
-        trades = fetch_resolved_trades(conn, args.days)
+        trades = fetch_resolved_trades(conn, args.days, include_dry_run=args.dry_run)
         brier  = fetch_brier_rows(conn, args.days)
     finally:
         conn.close()
