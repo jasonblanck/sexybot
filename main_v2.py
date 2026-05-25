@@ -401,7 +401,7 @@ def get_last_buy_trade(token_id: str) -> Optional[dict]:
             pass
 
 
-async def reconcile_positions_on_startup(executor: ClobExecutor, open_positions: dict[str, Position]) -> None:
+async def reconcile_positions_on_startup(executor: ClobExecutor, open_positions: dict[str, Position]) -> list[dict]:
     log.info("Starting on-chain position reconciliation...")
     loaded = load_open_positions()
     open_positions.clear()
@@ -410,7 +410,7 @@ async def reconcile_positions_on_startup(executor: ClobExecutor, open_positions:
     user_addr = FUNDER_ADDRESS or (executor._client.get_address() if executor else None)
     if not user_addr:
         log.warning("No user/funder wallet address available. Skipping on-chain position reconciliation.")
-        return
+        return []
 
     try:
         import json as _j
@@ -532,9 +532,11 @@ async def reconcile_positions_on_startup(executor: ClobExecutor, open_positions:
 
         save_open_positions(open_positions)
         log.info("Position reconciliation complete. Currently tracking %d position(s).", len(open_positions))
+        return live_positions
 
     except Exception as e:
         log.error("Error during position reconciliation: %s", e)
+        return []
 
 
 @dataclass
@@ -2031,7 +2033,13 @@ async def main() -> None:
             log.warning("Startup safety sweep failed to cancel all orders (non-fatal): %s", exc)
             
         # Reconcile local state with on-chain holdings on startup/restart
-        await reconcile_positions_on_startup(executor, open_positions)
+        live_positions = await reconcile_positions_on_startup(executor, open_positions)
+        if market_maker is not None and live_positions:
+            try:
+                log.info("Reconciling Market Maker inventory from on-chain positions...")
+                market_maker.reconcile_inventory_on_startup(markets_box[0], live_positions)
+            except Exception as mm_rec_exc:
+                log.warning("Market Maker startup inventory reconciliation failed (non-fatal): %s", mm_rec_exc)
         
         while True:
             try:

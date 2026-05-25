@@ -3181,11 +3181,12 @@ class PolymarketBot:
             with self.db:
                 self.db.execute("""INSERT INTO brier_scores
                     (market, token_id, side, predicted_prob, market_price,
-                     kelly_fraction, kelly_size, ai_reasoning, time)
-                    VALUES (?,?,?,?,?,?,?,?,?)""",
+                     kelly_fraction, kelly_size, ai_reasoning, time, source)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
                     (market[:100], token_id, side, predicted_prob, market_price,
                      kelly_f, kelly_size, reasoning[:200],
-                     datetime.utcnow().isoformat()))
+                     datetime.utcnow().isoformat(),
+                     os.getenv("CALIBRATION_SOURCE", "default")))
         except Exception as e:
             log.debug(f"brier log error: {e}")
 

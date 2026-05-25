@@ -163,7 +163,70 @@ class MarketMaker:
                     state.yes_inventory += qty
                 else:
                     state.no_inventory  += qty
+                
+                # Net out matched inventory to prevent denominator inflation
+                min_inv = min(state.yes_inventory, state.no_inventory)
+                if min_inv > 0:
+                    state.yes_inventory -= min_inv
+                    state.no_inventory  -= min_inv
                 break
+
+    def reconcile_inventory_on_startup(
+        self,
+        markets: list[PolyMarket],
+        live_positions: list[dict],
+    ) -> None:
+        """
+        Reconcile in-memory inventory with actual on-chain positions at startup.
+        Sets yes_inventory and no_inventory to the actual netted unhedged exposure.
+        """
+        # Build mapping of token_id -> (yes_token_id, side)
+        token_map = {}
+        for mkt in markets:
+            token_map[mkt.yes_token_id] = (mkt.yes_token_id, "yes")
+            token_map[mkt.no_token_id]  = (mkt.yes_token_id, "no")
+
+        # Initialize state for all watched markets so they are tracked
+        for mkt in markets:
+            self._states.setdefault(mkt.yes_token_id, MMState())
+
+        # Reset current inventories
+        for state in self._states.values():
+            state.yes_inventory = 0.0
+            state.no_inventory  = 0.0
+
+        for p in live_positions:
+            asset = p.get("asset")
+            size = float(p.get("size", 0) or 0)
+            cur_price = float(p.get("curPrice", 0) or 0)
+            redeemable = p.get("redeemable", False)
+            if not asset or size <= 0 or cur_price == 0 or redeemable:
+                continue
+
+            if asset in token_map:
+                yes_tid, side = token_map[asset]
+                state = self._states[yes_tid]
+                if side == "yes":
+                    state.yes_inventory = size
+                else:
+                    state.no_inventory = size
+
+        # Apply netting of matched inventory to get true unhedged directional exposure
+        for yes_tid, state in self._states.items():
+            min_inv = min(state.yes_inventory, state.no_inventory)
+            if min_inv > 0:
+                state.yes_inventory -= min_inv
+                state.no_inventory  -= min_inv
+                log.info(
+                    "MM Startup Reconcile | Netting hedged inventory for yes_token=%s… "
+                    "remaining yes_inv=%.4f, no_inv=%.4f (netted %.4f)",
+                    yes_tid[:12], state.yes_inventory, state.no_inventory, min_inv
+                )
+            else:
+                log.info(
+                    "MM Startup Reconcile | yes_token=%s… yes_inv=%.4f, no_inv=%.4f",
+                    yes_tid[:12], state.yes_inventory, state.no_inventory
+                )
 
     async def _poll_fills(self, state: MMState) -> None:
         """
@@ -222,6 +285,16 @@ class MarketMaker:
         # Must happen BEFORE we decide whether to cancel/replace so a freshly
         # filled leg drops its id and we compute the new skewed quote.
         await self._poll_fills(state)
+
+        # Net out matched inventory to prevent denominator inflation in skew calculation
+        min_inv = min(state.yes_inventory, state.no_inventory)
+        if min_inv > 0:
+            state.yes_inventory -= min_inv
+            state.no_inventory  -= min_inv
+            log.info(
+                "MM NETTING | %s  netted %.4f hedged shares — new_yes_inv=%.4f, new_no_inv=%.4f",
+                mkt.question[:40], min_inv, state.yes_inventory, state.no_inventory
+            )
 
         # Track mid history for circuit breaker
         now = time.time()
