@@ -109,6 +109,7 @@ class ExecutionGate:
         *,
         balance:    Optional[BalanceInfo] = None,
         order_size: Optional[float]       = None,
+        override_price: Optional[float]   = None,
     ) -> GateVerdict:
 
         # ── Guard: stale / empty book ────────────────────────────────────────
@@ -155,7 +156,7 @@ class ExecutionGate:
 
         # ── Condition 2: EV with slippage ────────────────────────────────────
         if side.upper() == "BUY":
-            execution_price = book.best_ask
+            execution_price = override_price if override_price is not None else book.best_ask
             effective_price = execution_price * (1 + self.slippage_rate)
             ev_net          = true_prob - effective_price
             # Underdog-BUY guard — see MIN_YES_BUY_PRICE.
@@ -169,7 +170,7 @@ class ExecutionGate:
                     ),
                 )
         else:
-            execution_price = book.best_bid
+            execution_price = override_price if override_price is not None else book.best_bid
             effective_price = execution_price * (1 - self.slippage_rate)
             ev_net          = effective_price - true_prob
 

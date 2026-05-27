@@ -272,6 +272,7 @@ class ClobExecutor:
         price_override: Optional[float]       = None,
         expiration:     int                   = 0,
         bypass_gate:    bool                  = False,
+        slippage_tolerance: float             = 0.005,
     ) -> OrderResult:
         """
         Gate → sign → submit a single limit order.
@@ -289,15 +290,55 @@ class ClobExecutor:
         if breaker_msg is not None:
             return OrderResult(success=False, error=breaker_msg)
 
-        # 1. Live book
+        # 1. Live book (with REST fallback if missing/stale)
         book = self._books.get_book(token_id_str)
+        if book is None or book.is_stale:
+            try:
+                log.warning("Place limit order: live WS book for %s is %s. Attempting REST fallback fetch...",
+                            token_id_str[:14], "missing" if book is None else "stale")
+                rest_book = self._client.get_order_book(token_id_str)
+                if rest_book:
+                    from orderbook_ws import Level, BookSnapshot
+                    bids = sorted(
+                        [Level(price=float(b["price"]), size=float(b["size"])) for b in rest_book.get("bids", [])],
+                        key=lambda x: x.price,
+                        reverse=True
+                    )
+                    asks = sorted(
+                        [Level(price=float(a["price"]), size=float(a["size"])) for a in rest_book.get("asks", [])],
+                        key=lambda x: x.price
+                    )
+                    book = BookSnapshot(
+                        token_id=token_id_str,
+                        bids=bids,
+                        asks=asks,
+                        timestamp=time.time(),
+                        sequence=0,
+                        mid_history=[]
+                    )
+            except Exception as rest_err:
+                log.error("REST fallback book fetch failed: %s", rest_err)
+
         if book is None:
             return OrderResult(success=False, error=f"no live book for {token_id_str[:16]}…")
 
         # 2. Balance (use cached value when available)
         balance = cached_balance if cached_balance is not None else self.get_balance()
 
-        # 3. Gate check (skipped for market-making orders that bypass it)
+        # 3. Execution price from live book with slippage buffer
+        if price_override is not None:
+            price = price_override
+        elif side == OrderSide.BUY:
+            price = book.best_ask * (1 + slippage_tolerance) if book.best_ask is not None else None
+        else:
+            price = book.best_bid * (1 - slippage_tolerance) if book.best_bid is not None else None
+
+        if price is None:
+            return OrderResult(success=False, error="no execution price available (empty book side)")
+
+        price = max(0.001, min(0.999, round(price, 4)))
+
+        # 4. Gate check (skipped for market-making orders that bypass it)
         side_str = "BUY" if side == OrderSide.BUY else "SELL"
         if bypass_gate:
             verdict = GateVerdict(passed=True, ev_net=0.0, spread_cents=0.0)
@@ -305,23 +346,11 @@ class ClobExecutor:
             verdict = self._gate.check(
                 book=book, true_prob=true_prob, side=side_str,
                 balance=balance, order_size=size_pmusd,
+                override_price=price,
             )
         if not verdict:
             log.debug("GATE BLOCKED [%s]: %s", token_id_str[:12], verdict.reject_reason)
             return OrderResult(success=False, error=verdict.reject_reason)
-
-        # 4. Execution price from live book
-        if price_override is not None:
-            price = price_override
-        elif side == OrderSide.BUY:
-            price = book.best_ask
-        else:
-            price = book.best_bid
-
-        if price is None:
-            return OrderResult(success=False, error="no execution price available (empty book side)")
-
-        price = max(0.001, min(0.999, round(price, 4)))
 
         # Price-ceiling re-check. Catches the slippage case where the book
         # moved up between signal evaluation and now — the signal-time gate
@@ -390,9 +419,9 @@ class ClobExecutor:
             self._record_order_outcome(rejected=True)
             return OrderResult(success=False, error=str(exc))
 
-        # 6. Submit
+        # 6. Submit (using Immediate-Or-Cancel to prevent stale fill / orphan order risk)
         try:
-            resp = self._client.post_order(signed, OrderType.GTC)
+            resp = self._client.post_order(signed, OrderType.IOC)
         except Exception as exc:
             log.error("post_order failed: %s", exc)
             self._record_order_outcome(rejected=True)
