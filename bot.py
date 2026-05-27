@@ -5876,10 +5876,130 @@ class PolymarketBot:
         Cached 10 minutes. Safe fallback on any error: returns the last
         cached value (initially 'normal' with no adjustments) so a Claude
         outage never blocks trading."""
-        if not REGIME_DETECTOR_ENABLED or not ANTHROPIC_API_KEY or CLAUDE_MAX_DISABLED:
+        gemini_key = os.getenv("GEMINI_API_KEY", "")
+        if not REGIME_DETECTOR_ENABLED or (not ANTHROPIC_API_KEY and not gemini_key):
             return self._regime_cache
         if not force and time.time() - self._regime_cache_time < 600:
             return self._regime_cache
+
+        # Gather inputs
+        macro  = self._macro_cache or {}
+        fmp    = (self._fmp_cache or {}).get("_sentiment", {})
+        gas    = self._gas_cache or {}
+        # Today's realized P&L (sum of matched trade amounts isn't true PnL,
+        # but the sign/magnitude is a useful "how's the day going" signal).
+        pnl_today = 0.0
+        try:
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            row = self.db.execute(
+                "SELECT COUNT(*), SUM(amount) FROM trades "
+                "WHERE time LIKE ? AND dry_run=0 AND status='matched'",
+                (f"{today}%",)
+            ).fetchone()
+            trade_count_today = int(row[0] or 0)
+            gross_today       = float(row[1] or 0.0)
+        except Exception:
+            trade_count_today = 0
+            gross_today = 0.0
+        daily_loss = self.get_daily_loss()
+
+        ctx = (
+            f"TIME (UTC): {datetime.utcnow().isoformat()}\n"
+            f"VIX: {macro.get('vix')}\n"
+            f"Fed Funds: {macro.get('fed_rate')}%   CPI YoY: {macro.get('cpi')}%\n"
+            f"SPY today: {fmp.get('spy_change_pct', 0):+.2f}%  up/total: "
+            f"{fmp.get('up_count', 0)}/{fmp.get('total', 0)}\n"
+            f"Polygon gas: {gas.get('gwei','?')} gwei ({gas.get('level','?')}, {gas.get('multiplier',1)}x)\n"
+            f"Bot volatility signal: {self._vol_state}\n"
+            f"Our trades today: {trade_count_today}  gross deployed: "
+            f"${gross_today:.2f}\n"
+            f"Daily loss tally: ${daily_loss:.2f} (limit ${DAILY_LOSS_LIMIT:.0f})\n"
+            f"Strategy: {STRATEGY}   Dry run: {DRY_RUN}   Paper: {PAPER_MODE}"
+        )
+
+        system = (
+            "You are the risk officer for a Polymarket trading bot. "
+            "Your job is to decide whether current conditions favor "
+            "trading or whether the bot should stand down. You are "
+            "deliberately conservative — a missed trade costs nothing; "
+            "trading into a hostile regime can blow up the account.\n"
+            "\n"
+            "Regimes:\n"
+            "- NORMAL: quiet or mildly volatile, usual signals OK. "
+            "kelly_multiplier 1.0, min_edge_add 0.0.\n"
+            "- CAUTIOUS: elevated vol, mixed macro, or early signs of "
+            "stress. Scale down: kelly_multiplier 0.5, min_edge_add "
+            "0.02 (require an extra 2% edge).\n"
+            "- HOSTILE: high VIX (>30), major macro event, extreme gas, "
+            "or our own losses mounting. kelly_multiplier 0.0 (halt "
+            "momentum/econFlow trading for the cycle), min_edge_add "
+            "0.10.\n"
+            "\n"
+            "Return your verdict STRICTLY as a raw JSON object (no markdown, no backticks) matching this schema:\n"
+            '{"regime": "normal"|"cautious"|"hostile", "kelly_multiplier": float, "min_edge_add": float, "reasoning": "string"}'
+        )
+
+        # ── Google Gemini Integration ──────────────────────────────────────────
+        if gemini_key:
+            try:
+                import gemini_client
+                import json as _json
+
+                prompt = f"{system}\n\nINPUT DATA:\n{ctx}"
+                response_text = await asyncio.to_thread(
+                    gemini_client.generate_content,
+                    prompt=prompt,
+                    temperature=0.1
+                )
+                if response_text:
+                    text = response_text.strip()
+                    if "```" in text:
+                        text = text.split("```")[1]
+                        if text.startswith("json"):
+                            text = text[4:]
+                        text = text.strip()
+
+                    decision = _json.loads(text)
+                    regime = str(decision.get("regime", "normal")).lower()
+                    if regime not in ("normal", "cautious", "hostile"):
+                        regime = "normal"
+                    kmult = float(decision.get("kelly_multiplier", 1.0))
+                    kmult = max(0.0, min(1.0, kmult))
+                    edge_add = float(decision.get("min_edge_add", 0.0))
+                    edge_add = max(0.0, min(0.20, edge_add))
+                    reasoning = str(decision.get("reasoning", ""))[:300]
+
+                    self._regime_cache = {
+                        "regime":           regime,
+                        "kelly_multiplier": kmult,
+                        "min_edge_add":     edge_add,
+                        "reasoning":        reasoning,
+                    }
+                    self._regime_cache_time = time.time()
+
+                    # Write to DB regime_log so V2 trading loop picks it up instantly
+                    try:
+                        self.db.execute(
+                            "INSERT INTO regime_log (regime, kelly_mult, min_edge, reasoning, created_at) "
+                            "VALUES (?, ?, ?, ?, datetime('now'))",
+                            (regime, kmult, edge_add, reasoning)
+                        )
+                        self.db.commit()
+                    except Exception as db_err:
+                        log.debug("Regime logging to DB failed: %s", db_err)
+
+                    log.info(
+                        "[REGIME GEMINI] %s | kelly_mult=%.2f edge_add=%.3f | reason: %s",
+                        regime.upper(), kmult, edge_add, reasoning,
+                    )
+                    return self._regime_cache
+            except Exception as gemini_err:
+                log.error("Gemini regime detection failed: %s — falling back to Claude/cache", gemini_err)
+
+        # ── Fallback to Claude (Anthropic) ──────────────────────────────────────
+        if not ANTHROPIC_API_KEY or CLAUDE_MAX_DISABLED:
+            return self._regime_cache
+
         try:
             import anthropic
             if self._anthropic_client is None:
@@ -10693,6 +10813,7 @@ def runtime_health():
             "strategy":            STRATEGY,
             "dry_run":             DRY_RUN,
             "claude_max_disabled": CLAUDE_MAX_DISABLED,
+            "gemini_active":       bool(os.getenv("GEMINI_API_KEY", "")),
             "regime":              (bot._regime_cache or {}).get("regime", "unknown"),
             "regime_assessed_at":  (bot._regime_cache or {}).get("assessed_at"),
             "last_trade_at":       _scalar("SELECT MAX(time) FROM trades WHERE dry_run=0"),

@@ -1759,7 +1759,8 @@ async function fetchBot(){
     const aiText=document.getElementById('ai-chip-text');
     if(aiChip&&aiText&&rt){
       aiChip.style.display='';
-      if(rt.claude_max_disabled){aiChip.className='chip chip-paused';aiText.textContent='AI OFF';aiChip.title='CLAUDE_MAX_DISABLE=true — rule-based only';}
+      if(rt.gemini_active){aiChip.className='chip chip-active';aiText.textContent='AI LIVE (GEMINI)';aiChip.title='Google Gemini regime verification active';}
+      else if(rt.claude_max_disabled){aiChip.className='chip chip-paused';aiText.textContent='AI OFF';aiChip.title='CLAUDE_MAX_DISABLE=true — rule-based only';}
       else{aiChip.className='chip chip-active';aiText.textContent='AI ON';aiChip.title='Claude verification active';}
     }
     document.getElementById('strat').textContent=(d.strategy||'—').toUpperCase();
