@@ -26,7 +26,7 @@ CRITICAL_BALANCE    = 10.0
 PMUSD_SCALAR        = 1_000_000
 # Payoff ratio <1 makes sub-0.30 YES BUYs unprofitable unless accuracy is
 # near-perfect; block them at the gate.
-MIN_YES_BUY_PRICE   = float(os.getenv("MIN_YES_BUY_PRICE", "0.30"))
+MIN_YES_BUY_PRICE   = float(os.getenv("MIN_YES_BUY_PRICE", os.getenv("MIN_BUY_PRICE", "0.30")))
 
 MAX_DRAWDOWN_USD    = float(os.getenv("MAX_DRAWDOWN_USD", "50.0"))   # halt if peak-to-trough > $50
 DRAWDOWN_WINDOW_SEC = int(os.getenv("DRAWDOWN_WINDOW",   "600"))     # rolling 10-minute window
