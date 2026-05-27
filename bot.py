@@ -9443,14 +9443,8 @@ async def lifespan(app_: FastAPI):
             except Exception as e:
                 # Don't block startup on a reconcile failure; log loudly.
                 log.warning(f"[STARTUP RECONCILE] cancel_all failed: {e}")
-        bot.running = True  # set before create_task to prevent double-start race at startup
-        _bot_task = asyncio.create_task(bot.run_loop_supervised(interval=SCAN_INTERVAL_S))
-        log.info("Bot auto-started on startup")
-        if PAPER_MODE and _PAPER_AVAILABLE and bot.paper:
-            bot.start_paper_oracle()
-            log.info("[PAPER] Resolution oracle started (5 min interval)")
-        asyncio.create_task(bot.position_monitor_loop())
-        log.info("[POSITION MONITOR] Started (EconFlow TP/SL + Momentum trailing stops, 30s interval)")
+        bot.running = False
+        log.info("Bot trading loop disabled on startup (SEXYBOT_TRADING_DISABLED=1). Running purely as API/Dashboard server.")
         # Background cache warmer — keeps balance/positions_value caches hot
         # so the /status handler never has to do a blocking urllib fetch.
         # Without this, the FIRST /status call after restart triggers ~8s of
