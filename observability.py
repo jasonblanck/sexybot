@@ -29,10 +29,13 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+_last_prune_time = 0.0
 
 DEFAULT_DB_PATH = os.getenv(
     "CALIBRATION_DB_PATH",
@@ -287,7 +290,12 @@ def record_shadow_batch(rows: list[dict], db_path: str = DEFAULT_DB_PATH) -> int
                 """,
                 params,
             )
-        return len(params)
+        written = len(params)
+        try:
+            prune_telemetry(db_path)
+        except Exception:
+            pass
+        return written
     except sqlite3.Error as exc:
         log.debug("record_shadow_batch failed: %s", exc)
         return 0
@@ -448,7 +456,12 @@ def record_discovery_batch(rows: list[dict], db_path: str = DEFAULT_DB_PATH) -> 
                 """,
                 params,
             )
-        return len(params)
+        written = len(params)
+        try:
+            prune_telemetry(db_path)
+        except Exception:
+            pass
+        return written
     except sqlite3.Error as exc:
         log.debug("record_discovery_batch failed: %s", exc)
         return 0
@@ -496,9 +509,40 @@ def record_external_feeds(rows: list[dict], db_path: str = DEFAULT_DB_PATH) -> i
                 """,
                 params,
             )
-            return cur.rowcount if cur.rowcount is not None else 0
+            written = cur.rowcount if cur.rowcount is not None else 0
+            try:
+                prune_telemetry(db_path)
+            except Exception:
+                pass
+            return written
     except sqlite3.Error as exc:
         log.debug("record_external_feeds failed: %s", exc)
         return 0
+    finally:
+        conn.close()
+
+
+def prune_telemetry(db_path: str = DEFAULT_DB_PATH, retention_days: int = 2) -> None:
+    """Delete telemetry data older than retention_days."""
+    global _last_prune_time
+    now = time.time()
+    if now - _last_prune_time < 86400:  # 24-hour cooldown
+        return
+    _last_prune_time = now
+
+    conn = _connect(db_path)
+    if conn is None:
+        return
+    try:
+        log.info("observability: running background telemetry auto-pruning...")
+        with conn:
+            conn.execute("DELETE FROM shadow_signals WHERE created_at < datetime('now', ?)", (f"-{retention_days} days",))
+            conn.execute("DELETE FROM discovery_audit WHERE created_at < datetime('now', ?)", (f"-{retention_days} days",))
+            conn.execute("DELETE FROM external_feeds WHERE fetched_at < datetime('now', ?)", (f"-{retention_days} days",))
+            # Also clean failed trades older than 2 days
+            conn.execute("DELETE FROM trades WHERE order_id IS NULL AND time < datetime('now', ?)", (f"-{retention_days} days",))
+        log.info("observability: telemetry auto-pruning complete.")
+    except sqlite3.Error as exc:
+        log.debug("prune_telemetry failed: %s", exc)
     finally:
         conn.close()
