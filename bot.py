@@ -9296,6 +9296,14 @@ class PolymarketBot:
             log.debug(f"get_pnl_data error: {e}")
         return self._pnl_cache
 
+    def is_v2_running(self) -> bool:
+        try:
+            import subprocess
+            res = subprocess.run(["systemctl", "is-active", "sexybot-v2"], capture_output=True, text=True, timeout=1.0)
+            return res.stdout.strip() == "active"
+        except Exception:
+            return True
+
     def get_state(self) -> dict:
         # Read cached values only — never trigger a network fetch from this
         # path. The cache_warmer background task refreshes balance/positions
@@ -9308,7 +9316,7 @@ class PolymarketBot:
         now = time.time()
         active_cooldowns = sum(1 for ts in self._error_cooldown.values() if ts > now)
         d = {
-            "running": self.running,
+            "running": self.is_v2_running(),
             "strategy": STRATEGY,
             "dry_run": DRY_RUN,
             "paper_mode": PAPER_MODE,
