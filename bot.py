@@ -427,7 +427,9 @@ MIN_TRADE_NOTIONAL = float(os.getenv("MIN_TRADE_NOTIONAL", "1.0"))
 if CLAUDE_MAX_DISABLED:
     # Force every AI feature off — keeps downstream code paths safe
     # without having to check CLAUDE_MAX_DISABLED everywhere.
-    REGIME_DETECTOR_ENABLED = False
+    # Exception: Regime Detector is cheap/safe via Google Gemini!
+    if not os.getenv("GEMINI_API_KEY", ""):
+        REGIME_DETECTOR_ENABLED = False
     # NIGHTLY_REVIEW is the one feature the operator can opt back in
     # even with the kill switch on (NIGHTLY_REVIEW=true in .env). It's
     # ~$0.10/night, runs once daily, and never touches the live trade
@@ -9596,7 +9598,7 @@ async def lifespan(app_: FastAPI):
         # real assessment instead of the default "normal". Fire-and-forget —
         # don't block startup on the Claude call; even a multi-second Sonnet
         # round-trip will finish well before the first scan cycle (30s).
-        if REGIME_DETECTOR_ENABLED and ANTHROPIC_API_KEY:
+        if REGIME_DETECTOR_ENABLED and (ANTHROPIC_API_KEY or os.getenv("GEMINI_API_KEY", "")):
             asyncio.create_task(bot.assess_market_regime(force=True))
             log.info("[REGIME] Bootstrap assessment kicked off at startup")
         # Brier calibration resolver — periodic background task that settles
@@ -10447,7 +10449,7 @@ def get_settings():
 def get_regime():
     """Current market regime as assessed by the Claude risk officer."""
     return JSONResponse({
-        "enabled": REGIME_DETECTOR_ENABLED and bool(ANTHROPIC_API_KEY),
+        "enabled": REGIME_DETECTOR_ENABLED and (bool(os.getenv("GEMINI_API_KEY", "")) or (bool(ANTHROPIC_API_KEY) and not CLAUDE_MAX_DISABLED)),
         **bot._regime_cache,
     })
 
@@ -11047,7 +11049,7 @@ def claude_max_health():
             "bot_running":        bot.running,
             "features": {
                 "regime_detector": {
-                    "enabled":      REGIME_DETECTOR_ENABLED and bool(ANTHROPIC_API_KEY) and not CLAUDE_MAX_DISABLED,
+                    "enabled":      REGIME_DETECTOR_ENABLED and (bool(os.getenv("GEMINI_API_KEY", "")) or (bool(ANTHROPIC_API_KEY) and not CLAUDE_MAX_DISABLED)),
                     "current":      (bot._regime_cache or {}).get("regime", "normal"),
                     "last_run":     (bot._regime_cache or {}).get("assessed_at"),
                     "hostile_24h":  _count("SELECT COUNT(*) FROM regime_log WHERE regime='hostile' AND created_at >= datetime('now','-24 hours')"),
