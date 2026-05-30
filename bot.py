@@ -10809,7 +10809,7 @@ def runtime_health():
                 return default
         return {
             "ts":                  datetime.utcnow().isoformat(),
-            "bot_running":         bot.running,
+            "bot_running":         bot.is_v2_running(),
             "new_trades_paused":   bot._new_trades_paused,
             "balance_halted":      bot._balance_halt_tripped,
             "strategy":            STRATEGY,
