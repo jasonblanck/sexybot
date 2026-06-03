@@ -419,9 +419,9 @@ class ClobExecutor:
             self._record_order_outcome(rejected=True)
             return OrderResult(success=False, error=str(exc))
 
-        # 6. Submit (using Immediate-Or-Cancel to prevent stale fill / orphan order risk)
+        # 6. Submit (using FAK / Fill-and-Kill equivalent to IOC to prevent stale fill / orphan order risk)
         try:
-            resp = self._client.post_order(signed, OrderType.IOC)
+            resp = self._client.post_order(signed, OrderType.FAK)
         except Exception as exc:
             log.error("post_order failed: %s", exc)
             self._record_order_outcome(rejected=True)
