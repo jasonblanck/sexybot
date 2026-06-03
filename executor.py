@@ -438,14 +438,15 @@ class ClobExecutor:
 
     def close_position(
         self,
-        token_id:   str | int,
-        token_qty:  float,
+        token_id:           str | int,
+        token_qty:          float,
         *,
-        reason:     str = "exit",
-        expiration: int = 0,
+        reason:             str = "exit",
+        expiration:         int = 0,
+        slippage_tolerance: float = 0.005,
     ) -> OrderResult:
         """
-        Sell `token_qty` outcome tokens at the current best bid.
+        Sell `token_qty` outcome tokens at the current best bid (minus a slippage buffer).
         Used for profit-taking and stop-loss exits.
 
         Bypasses the EV gate (we always want to exit a losing/winning position),
@@ -487,7 +488,7 @@ class ClobExecutor:
         if book.is_stale:
             return OrderResult(success=False, error="order book is stale — skipping exit")
 
-        price = book.best_bid
+        price = book.best_bid * (1 - slippage_tolerance) if book.best_bid is not None else None
         if price is None:
             return OrderResult(success=False, error="no bid on book — cannot exit")
 
@@ -501,8 +502,8 @@ class ClobExecutor:
             )
 
         log.info(
-            "CLOSE QUEUED | reason=%s price=%.4f qty=%.4f token=%s…",
-            reason, price, token_qty, token_id_str[:14],
+            "CLOSE QUEUED | reason=%s price=%.4f (bid=%.4f) qty=%.4f token=%s…",
+            reason, price, book.best_bid, token_qty, token_id_str[:14],
         )
 
         if self._dry_run:
@@ -539,7 +540,7 @@ class ClobExecutor:
             return OrderResult(success=False, error=str(exc))
 
         try:
-            resp = self._client.post_order(signed, OrderType.GTC)
+            resp = self._client.post_order(signed, OrderType.FAK)
         except Exception as exc:
             log.error("close_position post_order failed: %s", exc)
             return OrderResult(success=False, error=str(exc))

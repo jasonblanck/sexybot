@@ -56,7 +56,7 @@ MIN_LIQUIDITY    = float(os.getenv("MIN_LIQUIDITY",    "10000"))
 MIN_VOLUME_24H   = float(os.getenv("MIN_VOLUME",       "1000"))
 MAX_ORDER_SIZE   = float(os.getenv("MAX_ORDER_SIZE",   "10"))
 DRY_RUN          = os.getenv("DRY_RUN", "true").lower() == "true"
-SPREAD_MAX_CENTS = float(os.getenv("SPREAD_MAX_CENTS", "0.5"))
+SPREAD_MAX_CENTS = float(os.getenv("SPREAD_MAX_CENTS", "2.0"))
 SCAN_INTERVAL    = float(os.getenv("SCAN_INTERVAL",    "30"))
 
 CLOB_BASE       = "https://clob.polymarket.com"
@@ -375,6 +375,7 @@ def check_correlation_and_category_gates(mkt: PolyMarket, open_positions: dict[s
 def get_last_buy_trade(token_id: str) -> Optional[dict]:
     import sqlite3
     db_path = os.getenv("CALIBRATION_DB_PATH", "trades.db")
+    conn = None
     try:
         conn = sqlite3.connect(db_path, timeout=3.0)
         conn.row_factory = sqlite3.Row
@@ -395,10 +396,11 @@ def get_last_buy_trade(token_id: str) -> Optional[dict]:
         log.warning("get_last_buy_trade error for %s: %s", token_id[:14], e)
         return None
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 async def reconcile_positions_on_startup(executor: ClobExecutor, open_positions: dict[str, Position]) -> list[dict]:

@@ -18,7 +18,7 @@ from orderbook_ws import BookSnapshot
 
 log = logging.getLogger(__name__)
 
-SPREAD_MAX_CENTS    = 0.50
+SPREAD_MAX_CENTS    = 2.0
 SLIPPAGE_RATE       = 0.01
 MIN_EV              = 0.0
 LOW_BALANCE         = 50.0
@@ -306,6 +306,7 @@ class DrawdownGuard:
         db_daily_loss = 0.0
         db_path = os.getenv("CALIBRATION_DB_PATH", "trades.db")
         if os.path.exists(db_path):
+            conn = None
             try:
                 import sqlite3
                 from datetime import datetime, timezone
@@ -319,9 +320,14 @@ class DrawdownGuard:
                 )
                 val = cur.fetchone()[0]
                 db_daily_loss = abs(float(val)) if val is not None else 0.0
-                conn.close()
             except Exception as e:
                 log.error("DrawdownGuard DB daily loss query error: %s", e)
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
         in_mem_drop = 0.0
         peak_24h = balance
