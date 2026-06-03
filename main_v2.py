@@ -1806,8 +1806,9 @@ async def strategy_loop(
             last_traded[trade_token_id] = time.time()
 
             # Feed balance errors to the circuit breaker
-            if balance_breaker is not None and not result.success:
-                if BalanceErrorCircuitBreaker.is_balance_error(result.error):
+            if not result.success:
+                log.info("ORDER BLOCKED | token=%s… reason=%s", trade_token_id[:14], result.error)
+                if balance_breaker is not None and BalanceErrorCircuitBreaker.is_balance_error(result.error):
                     balance_breaker.record_error()
 
             if result:
