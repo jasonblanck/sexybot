@@ -419,9 +419,9 @@ class ClobExecutor:
             self._record_order_outcome(rejected=True)
             return OrderResult(success=False, error=str(exc))
 
-        # 6. Submit (using FAK / Fill-and-Kill equivalent to IOC to prevent stale fill / orphan order risk)
+        # 6. Submit (using GTC for entries to support high-precision limit prices; cleaned up by sweeper after 60s)
         try:
-            resp = self._client.post_order(signed, OrderType.FAK)
+            resp = self._client.post_order(signed, OrderType.GTC)
         except Exception as exc:
             log.error("post_order failed: %s", exc)
             self._record_order_outcome(rejected=True)
