@@ -20,7 +20,7 @@ log = logging.getLogger("resolve_brier_backlog")
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trades.db")
 
 def _gamma_market_outcome(token_id: str) -> int | None:
-    url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
+    url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}&closed=true"
     data = None
     
     # Standard request headers
