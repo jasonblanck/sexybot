@@ -164,7 +164,7 @@ def main():
                 pnl = payout - cost
                 won = 1 if outcome == 1 else 0
                 conn.execute(
-                    "UPDATE trades SET resolved=1, won=?, realized_pnl=?, resolved_at=datetime('now') WHERE id=?",
+                    "UPDATE trades SET resolved=1, won=?, realized_pnl=?, resolved_at=time WHERE id=?",
                     (won, round(pnl, 4), buy_id)
                 )
                 
