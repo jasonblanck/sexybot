@@ -1103,7 +1103,7 @@ class PolymarketBot:
             today = datetime.utcnow().strftime("%Y-%m-%d")
             cur = self.db.execute(
                 "SELECT SUM(realized_pnl) FROM trades "
-                "WHERE resolved_at LIKE ? AND dry_run=0 AND resolved=1 "
+                "WHERE time LIKE ? AND dry_run=0 AND resolved=1 "
                 "  AND realized_pnl IS NOT NULL AND realized_pnl < 0",
                 (f"{today}%",),
             )
