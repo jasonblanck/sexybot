@@ -226,7 +226,7 @@ _\ \ / _/  \  / \ V // _ \ / (_)/  /
   </main>
 
   <div class="botbar">
-    <div><span id="conn">◉</span> LINK 159.65.201.165 · POLYGON MAINNET · CLOB 200 OK</div>
+    <div id="connection-status"><span id="conn">◉</span> LINK 159.65.201.165 · POLYGON MAINNET · CLOB 200 OK</div>
     <div>RND: <span id="rnd">—</span></div>
   </div>
   <div class="ticker">
@@ -447,6 +447,9 @@ otpBack.addEventListener('click', (e) => {
     if (r.ok) window.location.href = '/';
   } catch (e) { /* ignore — stay on login */ }
 })();
+
+// Dynamically update connection label with current hostname
+document.getElementById('connection-status').innerHTML = `<span id="conn">◉</span> LINK ${window.location.hostname} · POLYGON MAINNET · CLOB 200 OK`;
 </script>
 </body>
 </html>

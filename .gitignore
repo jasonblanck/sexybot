@@ -12,3 +12,4 @@ trades.db
 *.db
 *.db-shm
 *.db-wal
+open_positions.json
