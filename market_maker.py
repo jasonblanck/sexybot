@@ -370,10 +370,10 @@ class MarketMaker:
             return await self._cancel_quotes(mkt, state)
 
         # ── Decide if requote is needed ───────────────────────────────────────
-        has_quotes   = state.yes_order_id or state.no_order_id
-        mid_drifted  = (state.quote_mid is None or
-                        abs(mid - state.quote_mid) >= REQUOTE_TICK)
-        need_requote = (not has_quotes) or mid_drifted
+        has_both_quotes = state.yes_order_id and state.no_order_id
+        mid_drifted     = (state.quote_mid is None or
+                           abs(mid - state.quote_mid) >= REQUOTE_TICK)
+        need_requote    = (not has_both_quotes) or mid_drifted
 
         if not need_requote:
             return actions_cancelled
@@ -408,43 +408,49 @@ class MarketMaker:
         actions = cancelled
 
         # ── Place BUY YES (bid leg) ───────────────────────────────────────────
-        yes_result: OrderResult = await asyncio.to_thread(
-            self._ex.place_limit_order,
-            mkt.yes_token_id,
-            OrderSide.BUY,
-            bid_price,       # true_prob = our quote price (gate bypassed)
-            effective_size,
-            cached_balance = balance,
-            price_override = bid_price,
-            bypass_gate    = True,
-        )
-        if yes_result.success:
-            state.yes_order_id = yes_result.order_id
-            state.quote_mid    = mid
-            actions += 1
-            if balance is not None:
-                remaining_spendable[0] -= effective_size
+        if book.obi > -ADVERSE_OBI_THRESHOLD:
+            yes_result: OrderResult = await asyncio.to_thread(
+                self._ex.place_limit_order,
+                mkt.yes_token_id,
+                OrderSide.BUY,
+                bid_price,       # true_prob = our quote price (gate bypassed)
+                effective_size,
+                cached_balance = balance,
+                price_override = bid_price,
+                bypass_gate    = True,
+            )
+            if yes_result.success:
+                state.yes_order_id = yes_result.order_id
+                state.quote_mid    = mid
+                actions += 1
+                if balance is not None:
+                    remaining_spendable[0] -= effective_size
+            else:
+                log.debug("MM bid failed: %s", yes_result.error)
         else:
-            log.debug("MM bid failed: %s", yes_result.error)
+            log.info("MM ADVERSE GATE (YES) | %s  obi=%+.3f — skipping bid placement", mkt.question[:40], book.obi)
 
         # ── Place BUY NO (ask leg = 1 − ask_price) ───────────────────────────
-        no_result: OrderResult = await asyncio.to_thread(
-            self._ex.place_limit_order,
-            mkt.no_token_id,
-            OrderSide.BUY,
-            no_bid_price,    # NO-token buy price
-            effective_size,
-            cached_balance = balance,
-            price_override = no_bid_price,
-            bypass_gate    = True,
-        )
-        if no_result.success:
-            state.no_order_id = no_result.order_id
-            actions += 1
-            if balance is not None:
-                remaining_spendable[0] -= effective_size
+        if book.obi < ADVERSE_OBI_THRESHOLD:
+            no_result: OrderResult = await asyncio.to_thread(
+                self._ex.place_limit_order,
+                mkt.no_token_id,
+                OrderSide.BUY,
+                no_bid_price,    # NO-token buy price
+                effective_size,
+                cached_balance = balance,
+                price_override = no_bid_price,
+                bypass_gate    = True,
+            )
+            if no_result.success:
+                state.no_order_id = no_result.order_id
+                actions += 1
+                if balance is not None:
+                    remaining_spendable[0] -= effective_size
+            else:
+                log.debug("MM ask failed: %s", no_result.error)
         else:
-            log.debug("MM ask failed: %s", no_result.error)
+            log.info("MM ADVERSE GATE (NO)  | %s  obi=%+.3f — skipping ask placement", mkt.question[:40], book.obi)
 
         return actions
 
