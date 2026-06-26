@@ -120,17 +120,15 @@ class MarketMaker:
             log.warning("MM: critical balance — skipping all quoting")
             return 0
 
-        # Guard: ensure both order legs won't push balance below the $10 reserve.
+        # Guard: ensure we have enough spendable balance to place at least the minimum order size on both legs.
         # bypass_gate=True skips the executor's reserve check, so we enforce it here.
-        # Each cycle places a BUY YES leg and a BUY NO leg, each costing self._size USDC,
-        # so the spendable balance must cover 2 × order_size.
+        # Each cycle places a BUY YES leg and a BUY NO leg. The minimum notional per leg is $1.00.
         if balance is not None:
             spendable = balance.balance - CRITICAL_BALANCE
-            required  = 2 * self._size
-            if spendable < required:
+            if spendable < 2.0:
                 log.warning(
-                    "MM: spendable $%.2f < 2 × order_size $%.2f — insufficient margin for both legs",
-                    spendable, required,
+                    "MM: spendable $%.2f < minimum $2.00 — insufficient margin to quote even at minimum $1.00 size",
+                    spendable,
                 )
                 return 0
 
@@ -377,6 +375,21 @@ class MarketMaker:
         if not need_requote:
             return actions_cancelled
 
+        # Dynamically determine effective order size based on currently available spendable balance.
+        # This allows us to keep quoting even if balance is low, scaling down to a minimum of $1.00.
+        effective_size = self._size
+        if balance is not None:
+            spendable = balance.balance - CRITICAL_BALANCE
+            if spendable < 2.0:
+                log.debug("MM SKIP | %s  spendable balance $%.2f is below minimum $2.00", mkt.question[:40], spendable)
+                return actions_cancelled
+            if spendable < 2 * self._size:
+                scaled_size = spendable / 2.0
+                if scaled_size >= 1.0:
+                    effective_size = round(scaled_size, 2)
+                    log.info("MM SCALE | %s  low spendable balance ($%.2f) — scaling order size to $%.2f",
+                             mkt.question[:40], spendable, effective_size)
+
         # ── Cancel stale quotes ───────────────────────────────────────────────
         cancelled = await self._cancel_quotes(mkt, state) + actions_cancelled
 
@@ -397,7 +410,7 @@ class MarketMaker:
             mkt.yes_token_id,
             OrderSide.BUY,
             bid_price,       # true_prob = our quote price (gate bypassed)
-            self._size,
+            effective_size,
             cached_balance = balance,
             price_override = bid_price,
             bypass_gate    = True,
@@ -415,7 +428,7 @@ class MarketMaker:
             mkt.no_token_id,
             OrderSide.BUY,
             no_bid_price,    # NO-token buy price
-            self._size,
+            effective_size,
             cached_balance = balance,
             price_override = no_bid_price,
             bypass_gate    = True,

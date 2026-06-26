@@ -22,7 +22,7 @@ SPREAD_MAX_CENTS    = 2.0
 SLIPPAGE_RATE       = 0.01
 MIN_EV              = 0.0
 LOW_BALANCE         = 50.0
-CRITICAL_BALANCE    = 10.0
+CRITICAL_BALANCE    = float(os.getenv("CRITICAL_BALANCE", "1.0"))
 PMUSD_SCALAR        = 1_000_000
 # Payoff ratio <1 makes sub-0.30 YES BUYs unprofitable unless accuracy is
 # near-perfect; block them at the gate.
