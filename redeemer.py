@@ -30,6 +30,52 @@ NEG_RISK_ADAPTER  = Web3.to_checksum_address("0xd91E80cF2E7be2e162c6513ceD06f1dD
 USDC_ADDRESS      = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
 NULL_BYTES32      = b"\x00" * 32
 
+USDC_E_ADDRESS      = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+USDC_NATIVE_ADDRESS = Web3.to_checksum_address("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")
+PUSD_ADDRESS        = Web3.to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
+
+COLLATERAL_ONRAMP   = Web3.to_checksum_address("0x93070a847efEf7F70739046A929D47a521F5B8ee")
+CTF_EXCHANGE        = Web3.to_checksum_address("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")
+NEG_RISK_EXCHANGE   = Web3.to_checksum_address("0xC5d563A36AE78145C45a50134d48A1215220f80a")
+
+ERC20_ABI = [
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "inputs": [{"name": "account", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
+    {
+        "name": "allowance",
+        "type": "function",
+        "inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
+    {
+        "name": "approve",
+        "type": "function",
+        "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}],
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+    },
+]
+
+ONRAMP_ABI = [
+    {
+        "name": "wrap",
+        "type": "function",
+        "inputs": [
+            {"name": "underlyingToken", "type": "address"},
+            {"name": "recipient",       "type": "address"},
+            {"name": "amount",          "type": "uint256"},
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable",
+    }
+]
+
 CTF_ABI = [
     {
         "name": "redeemPositions",
@@ -406,6 +452,13 @@ class PositionRedeemer:
             except Exception as exc:
                 log.error("PositionRedeemer: merge error: %s", exc)
 
+        # Auto deposit and wrap USDC/USDC.e to pUSD, and check allowances
+        try:
+            wrapped_txs = self._auto_deposit_and_wrap()
+            tx_count += wrapped_txs
+        except Exception as exc:
+            log.error("PositionRedeemer: auto deposit/wrap cycle error: %s", exc)
+
         return tx_count
 
     # ── Internal ──────────────────────────────────────────────────────────────
@@ -568,3 +621,106 @@ class PositionRedeemer:
         tx = self._execute_with_rpc_fallback(_do_merge)
         log.info("MERGED | %s  tx=%s", title, tx)
         return True
+
+    def _auto_deposit_and_wrap(self) -> int:
+        """
+        Check for raw USDC.e/USDC in the Gnosis Safe and wrap them into pUSD.
+        Also check and ensure pUSD allowances are set for CTF and NegRisk exchanges.
+        Returns number of transactions executed.
+        """
+        if not self._safe_addr:
+            return 0
+
+        tx_count = 0
+        
+        tokens_to_check = [
+            ("USDC.e", USDC_E_ADDRESS),
+            ("USDC", USDC_NATIVE_ADDRESS),
+        ]
+        
+        for name, token_addr in tokens_to_check:
+            try:
+                # 1. Check Balance using RPC fallback
+                def _fetch_bal(w3_inst):
+                    token_contract = w3_inst.eth.contract(address=token_addr, abi=ERC20_ABI)
+                    return token_contract.functions.balanceOf(self._safe_addr).call()
+                
+                balance = self._execute_with_rpc_fallback(_fetch_bal)
+                
+                # We wrap if balance is >= $1.00 (1,000,000 units)
+                if balance >= 1_000_000:
+                    log.info("PositionRedeemer: found %s balance of %.2f in Gnosis Safe. Automating wrap...", name, balance / 1_000_000)
+                    
+                    if self._dry_run:
+                        log.info("DRY RUN — wrap of %.2f %s skipped", balance / 1_000_000, name)
+                        continue
+
+                    # 2. Check Allowance to Onramp using RPC fallback
+                    def _fetch_allowance(w3_inst):
+                        token_contract = w3_inst.eth.contract(address=token_addr, abi=ERC20_ABI)
+                        return token_contract.functions.allowance(self._safe_addr, COLLATERAL_ONRAMP).call()
+                    
+                    allowance = self._execute_with_rpc_fallback(_fetch_allowance)
+                    
+                    if allowance < balance:
+                        log.info("PositionRedeemer: Gnosis Safe has insufficient allowance for onramp. Approving...")
+                        
+                        def _do_approve(w3_inst):
+                            token_contract = w3_inst.eth.contract(address=token_addr, abi=ERC20_ABI)
+                            max_uint = 2**256 - 1
+                            approve_data = token_contract.encode_abi(abi_element_identifier="approve", args=[COLLATERAL_ONRAMP, max_uint])
+                            return _exec_safe_tx(w3_inst, self._safe, self._pk, self._signer_addr, token_addr, bytes.fromhex(approve_data[2:]))
+                        
+                        tx = self._execute_with_rpc_fallback(_do_approve)
+                        log.info("PositionRedeemer: Approved onramp for %s. tx=%s", name, tx)
+                        tx_count += 1
+                    
+                    # 3. Call Wrap
+                    def _do_wrap(w3_inst):
+                        onramp_contract = w3_inst.eth.contract(address=COLLATERAL_ONRAMP, abi=ONRAMP_ABI)
+                        wrap_data = onramp_contract.encode_abi(
+                            abi_element_identifier="wrap", 
+                            args=[token_addr, self._safe_addr, balance]
+                        )
+                        return _exec_safe_tx(w3_inst, self._safe, self._pk, self._signer_addr, COLLATERAL_ONRAMP, bytes.fromhex(wrap_data[2:]))
+                        
+                    tx = self._execute_with_rpc_fallback(_do_wrap)
+                    log.info("PositionRedeemer: Wrapped %.2f %s into pUSD. tx=%s", balance / 1_000_000, name, tx)
+                    tx_count += 1
+            except Exception as exc:
+                log.error("PositionRedeemer: failed to wrap %s: %s", name, exc)
+                
+        # 4. Check pUSD Allowance to Exchanges
+        try:
+            exchanges = [
+                ("CTF Exchange", CTF_EXCHANGE),
+                ("NegRisk Exchange", NEG_RISK_EXCHANGE),
+            ]
+            for ex_name, ex_addr in exchanges:
+                def _fetch_pusd_allowance(w3_inst):
+                    pusd_contract = w3_inst.eth.contract(address=PUSD_ADDRESS, abi=ERC20_ABI)
+                    return pusd_contract.functions.allowance(self._safe_addr, ex_addr).call()
+                
+                allowance = self._execute_with_rpc_fallback(_fetch_pusd_allowance)
+                
+                # If allowance is less than $10,000, set max allowance
+                if allowance < 10_000 * 1_000_000:
+                    log.info("PositionRedeemer: Gnosis Safe has low pUSD allowance for %s ($%.2f). Approving...", ex_name, allowance / 1_000_000)
+                    
+                    if self._dry_run:
+                        log.info("DRY RUN — approval of %s for pUSD skipped", ex_name)
+                        continue
+
+                    def _do_approve_exchange(w3_inst):
+                        pusd_contract = w3_inst.eth.contract(address=PUSD_ADDRESS, abi=ERC20_ABI)
+                        max_uint = 2**256 - 1
+                        approve_data = pusd_contract.encode_abi(abi_element_identifier="approve", args=[ex_addr, max_uint])
+                        return _exec_safe_tx(w3_inst, self._safe, self._pk, self._signer_addr, PUSD_ADDRESS, bytes.fromhex(approve_data[2:]))
+                        
+                    tx = self._execute_with_rpc_fallback(_do_approve_exchange)
+                    log.info("PositionRedeemer: Approved %s for pUSD. tx=%s", ex_name, tx)
+                    tx_count += 1
+        except Exception as exc:
+            log.error("PositionRedeemer: failed to verify/approve pUSD allowances: %s", exc)
+
+        return tx_count
