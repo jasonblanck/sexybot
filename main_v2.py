@@ -745,6 +745,41 @@ async def get_recent_sportsbook_odds(question: str) -> Optional[float]:
     return our_fair
 
 
+def enforce_category_diversity(markets: list[PolyMarket], max_per_category: int = 5, total: int = 20) -> list[PolyMarket]:
+    """
+    Select up to `total` markets from `markets` (already sorted by volume).
+    First pass: strictly enforce `max_per_category` limit per internal category (e.g. crypto).
+    Second pass: if we have not reached `total` markets yet, fill the remaining slots
+    with the next highest volume markets regardless of category, to ensure we always
+    fully utilize our quoting slots!
+    """
+    counts = {}
+    selected = []
+    selected_ids = set()
+    
+    # First pass: strict diversity cap
+    for m in markets:
+        cat = classify_internal_category(m.question)
+        current_count = counts.get(cat, 0)
+        if current_count < max_per_category:
+            selected.append(m)
+            selected_ids.add(m.yes_token_id)
+            counts[cat] = current_count + 1
+            if len(selected) >= total:
+                break
+                
+    # Second pass: fill remaining slots up to `total`
+    if len(selected) < total:
+        for m in markets:
+            if m.yes_token_id not in selected_ids:
+                selected.append(m)
+                selected_ids.add(m.yes_token_id)
+                if len(selected) >= total:
+                    break
+                    
+    return selected
+
+
 def _audit_discovery(raw_markets: list[PolyMarket]) -> list[dict]:
     """
     Mirror the MarketFilter chain used in main() / strategy_loop and tag each
@@ -795,10 +830,15 @@ def _audit_discovery(raw_markets: list[PolyMarket]) -> list[dict]:
             continue
         survivors.append((m, base))
 
-    # Top-20 by volume_24h — the only ones that actually make the watchlist.
+    # Top-20 by volume_24h with category diversity applied.
     survivors.sort(key=lambda pair: pair[0].volume_24h, reverse=True)
-    for idx, (_m, base) in enumerate(survivors):
-        rows.append({**base, "excluded_by": "kept" if idx < 20 else "top_n"})
+    survivor_markets = [pair[0] for pair in survivors]
+    diverse_selection = enforce_category_diversity(survivor_markets, max_per_category=5, total=20)
+    diverse_ids = {m.yes_token_id for m in diverse_selection}
+
+    for idx, (m, base) in enumerate(survivors):
+        kept = m.yes_token_id in diverse_ids
+        rows.append({**base, "excluded_by": "kept" if kept else "top_n"})
     return rows
 
 
@@ -1180,16 +1220,17 @@ async def strategy_loop(
                     min_volume=MIN_VOLUME_24H,
                     max_pages=3
                 )
-                fresh = (
+                fresh_candidates = (
                     MarketFilter(fresh_raw)
                     .max_spread_cents(3.0)
                     .price_range(0.08, 0.92)
                     .exclude_categories(EXCLUDE_CATEGORIES)
                     .exclude_keywords(EXCLUDE_KEYWORDS)
                     .exclude_internal_categories(BLOCK_INTERNAL_CATEGORIES)
-                    .top(20, key="volume_24h")
                     .results()
                 )
+                fresh_candidates.sort(key=lambda m: m.volume_24h, reverse=True)
+                fresh = enforce_category_diversity(fresh_candidates, max_per_category=5, total=20)
                 if is_sports_only_active():
                     fresh = [m for m in fresh if classify_internal_category(m.question) == "sports"]
                 # Drop any new markets — only keep already-subscribed ones
@@ -1934,16 +1975,17 @@ async def main() -> None:
     # 1. Discover markets
     log.info("Fetching markets from Gamma API…")
     raw = fetch_markets(min_liquidity=MIN_LIQUIDITY, min_volume=MIN_VOLUME_24H, max_pages=3)
-    markets = (
+    candidate_markets = (
         MarketFilter(raw)
         .max_spread_cents(3.0)
         .price_range(0.08, 0.92)
         .exclude_categories(EXCLUDE_CATEGORIES)
         .exclude_keywords(EXCLUDE_KEYWORDS)
         .exclude_internal_categories(BLOCK_INTERNAL_CATEGORIES)
-        .top(20, key="volume_24h")
         .results()
     )
+    candidate_markets.sort(key=lambda m: m.volume_24h, reverse=True)
+    markets = enforce_category_diversity(candidate_markets, max_per_category=5, total=20)
     if is_sports_only_active():
         markets = [m for m in markets if classify_internal_category(m.question) == "sports"]
         log.info("SEXYBOT_SPORTS_ONLY is active (expires %s): filtered watch list down to %d sports markets",
