@@ -423,11 +423,14 @@ class PositionRedeemer:
         """
         Pair up YES/NO positions for the same conditionId that are both mergeable.
         Returns list of [yes_pos, no_pos] pairs.
+        Only merges standard binary CTF markets to avoid NegRisk multi-outcome reverts.
         """
         by_condition: dict[str, list[dict]] = {}
         for p in positions:
             if not p.get("mergeable"):
                 continue
+            if p.get("negativeRisk"):
+                continue  # Skip NegRisk merges to avoid multi-outcome GS013 reverts
             cid = p["conditionId"]
             by_condition.setdefault(cid, []).append(p)
 
