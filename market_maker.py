@@ -133,9 +133,11 @@ class MarketMaker:
                 return 0
 
         actions = 0
+        spendable = balance.balance - CRITICAL_BALANCE if balance is not None else 0.0
+        remaining_spendable = [spendable]
         for mkt in markets:
             try:
-                actions += await self._process_market(mkt, balance)
+                actions += await self._process_market(mkt, balance, remaining_spendable)
             except Exception as exc:
                 log.error("MM error on %s: %s", mkt.question[:40], exc)
         return actions
@@ -270,6 +272,7 @@ class MarketMaker:
         self,
         mkt:     PolyMarket,
         balance: Optional[BalanceInfo],
+        remaining_spendable: list[float],
     ) -> int:
         book = self._books.get_book(mkt.yes_token_id)
         if book is None or book.is_stale or book.mid is None:
@@ -379,7 +382,7 @@ class MarketMaker:
         # This allows us to keep quoting even if balance is low, scaling down to a minimum of $1.00.
         effective_size = self._size
         if balance is not None:
-            spendable = balance.balance - CRITICAL_BALANCE
+            spendable = remaining_spendable[0]
             if spendable < 2.0:
                 log.debug("MM SKIP | %s  spendable balance $%.2f is below minimum $2.00", mkt.question[:40], spendable)
                 return actions_cancelled
@@ -419,6 +422,8 @@ class MarketMaker:
             state.yes_order_id = yes_result.order_id
             state.quote_mid    = mid
             actions += 1
+            if balance is not None:
+                remaining_spendable[0] -= effective_size
         else:
             log.debug("MM bid failed: %s", yes_result.error)
 
@@ -436,6 +441,8 @@ class MarketMaker:
         if no_result.success:
             state.no_order_id = no_result.order_id
             actions += 1
+            if balance is not None:
+                remaining_spendable[0] -= effective_size
         else:
             log.debug("MM ask failed: %s", no_result.error)
 
