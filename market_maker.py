@@ -327,23 +327,29 @@ class MarketMaker:
                 "MM ADVERSE (YES) | %s  obi=%+.3f — pulling bid",
                 mkt.question[:40], book.obi,
             )
-            if state.yes_order_id != "DRY_RUN":
+            if state.yes_order_id == "DRY_RUN":
+                state.yes_order_id    = None
+                state.yes_seen_filled = 0.0
+            else:
                 ok = await asyncio.to_thread(self._ex.cancel_order, state.yes_order_id)
                 if ok:
                     actions_cancelled += 1
-            state.yes_order_id    = None
-            state.yes_seen_filled = 0.0
+                    state.yes_order_id    = None
+                    state.yes_seen_filled = 0.0
         if state.no_order_id and book.obi >= ADVERSE_OBI_THRESHOLD:
             log.info(
                 "MM ADVERSE (NO)  | %s  obi=%+.3f — pulling ask",
                 mkt.question[:40], book.obi,
             )
-            if state.no_order_id != "DRY_RUN":
+            if state.no_order_id == "DRY_RUN":
+                state.no_order_id    = None
+                state.no_seen_filled = 0.0
+            else:
                 ok = await asyncio.to_thread(self._ex.cancel_order, state.no_order_id)
                 if ok:
                     actions_cancelled += 1
-            state.no_order_id    = None
-            state.no_seen_filled = 0.0
+                    state.no_order_id    = None
+                    state.no_seen_filled = 0.0
 
         # ── Mid range guard ───────────────────────────────────────────────────
         if not (MIN_MID_FOR_MM <= mid <= MAX_MID_FOR_MM):
@@ -490,11 +496,25 @@ class MarketMaker:
     async def _cancel_quotes(self, mkt: PolyMarket, state: MMState) -> int:
         """Cancel both legs for a market. Returns number of cancels issued."""
         cancelled = 0
-        for order_id in (state.yes_order_id, state.no_order_id):
-            if order_id and order_id != "DRY_RUN":
-                ok = await asyncio.to_thread(self._ex.cancel_order, order_id)
+        
+        # YES leg
+        if state.yes_order_id:
+            if state.yes_order_id == "DRY_RUN":
+                state.yes_order_id = None
+            else:
+                ok = await asyncio.to_thread(self._ex.cancel_order, state.yes_order_id)
                 if ok:
                     cancelled += 1
-        state.yes_order_id = None
-        state.no_order_id  = None
+                    state.yes_order_id = None
+
+        # NO leg
+        if state.no_order_id:
+            if state.no_order_id == "DRY_RUN":
+                state.no_order_id = None
+            else:
+                ok = await asyncio.to_thread(self._ex.cancel_order, state.no_order_id)
+                if ok:
+                    cancelled += 1
+                    state.no_order_id = None
+
         return cancelled

@@ -576,7 +576,7 @@ class ClobExecutor:
             log.info("DRY RUN — cancel order %s skipped", order_id)
             return True
         try:
-            self._client.cancel(order_id)
+            self._client.cancel_order(order_id)
             log.info("CANCELLED | order_id=%s", order_id)
             return True
         except Exception as exc:
