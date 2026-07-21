@@ -1244,6 +1244,12 @@ async def estimate_true_probability(
             log.info("ODDS DISCREPANCY BOOST (NO) | %s: Sportsbooks imply %.3f vs Polymarket %.3f (+5%% boost applied)", 
                      market.question[:40], implied_yes_prob, yes_price)
 
+    # Active Trader Favorite Leagues Boost (NBA, NFL, Tennis: +5% boost)
+    q_lower = (market.question or "").lower()
+    if any(league in q_lower for league in ("nba", "nfl", "tennis")):
+        conf_boost += 0.05
+        log.info("TRADER FAVORITE LEAGUE BOOST | %s (+5%% confidence boost applied)", market.question[:40])
+
     if dominant_side == "YES":
         raw_true_prob = min(yes_price + conf_boost, 0.97)
         side          = OrderSide.BUY

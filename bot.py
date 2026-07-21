@@ -174,7 +174,7 @@ THE_ODDS_API_KEY   = os.getenv("THE_ODDS_API_KEY", "")
 # push our total exposure to that market's category over this fraction
 # of the open book. 0 disables the check; 1.0 effectively disables it.
 # Default 0.50 = no single category > 50% of book.
-MAX_CATEGORY_EXPOSURE_PCT = float(os.getenv("MAX_CATEGORY_EXPOSURE_PCT", "0.50"))
+MAX_CATEGORY_EXPOSURE_PCT = float(os.getenv("MAX_CATEGORY_EXPOSURE_PCT", "0.20"))
 # Hard caps to keep account utilisation bounded — prevents the bot from
 # churning through wallet equity even on a healthy trade-rate day. Set
 # either to 0 to disable. Defaults sized for a ~$250 wallet:
