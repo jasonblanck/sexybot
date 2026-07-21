@@ -87,7 +87,8 @@ class PretradeVerifier:
     def _get_db_macro_context(self) -> str:
         context = []
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            conn.execute("PRAGMA busy_timeout=5000")
             cur = conn.cursor()
             # Fetch latest FRED data
             cur.execute('''
@@ -125,7 +126,8 @@ class PretradeVerifier:
     def _get_db_news_headlines(self) -> str:
         headlines = []
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            conn.execute("PRAGMA busy_timeout=5000")
             cur = conn.cursor()
             cur.execute('''
                 SELECT title, published_at, source 

@@ -9441,7 +9441,8 @@ class PolymarketBot:
         category_pcts = {}
         try:
             import sqlite3
-            conn = sqlite3.connect("/root/polybot/trades.db")
+            conn = sqlite3.connect("/root/polybot/trades.db", timeout=10.0)
+            conn.execute("PRAGMA busy_timeout=5000")
             cur = conn.cursor()
             cur.execute('''
                 SELECT won, time FROM trades 

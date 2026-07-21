@@ -203,7 +203,8 @@ class ConsecutiveLossesCircuitBreaker:
 
         import sqlite3
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            conn.execute("PRAGMA busy_timeout=5000")
             cur = conn.cursor()
             cur.execute('''
                 SELECT won, time FROM trades 
