@@ -3,6 +3,7 @@ import sqlite3
 import time
 import json
 import logging
+import asyncio
 import requests
 from typing import Optional, Tuple
 from datetime import datetime
@@ -228,7 +229,6 @@ Reply ONLY with a JSON object in this format:
                 import anthropic
                 self._anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
             
-            import asyncio
             message = await asyncio.to_thread(
                 self._anthropic_client.messages.create,
                 model=CLAUDE_FAST_MODEL,
