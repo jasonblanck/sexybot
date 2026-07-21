@@ -34,6 +34,7 @@ from observability import (
 )
 from orderbook_ws import BookManager, BookSnapshot, Level
 from redeemer import PositionRedeemer
+from ai_verification import PretradeVerifier
 from risk import (
     BalanceErrorCircuitBreaker,
     BalanceInfo,
@@ -1260,6 +1261,7 @@ async def strategy_loop(
     calibrator:     Optional[Calibrator]                  = None,
     regime_reader:  Optional[RegimeReader]                = None,
     losses_breaker:  Optional[ConsecutiveLossesCircuitBreaker] = None,
+    verifier:        Optional[PretradeVerifier]            = None,
 ) -> None:
     # Give WebSocket connections time to receive initial snapshots for all tokens
     log.info("Waiting 10s for WebSocket order books to populate…")
@@ -1887,6 +1889,13 @@ async def strategy_loop(
                 regime.multiplier, signal.source,
             )
 
+            # Run AI Pretrade Verification if configured
+            if verifier is not None:
+                passed, verify_reason = await verifier.verify_trade(mkt, trade_side, trade_prob, trade_book)
+                if not passed:
+                    log.warning("AI VERIFICATION REJECTED | %s: %s", mkt.question[:40], verify_reason)
+                    continue
+
             # Balance-error circuit breaker: after N failed orders on
             # "insufficient balance" errors, stop trying to place anything
             # for a cooldown. Prevents retry-storm behavior like 2026-04-09.
@@ -2128,6 +2137,7 @@ async def main() -> None:
     # or a local dev machine.
     calibrator    = Calibrator(source=CALIBRATION_SOURCE) if CALIBRATOR_ENABLED else None
     regime_reader = RegimeReader() if REGIME_RESPECT else None
+    verifier      = PretradeVerifier(db_path="/root/polybot/trades.db")
 
     async def _strategy_with_restart() -> None:
         last_traded:    dict[str, float]    = {}
@@ -2166,6 +2176,7 @@ async def main() -> None:
                     calibrator      = calibrator,
                     regime_reader   = regime_reader,
                     losses_breaker  = losses_breaker,
+                    verifier        = verifier,
                 )
             except DrawdownHalt as exc:
                 # Cancel all outstanding orders before halting.
