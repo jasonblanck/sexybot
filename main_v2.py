@@ -178,6 +178,70 @@ REGIME_RESPECT        = os.getenv("REGIME_RESPECT", "true").lower() == "true"
 
 # ── Signal schema ──────────────────────────────────────────────────────────────
 
+class ConsecutiveLossesCircuitBreaker:
+    """
+    Trip a cooldown period if the last N resolved trades in the database were all losses.
+    Stateless across restarts as it queries the trades database.
+    """
+    def __init__(self, db_path: str, max_consecutive_losses: int = 4, cooldown_hours: float = 4.0):
+        self.db_path = db_path
+        self.max_consecutive_losses = max_consecutive_losses
+        self.cooldown_seconds = cooldown_hours * 3600
+        self._last_checked = 0.0
+        self._is_tripped = False
+        self._cooldown_until = 0.0
+
+    def check_status(self) -> bool:
+        now = time.time()
+        if now - self._last_checked < 30:
+            return self._is_tripped
+        self._last_checked = now
+
+        if self._is_tripped and now < self._cooldown_until:
+            return True
+
+        import sqlite3
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT won, time FROM trades 
+                WHERE resolved = 1 AND won IS NOT NULL 
+                ORDER BY time DESC 
+                LIMIT ?
+            ''', (self.max_consecutive_losses,))
+            results = cur.fetchall()
+            conn.close()
+
+            if len(results) < self.max_consecutive_losses:
+                self._is_tripped = False
+                return False
+
+            all_losses = all(r[0] == 0 for r in results)
+            if all_losses:
+                # results[0][1] is latest resolved trade timestamp (ISO-8601 string)
+                from datetime import datetime
+                last_time_str = results[0][1].split("+")[0]
+                last_dt = datetime.fromisoformat(last_time_str)
+                last_ts = last_dt.timestamp()
+
+                if now - last_ts < self.cooldown_seconds:
+                    self._is_tripped = True
+                    self._cooldown_until = last_ts + self.cooldown_seconds
+                    log.warning(
+                        "CONSECUTIVE LOSSES COOLDOWN ACTIVE | %d losses. Cooldown until %s",
+                        self.max_consecutive_losses,
+                        datetime.fromtimestamp(self._cooldown_until).isoformat()
+                    )
+                    return True
+                
+            self._is_tripped = False
+        except Exception as e:
+            log.debug("ConsecutiveLossesCircuitBreaker error: %s", e)
+
+        return False
+
+
 class VolumeSpike(BaseModel):
     """
     Strictly-typed momentum signal from CLOB trade data.
@@ -1195,6 +1259,7 @@ async def strategy_loop(
     balance_breaker: Optional[BalanceErrorCircuitBreaker] = None,
     calibrator:     Optional[Calibrator]                  = None,
     regime_reader:  Optional[RegimeReader]                = None,
+    losses_breaker:  Optional[ConsecutiveLossesCircuitBreaker] = None,
 ) -> None:
     # Give WebSocket connections time to receive initial snapshots for all tokens
     log.info("Waiting 10s for WebSocket order books to populate…")
@@ -1691,7 +1756,9 @@ async def strategy_loop(
 
         # Collect live books — skip markets with an open position (no stacking)
         live: list[tuple[PolyMarket, BookSnapshot]] = []
-        if len(open_positions) >= MAX_CONCURRENT_POSITIONS:
+        if losses_breaker is not None and losses_breaker.check_status():
+            log.warning("CONSECUTIVE LOSSES COOLDOWN ACTIVE — skipping momentum entries")
+        elif len(open_positions) >= MAX_CONCURRENT_POSITIONS:
             log.info("MAX OPEN POSITIONS REACHED (%d/%d) — skipping momentum entries", len(open_positions), MAX_CONCURRENT_POSITIONS)
         else:
             for mkt in markets:
@@ -2069,6 +2136,7 @@ async def main() -> None:
         markets_box:    list[list[PolyMarket]] = [markets]   # mutable box — survives restarts
         drawdown_guard  = DrawdownGuard()                     # account-level kill-switch
         balance_breaker = BalanceErrorCircuitBreaker()        # retry-storm guard
+        losses_breaker  = ConsecutiveLossesCircuitBreaker(db_path="/root/polybot/trades.db")
         
         # Cancel any active/stray orders before we reconcile and trade
         log.info("Startup safety sweep: cancelling all active orders...")
@@ -2097,6 +2165,7 @@ async def main() -> None:
                     balance_breaker = balance_breaker,
                     calibrator      = calibrator,
                     regime_reader   = regime_reader,
+                    losses_breaker  = losses_breaker,
                 )
             except DrawdownHalt as exc:
                 # Cancel all outstanding orders before halting.
