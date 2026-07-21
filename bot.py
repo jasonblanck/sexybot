@@ -9427,6 +9427,59 @@ class PolymarketBot:
             return True
 
     def get_state(self) -> dict:
+        # Reload environment variables to get current SEXYBOT_TRADING_DISABLED status
+        try:
+            from dotenv import load_dotenv
+            load_dotenv("/root/polybot/.env", override=True)
+        except Exception:
+            pass
+        trading_disabled = os.getenv("SEXYBOT_TRADING_DISABLED", "0") == "1"
+
+        # Check consecutive losses circuit breaker
+        losses_tripped = False
+        cooldown_until = 0.0
+        category_pcts = {}
+        try:
+            import sqlite3
+            conn = sqlite3.connect("/root/polybot/trades.db")
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT won, time FROM trades 
+                WHERE resolved = 1 AND won IS NOT NULL 
+                ORDER BY time DESC 
+                LIMIT 4
+            ''')
+            results = cur.fetchall()
+            if len(results) == 4 and all(r[0] == 0 for r in results):
+                from datetime import datetime
+                last_time_str = results[0][1].split("+")[0]
+                last_dt = datetime.fromisoformat(last_time_str)
+                last_ts = last_dt.timestamp()
+                cooldown_seconds = 4 * 3600
+                if time.time() - last_ts < cooldown_seconds:
+                    losses_tripped = True
+                    cooldown_until = last_ts + cooldown_seconds
+            
+            # Fetch active category exposures
+            if os.path.exists("/root/polybot/open_positions.json"):
+                with open("/root/polybot/open_positions.json", "r") as f:
+                    open_pos = json.load(f)
+                total_val = 0.0
+                cat_vals = {}
+                for tok_id, pos in open_pos.items():
+                    qty = pos.get("token_qty", 0.0)
+                    price = pos.get("entry_price", 0.0)
+                    val = qty * price
+                    cat = pos.get("category", "other") or "other"
+                    cat_vals[cat] = cat_vals.get(cat, 0.0) + val
+                    total_val += val
+                if total_val > 0:
+                    for cat, val in cat_vals.items():
+                        category_pcts[cat] = round(val / total_val, 4)
+            conn.close()
+        except Exception as db_exc:
+            log.debug("API get_state db extra checks failed: %s", db_exc)
+
         # Read cached values only — never trigger a network fetch from this
         # path. The cache_warmer background task refreshes balance/positions
         # every 45s, so /status always returns within a few ms. Previously
@@ -9439,6 +9492,10 @@ class PolymarketBot:
         active_cooldowns = sum(1 for ts in self._error_cooldown.values() if ts > now)
         d = {
             "running": self.is_v2_running(),
+            "trading_disabled": trading_disabled,
+            "losses_breaker_tripped": losses_tripped,
+            "losses_breaker_cooldown_until": cooldown_until,
+            "category_exposures": category_pcts,
             "strategy": STRATEGY,
             "dry_run": DRY_RUN,
             "paper_mode": PAPER_MODE,
@@ -10537,6 +10594,50 @@ async def reset_balance_breaker():
         "now_tripped":        bot._balance_halt_tripped,
         "now_streak":         bot._balance_error_streak,
     })
+
+
+@app.post("/admin/trading-toggle", dependencies=[Depends(require_api_key)])
+async def toggle_trading():
+    """Toggle SEXYBOT_TRADING_DISABLED between 1 and 0 in the .env file."""
+    path = "/root/polybot/.env"
+    if not os.path.exists(path):
+        path = ".env"
+    
+    current_val = "0"
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+        
+        new_lines = []
+        found = False
+        for line in lines:
+            if line.strip().startswith("SEXYBOT_TRADING_DISABLED="):
+                val = line.strip().split("=")[1].strip()
+                new_val = "0" if val == "1" else "1"
+                current_val = new_val
+                new_lines.append(f"SEXYBOT_TRADING_DISABLED={new_val}\n")
+                found = True
+            else:
+                new_lines.append(line)
+        
+        if not found:
+            new_lines.append("SEXYBOT_TRADING_DISABLED=1\n")
+            current_val = "1"
+            
+        with open(path, "w") as f:
+            f.writelines(new_lines)
+            
+        from dotenv import load_dotenv
+        load_dotenv(path, override=True)
+        global SEXYBOT_TRADING_DISABLED
+        SEXYBOT_TRADING_DISABLED = os.getenv("SEXYBOT_TRADING_DISABLED", "0") == "1"
+        
+        status_msg = "PAUSED" if SEXYBOT_TRADING_DISABLED else "RESUMED"
+        bot._log(f"Trading state toggled via dashboard: now {status_msg}", "warning")
+        bot.send_telegram(f"🤖 Trading state toggled via dashboard. Now: {status_msg}")
+        return JSONResponse({"ok": True, "trading_disabled": SEXYBOT_TRADING_DISABLED})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to toggle trading: {e}")
 
 
 @app.get("/admin/trades.csv", dependencies=[Depends(require_api_key)])

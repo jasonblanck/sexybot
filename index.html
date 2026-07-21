@@ -656,6 +656,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <span><span style="color:var(--text3)">NDQ </span><span id="hndq">—</span></span>
     </span>
     <span id="clock">—</span>
+    <button onclick="toggleTradingState(this)" id="trading-toggle-btn" class="view-toggle" style="background:#3d141d;color:#ff3355;border:1px solid #ff335540;margin-right:8px" title="Pause or Resume bot trading">⏸ PAUSE TRADING</button>
     <span class="chip chip-paused" id="status-chip" title="Bot status">
       <span class="chip-dot" id="sdot"></span>
       <span id="stext">connecting</span>
@@ -732,6 +733,7 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
         <div class="stat-row"><span class="stat-lbl">Mode</span><span class="stat-val" id="mode">—</span></div>
         <div class="stat-row" id="paper-mode-row" style="display:none"><span class="stat-lbl">Paper Bal</span><span class="stat-val p" id="paper-bal-mini">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Status</span><span class="stat-val" id="bstatus">—</span></div>
+        <div class="stat-row" id="breaker-row" style="display:none"><span class="stat-lbl" style="color:var(--red)">Whipsaw Cooldown</span><span class="stat-val r" id="breaker-state" title="Whipsaw circuit breaker cooldown active">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Volatility</span><span class="stat-val" id="vol-state">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Gas (Polygon)</span><span class="stat-val" id="gas-state">—</span></div>
         <div class="stat-row"><span class="stat-lbl">Regime (Claude)</span><span class="stat-val" id="regime-state" title="Claude risk-officer verdict; hostile halts new trades">—</span></div>
@@ -740,6 +742,12 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
         <div class="stat-row" id="realized-pnl-row" style="display:none"><span class="stat-lbl">Realized P&L (30d)</span><span class="stat-val" id="realized-pnl-state" title="Actual profit/loss on resolved positions — gross payout minus cost">—</span></div>
         <div class="stat-row" id="deep-row" style="display:none"><span class="stat-lbl">Deep verdicts (7d)</span><span class="stat-val" id="deep-state" title="Opus+web_search verifications on high-value trades">—</span></div>
         <div class="stat-row" id="claude-max-row"><span class="stat-lbl">Claude Max</span><span class="stat-val" id="claude-max-state" title="Overall status of the Claude Max stack — click logs for details">—</span></div>
+      </div>
+    </div>
+    <div class="panel" id="alloc-panel">
+      <div class="panel-title">CATEGORY EXPOSURES</div>
+      <div id="alloc-body" style="font-size:11px;color:var(--text2);padding:4px 0">
+        <div style="color:var(--text3);font-size:10px">No active exposures (0% / 40% all categories).</div>
       </div>
     </div>
     <div class="panel" id="backtest-panel">
@@ -1750,8 +1758,53 @@ async function fetchBot(){
     let chipState='active',chipText='live';
     if(rt&&rt.balance_halted){chipState='error';chipText='balance halted';}
     else if(rt&&rt.new_trades_paused){chipState='paused';chipText='daily-loss pause';}
+    else if(d.trading_disabled){chipState='paused';chipText='operator paused';}
+    else if(d.losses_breaker_tripped){chipState='paused';chipText='whipsaw cooldown';}
     else if(!d.running){chipState='paused';chipText='stopped';}
     setBotStatus(chipState,chipText);
+
+    // Update Whipsaw Cooldown Row
+    const breakerRow = document.getElementById('breaker-row');
+    const breakerState = document.getElementById('breaker-state');
+    if (breakerRow && breakerState) {
+      if (d.losses_breaker_tripped) {
+        breakerRow.style.display = '';
+        const cdSec = Math.max(0, Math.round(d.losses_breaker_cooldown_until - Date.now() / 1000));
+        const cdMin = Math.round(cdSec / 60);
+        breakerState.innerHTML = `<span class="r">⚠️ ACTIVE (${cdMin}m left)</span>`;
+      } else {
+        breakerRow.style.display = 'none';
+      }
+    }
+
+    // Update Category Exposures Panel
+    const allocBody = document.getElementById('alloc-body');
+    if (allocBody) {
+      const exposures = d.category_exposures || {};
+      const keys = Object.keys(exposures);
+      if (keys.length > 0) {
+        allocBody.innerHTML = keys.map(cat => {
+          const val = exposures[cat];
+          const pct = Math.round(val * 100);
+          const barCls = pct >= 40 ? 'r' : pct >= 30 ? 'o' : 'g';
+          const colorName = barCls === 'g' ? '#00cc66' : barCls === 'o' ? '#ffaa00' : '#ff3355';
+          return `<div style="margin-bottom:8px">
+            <div class="stat-row" style="margin-bottom:2px">
+              <span class="stat-lbl">${cat.toUpperCase()}</span>
+              <span class="stat-val ${barCls}">${pct}% / 40%</span>
+            </div>
+            <div style="width:100%;height:4px;background:var(--border2);border-radius:2px;overflow:hidden">
+              <div style="width:${Math.min(100, (pct/40)*100)}%;height:100%;background:${colorName}"></div>
+            </div>
+          </div>`;
+        }).join('');
+      } else {
+        allocBody.innerHTML = '<div style="color:var(--text3);font-size:10px">No active exposures (0% / 40% all categories).</div>';
+      }
+    }
+
+    // Update trading pause/resume toggle button in header
+    updateTradingToggleButton(d.trading_disabled);
     // AI status chip — surfaces CLAUDE_MAX_DISABLE so an operator can tell
     // at a glance whether trades are being verified by Claude or running
     // rule-based only.
