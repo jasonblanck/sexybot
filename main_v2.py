@@ -1842,6 +1842,32 @@ async def strategy_loop(
 
             # Build regime descriptor from the book we're about to trade on.
             trade_book = book_manager.get_book(trade_token_id)
+
+            # 1. Event Proximity Guard (Pre-Match Freeze)
+            if mkt.end_date:
+                try:
+                    end_str = mkt.end_date.replace("Z", "")
+                    if "+" in end_str:
+                        end_str = end_str.split("+")[0]
+                    end_dt = datetime.fromisoformat(end_str)
+                    end_ts = end_dt.timestamp()
+                    if signal.is_sports or "sports" in (mkt.category or "").lower():
+                        if time.time() > end_ts - 3600:
+                            log.info("EVENT PROXIMITY FREEZE | %s: match starts/resolves soon (%s), skipping entry",
+                                     mkt.question[:40], mkt.end_date)
+                            continue
+                except Exception as proximity_exc:
+                    log.debug("Proximity guard parse error: %s", proximity_exc)
+
+            # 2. Percentage-Based Spread Guard
+            if trade_book and trade_book.best_bid and trade_book.best_ask:
+                spread = trade_book.best_ask - trade_book.best_bid
+                max_spread = trade_book.best_ask * 0.05  # max 5% of price
+                if spread > max_spread:
+                    log.info("SPREAD GATE REJECT | %s: spread %.4f > max allowed %.4f (5%% of %.4f)",
+                             mkt.question[:40], spread, max_spread, trade_book.best_ask)
+                    continue
+
             regime     = _build_regime(mkt, trade_book) if trade_book else _build_regime(mkt, _yes_book)
 
             # Kelly sizing now scales by signal strength × regime multiplier, so
@@ -1876,6 +1902,17 @@ async def strategy_loop(
                     log.info("SIZING GATE | %s: capped Kelly size $%.2f to $%.2f (max %d%% of balance)",
                              mkt.question[:40], kelly_dollars, max_pos_dollars, int(MAX_POSITION_COST_PCT * 100))
                     kelly_dollars = max_pos_dollars
+
+            # Best-Ask Size Capping (Prevent walking the book / eating slippage)
+            if trade_book and trade_book.best_ask and trade_book.asks:
+                best_ask_price = trade_book.best_ask
+                best_ask_size = trade_book.asks[0].size
+                available_usdc = best_ask_price * best_ask_size
+                if kelly_dollars > available_usdc:
+                    log.info("LIQUIDITY CAPPING | %s: capped size from $%.2f to $%.2f to match top-of-book volume (%f tokens @ %.4f)",
+                             mkt.question[:40], kelly_dollars, available_usdc, best_ask_size, best_ask_price)
+                    kelly_dollars = available_usdc
+
             if kelly_dollars < 1.0:
                 log.debug(
                     "KELLY SKIP | %s  kelly=$%.2f strength=%.2f regime_mult=%.2f",
