@@ -1125,6 +1125,24 @@ async def estimate_true_probability(
         )
         return None
 
+    # 4a. Sports Unaligned Spike Filter: Block standalone volume spikes on sports
+    # markets without OBI alignment. Eliminates 1-2 cent retail order traps.
+    if is_sports and source == "spike":
+        log.info(
+            "SPORTS UNALIGNED SPIKE BLOCKED | %s (requires OBI alignment for sports entries)",
+            market.question[:40],
+        )
+        _shadow(
+            "sports_unaligned_spike",
+            spike_has=spike.has_spike,
+            spike_dominant_side=spike.dominant_side,
+            spike_confidence=spike.confidence,
+            spike_ratio=spike.spike_ratio,
+            signal_source=source,
+            signal_strength=strength,
+        )
+        return None
+
     # 4. OBI must not actively oppose the signal
     if dominant_side == "YES" and obi < -OBI_CONFIRM_MIN:
         log.debug("OBI opposes YES trade (obi=%+.3f) — skip %s", obi, market.question[:40])
