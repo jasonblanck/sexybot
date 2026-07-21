@@ -163,8 +163,9 @@ _INDEXES = (
 def _connect(db_path: str = DEFAULT_DB_PATH) -> Optional[sqlite3.Connection]:
     """Open a write-capable connection with WAL mode + short timeout."""
     try:
-        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=3.0)
+        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10.0)
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
     except sqlite3.Error as exc:

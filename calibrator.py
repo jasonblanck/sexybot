@@ -52,8 +52,9 @@ def _connect(db_path: str) -> Optional[sqlite3.Connection]:
     if not os.path.exists(db_path):
         return None
     try:
-        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=3.0)
+        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10.0)
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
     except sqlite3.Error as exc:
         log.debug("calibrator _connect(%s) failed: %s", db_path, exc)
