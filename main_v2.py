@@ -910,12 +910,22 @@ def _audit_discovery(raw_markets: list[PolyMarket]) -> list[dict]:
 
 # ── Momentum signal ────────────────────────────────────────────────────────────
 
+_TRADE_SESSION: Optional[requests.Session] = None
+
+
+def _get_trade_session() -> requests.Session:
+    global _TRADE_SESSION
+    if _TRADE_SESSION is None:
+        _TRADE_SESSION = requests.Session()
+    return _TRADE_SESSION
+
+
 def _get_recent_trades_sync(token_id: str) -> list[dict]:
     """Synchronous trade fetch — always call via asyncio.to_thread().
-    Uses the public data-api host; the CLOB host requires L2 auth and was
-    silently returning 401 for over a month, disabling _detect_volume_spike."""
+    Uses connection pooling via requests.Session() to eliminate TCP/TLS latency."""
     try:
-        resp = requests.get(
+        session = _get_trade_session()
+        resp = session.get(
             f"{DATA_API_BASE}/trades",
             params={"asset_id": token_id, "limit": 100},
             timeout=REQUEST_TIMEOUT,
