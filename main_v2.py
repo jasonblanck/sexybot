@@ -90,13 +90,13 @@ MIN_BOOK_DEPTH_USDC = float(os.getenv("MIN_BOOK_DEPTH_USDC", "200"))  # skip thr
 # almost no upside to buying at 0.99 — best case ~1c, worst case −99c.
 # Default lowered from 0.80 to 0.70 to prevent asymmetric, negative-EV entries.
 # 80-100c and 70-80c regions were assessed, and the lower ceiling caps capital bleedout.
-MAX_ENTRY_PRICE  = float(os.getenv("MAX_ENTRY_PRICE", "0.70"))
+MAX_ENTRY_PRICE  = float(os.getenv("MAX_ENTRY_PRICE", "0.80"))
 
 # Position management
 TRADE_COOLDOWN_SEC    = 300   # seconds before re-buying the same token
 MARKET_REFRESH_CYCLES = 20   # re-discover markets every N scan cycles
-PROFIT_TARGET         = float(os.getenv("PROFIT_TARGET", "0.08"))   # 8% gain → close (base; dynamic)
-STOP_LOSS             = float(os.getenv("STOP_LOSS",     "0.05"))   # 5% loss → close (base; dynamic)
+PROFIT_TARGET         = float(os.getenv("PROFIT_TARGET", "0.12"))   # 12% gain → close (base; dynamic)
+STOP_LOSS             = float(os.getenv("STOP_LOSS",     "0.08"))   # 8% loss → close (base; dynamic)
 KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.25"))  # Quarter Kelly
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", os.getenv("MAX_OPEN_POSITIONS", "3")))  # Max open positions to limit correlated risk
 MAX_POSITION_COST_PCT    = float(os.getenv("MAX_POSITION_COST_PCT", "0.15"))  # Max 15% of wallet balance per position
@@ -104,18 +104,15 @@ MAX_POSITION_COST_PCT    = float(os.getenv("MAX_POSITION_COST_PCT", "0.15"))  # 
 # close at current bid rather than continuing to hold dead inventory. Helps
 # recycle capital into fresher signals and caps "slow bleed" losses that
 # never quite trigger a stop.
-MAX_HOLD_SEC          = int(os.getenv("MAX_HOLD_SEC", "3600"))   # 1 h default
+MAX_HOLD_SEC          = int(os.getenv("MAX_HOLD_SEC", "7200"))   # 2 h default (120m)
 # Below this absolute (not relative) loss, the time-stop will exit even if
 # the standard percentage stop hasn't triggered. Prevents being stuck in a
 # chronically drifting-lower position.
 TIME_STOP_MIN_GAIN    = float(os.getenv("TIME_STOP_MIN_GAIN", "-0.01"))
 MIN_EXIT_PRICE        = float(os.getenv("MIN_EXIT_PRICE", "0.05"))
-# Comma-separated list of category substrings to skip at discovery. Defaults
-# to 'crypto' per the 2026-04-22 backtest recommendation (short-horizon crypto
-# price markets; 0% resolved win rate and structurally efficient). Override
-# with empty string to re-enable.
+# Comma-separated list of category substrings to skip at discovery.
 EXCLUDE_CATEGORIES    = [
-    c.strip() for c in os.getenv("EXCLUDE_CATEGORIES", "crypto").split(",") if c.strip()
+    c.strip() for c in os.getenv("EXCLUDE_CATEGORIES", "").split(",") if c.strip()
 ]
 # Comma-separated substrings to skip on the market QUESTION (not category),
 # because Polymarket's category field puts most political markets under
