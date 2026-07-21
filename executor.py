@@ -178,6 +178,7 @@ class ClobExecutor:
         # Older entries get pruned lazily inside _record_order_outcome.
         self._reject_history: deque[tuple[float, bool]] = deque(maxlen=2000)
         self._reject_breaker_tripped_at: Optional[float] = None
+        self._neg_risk_cache: dict[str, bool] = {}
 
         log.info("ClobExecutor ready | address=%s dry_run=%s", self._client.get_address(), dry_run)
 
@@ -394,11 +395,13 @@ class ClobExecutor:
         # Exchange contract; orders signed for the wrong one come back
         # as 400 order_version_mismatch). SDK auto-detection wasn't
         # propagating reliably under signature_type=2 — pass explicitly.
-        try:
-            neg_risk_flag = bool(self._client.get_neg_risk(token_id_str))
-        except Exception as nr_exc:
-            log.warning("get_neg_risk failed (token=%s…): %s; defaulting False", token_id_str[:14], nr_exc)
-            neg_risk_flag = False
+        if token_id_str not in self._neg_risk_cache:
+            try:
+                self._neg_risk_cache[token_id_str] = bool(self._client.get_neg_risk(token_id_str))
+            except Exception as nr_exc:
+                log.warning("get_neg_risk failed (token=%s…): %s; defaulting False", token_id_str[:14], nr_exc)
+                self._neg_risk_cache[token_id_str] = False
+        neg_risk_flag = self._neg_risk_cache[token_id_str]
 
         try:
             args = OrderArgs(

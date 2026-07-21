@@ -163,10 +163,13 @@ class OrderBook:
 
     def _record_mid(self) -> None:
         """Append current (ts, mid) if both sides are populated with real volume."""
+        now = time.time()
+        if self._mid_history and (now - self._mid_history[-1][0]) < 0.5:
+            return
         bb = next((p for p, s in sorted(self._bids.items(), reverse=True) if s > 0), None)
         ba = next((p for p, s in sorted(self._asks.items())               if s > 0), None)
         if bb is not None and ba is not None:
-            self._mid_history.append((time.time(), (bb + ba) / 2))
+            self._mid_history.append((now, (bb + ba) / 2))
 
     def _apply_snapshot(self, bids: list[dict], asks: list[dict]) -> None:
         self._bids = {float(b["price"]): float(b["size"]) for b in bids}
@@ -343,8 +346,11 @@ class BookManager:
 
     def get_book(self, token_id: str) -> Optional[BookSnapshot]:
         """Return the latest snapshot for a token, or None if not yet received."""
-        for client in self._clients:
-            snap = client.get_book(token_id)
+        client = getattr(self, "_token_map", {}).get(token_id)
+        if client:
+            return client.get_book(token_id)
+        for c in self._clients:
+            snap = c.get_book(token_id)
             if snap is not None:
                 return snap
         return None
@@ -368,6 +374,11 @@ class BookManager:
             ClobWebSocket(token_ids=batch, on_book_update=self._on_update)
             for batch in batches
         ]
+
+        self._token_map = {}
+        for client in self._clients:
+            for tid in client.token_ids:
+                self._token_map[tid] = client
 
         log.info(
             "BookManager: %d token(s) across %d WS connection(s)",

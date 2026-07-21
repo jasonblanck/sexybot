@@ -182,10 +182,10 @@ class PretradeVerifier:
         # 2. Fetch latest Macro context if macro/economic market
         macro_context = ""
         if "cpi" in question.lower() or "interest rate" in question.lower() or "fed" in question.lower() or "unemployment" in question.lower():
-            macro_context = self._get_db_macro_context()
+            macro_context = await asyncio.to_thread(self._get_db_macro_context)
 
         # 3. Fetch latest News context
-        news_context = self._get_db_news_headlines()
+        news_context = await asyncio.to_thread(self._get_db_news_headlines)
 
         # 4. Construct Prompt
         prompt = f"""You are the pre-trade risk management assistant for an automated Polymarket trading bot.
@@ -222,10 +222,14 @@ Reply ONLY with a JSON object in this format:
 }}"""
 
         try:
-            import anthropic
-            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            message = client.messages.create(
-                model=CLAUDE_FAST_MODEL, # Haiku is fast and cheap for this structured check
+            if not hasattr(self, "_anthropic_client") or self._anthropic_client is None:
+                import anthropic
+                self._anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            
+            import asyncio
+            message = await asyncio.to_thread(
+                self._anthropic_client.messages.create,
+                model=CLAUDE_FAST_MODEL,
                 max_tokens=200,
                 temperature=0.0,
                 messages=[
@@ -234,7 +238,6 @@ Reply ONLY with a JSON object in this format:
             )
             # Parse response
             resp_text = message.content[0].text.strip()
-            # Clean up potential markdown formatting in output
             if resp_text.startswith("```json"):
                 resp_text = resp_text.replace("```json", "").replace("```", "").strip()
             res = json.loads(resp_text)

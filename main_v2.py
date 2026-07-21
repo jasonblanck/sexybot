@@ -1272,6 +1272,13 @@ async def strategy_loop(
     subscribed_yes_ids: set[str] = {mkt.yes_token_id for mkt in markets_box[0]}
 
     while True:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv("/root/polybot/.env", override=True)
+        except Exception:
+            pass
+        trading_disabled = os.getenv("SEXYBOT_TRADING_DISABLED", "0") == "1"
+
         cycle_count[0] += 1
         markets = markets_box[0]
         log.info("── Scanning %d markets (cycle %d) ──", len(markets), cycle_count[0])
@@ -1758,7 +1765,9 @@ async def strategy_loop(
 
         # Collect live books — skip markets with an open position (no stacking)
         live: list[tuple[PolyMarket, BookSnapshot]] = []
-        if losses_breaker is not None and losses_breaker.check_status():
+        if trading_disabled:
+            log.info("TRADING DISABLED (SEXYBOT_TRADING_DISABLED=1) — skipping momentum entries")
+        elif losses_breaker is not None and losses_breaker.check_status():
             log.warning("CONSECUTIVE LOSSES COOLDOWN ACTIVE — skipping momentum entries")
         elif len(open_positions) >= MAX_CONCURRENT_POSITIONS:
             log.info("MAX OPEN POSITIONS REACHED (%d/%d) — skipping momentum entries", len(open_positions), MAX_CONCURRENT_POSITIONS)
