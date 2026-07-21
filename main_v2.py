@@ -1005,6 +1005,45 @@ def _detect_volume_spike(trades: list[dict]) -> VolumeSpike:
     )
 
 
+def evaluate_expiry_matrix(pos: Position, book: BookSnapshot, end_date_iso: Optional[str]) -> Optional[str]:
+    """
+    Conditional Auto-Close Matrix for Expiry Risk (T - 2h = 7200s):
+                   +-----------------------------------+
+                   |      Prob / Price at T - 2h      |
+                   |   < 0.15 or > 0.85   | 0.15 - 0.85  |
+    +--------------+------------------+----------------+
+    | Sufficient   |   HOLD (A)       |  AUTO-CLOSE    |
+    | Order Depth  | (Capture yield)  |  (Cut risk)    |
+    +--------------+------------------+----------------+
+    | Thin Book    |   HOLD (B)       |  LIMIT EXIT    |
+    |              | (Avoid slippage) | (Scale out)    |
+    +--------------+------------------+----------------+
+    """
+    if not end_date_iso:
+        return None
+    try:
+        end_ts = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00")).timestamp()
+        time_to_expiry_sec = end_ts - time.time()
+    except Exception:
+        return None
+
+    if time_to_expiry_sec > 7200 or time_to_expiry_sec < 0:
+        return None  # Only evaluate within T - 2h window
+
+    price = book.best_bid if book.best_bid is not None else pos.entry_price
+    depth = book.book_depth_usdc or 0.0
+
+    # Highly uncertain mid-range (0.15 - 0.85)
+    if 0.15 <= price <= 0.85:
+        if depth >= 200.0:
+            return f"expiry-matrix T-2h auto-close (uncertain p={price:.2f} depth=${depth:.0f})"
+        else:
+            return f"expiry-matrix T-2h limit-exit (uncertain p={price:.2f} thin-depth=${depth:.0f})"
+    
+    # Deep ITM/OTM (<0.15 or >0.85): HOLD to capture yield without taker fees
+    return None
+
+
 async def estimate_true_probability(
     market:     PolyMarket,
     book:       BookSnapshot,
@@ -1720,12 +1759,17 @@ async def strategy_loop(
             held_s  = time.time() - pos.entry_time
             profit_band = pos.profit_target or PROFIT_TARGET
             stop_band   = pos.stop_loss     or STOP_LOSS
+
+            expiry_reason = evaluate_expiry_matrix(pos, book, getattr(pos, "end_date", None))
+
             if gain >= profit_band:
                 reason = f"profit {gain * 100:.1f}% (target {profit_band * 100:.1f}%)"
             elif gain <= -stop_band:
                 reason = f"stop-loss {gain * 100:.1f}% (band {stop_band * 100:.1f}%)"
             elif held_s >= MAX_HOLD_SEC and gain <= TIME_STOP_MIN_GAIN:
                 reason = f"time-stop {held_s / 60:.0f}m gain={gain * 100:+.1f}%"
+            elif expiry_reason is not None:
+                reason = expiry_reason
             else:
                 continue
 
