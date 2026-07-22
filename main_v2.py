@@ -888,7 +888,7 @@ def _audit_discovery(raw_markets: list[PolyMarket]) -> list[dict]:
     # Top-20 by volume_24h with category diversity applied.
     survivors.sort(key=lambda pair: pair[0].volume_24h, reverse=True)
     survivor_markets = [pair[0] for pair in survivors]
-    diverse_selection = enforce_category_diversity(survivor_markets, max_per_category=5, total=20)
+    diverse_selection = enforce_category_diversity(survivor_markets, max_per_category=8, total=40)
     diverse_ids = {m.yes_token_id for m in diverse_selection}
 
     for idx, (m, base) in enumerate(survivors):
@@ -2243,7 +2243,7 @@ async def main() -> None:
 
     # 1. Discover markets
     log.info("Fetching markets from Gamma API…")
-    raw = fetch_markets(min_liquidity=MIN_LIQUIDITY, min_volume=MIN_VOLUME_24H, max_pages=3)
+    raw = fetch_markets(min_liquidity=MIN_LIQUIDITY, min_volume=MIN_VOLUME_24H, max_pages=5)
     candidate_markets = (
         MarketFilter(raw)
         .max_spread_cents(3.0)
@@ -2254,7 +2254,7 @@ async def main() -> None:
         .results()
     )
     candidate_markets.sort(key=lambda m: m.volume_24h, reverse=True)
-    markets = enforce_category_diversity(candidate_markets, max_per_category=5, total=20)
+    markets = enforce_category_diversity(candidate_markets, max_per_category=8, total=40)
     if is_sports_only_active():
         markets = [m for m in markets if classify_internal_category(m.question) == "sports"]
         log.info("SEXYBOT_SPORTS_ONLY is active (expires %s): filtered watch list down to %d sports markets",
