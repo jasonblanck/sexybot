@@ -1036,6 +1036,47 @@ def evaluate_expiry_matrix(pos: Position, book: BookSnapshot, end_date_iso: Opti
     return None
 
 
+def get_rolling_sharpe_multiplier(db_path: str = "/root/polybot/trades.db") -> float:
+    """
+    Institutional Portfolio Risk Engine:
+    Calculates rolling 30-trade Sharpe Ratio from position_postmortem.
+    Sharpe >= 1.2  →  1.25x multiplier (Press proven statistical edge)
+    Sharpe < 0.8   →  0.70x multiplier (30% reduction to preserve capital)
+    Standard       →  1.00x multiplier
+    """
+    if not os.path.exists(db_path):
+        return 1.0
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT realized_gain_pct FROM position_postmortem ORDER BY id DESC LIMIT 30"
+        )
+        rows = cur.fetchall()
+        conn.close()
+        if len(rows) < 5:
+            return 1.0
+        pnls = [r[0] for r in rows if r[0] is not None]
+        if not pnls:
+            return 1.0
+        mean_pnl = sum(pnls) / len(pnls)
+        variance = sum((x - mean_pnl) ** 2 for x in pnls) / len(pnls)
+        std_pnl = math.sqrt(variance)
+        if std_pnl < 1e-4:
+            return 1.0
+        sharpe = mean_pnl / std_pnl
+        if sharpe >= 1.2:
+            log.info("SHARPE SIZING ENGINE | Rolling Sharpe=%.2f >= 1.2 → 1.25x sizing multiplier", sharpe)
+            return 1.25
+        elif sharpe < 0.8:
+            log.info("SHARPE SIZING ENGINE | Rolling Sharpe=%.2f < 0.8 → 0.70x sizing multiplier (risk reduction)", sharpe)
+            return 0.70
+        return 1.0
+    except Exception as exc:
+        log.debug("get_rolling_sharpe_multiplier error (non-fatal): %s", exc)
+        return 1.0
+
+
 async def estimate_true_probability(
     market:     PolyMarket,
     book:       BookSnapshot,
@@ -1951,13 +1992,12 @@ async def strategy_loop(
                     # Lower conviction signals
                     current_fraction = 0.15  # Scale down to minimize risk
 
+            sharpe_mult = get_rolling_sharpe_multiplier()
             kelly_dollars = kelly_size(
                 trade_prob, trade_price,
                 cycle_balance.balance if cycle_balance else MAX_ORDER_SIZE,
-                # Regime scale is applied on top of the dynamic current_fraction so
-                # a macro-cautious call from the detector further throttles sizing
-                # even when book-level regime multiplier would allow more.
-                kelly_fraction  = current_fraction * regime_kelly_scale,
+                # Regime scale & rolling Sharpe multiplier throttle/boost sizing dynamically
+                kelly_fraction  = current_fraction * regime_kelly_scale * sharpe_mult,
                 max_size        = MAX_ORDER_SIZE,
                 max_pct_of_balance = MAX_POSITION_COST_PCT,
                 signal_strength = signal.strength,
