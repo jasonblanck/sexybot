@@ -1980,10 +1980,10 @@ async def strategy_loop(
                              mkt.question[:40], kelly_dollars, available_usdc, best_ask_size, best_ask_price)
                     kelly_dollars = available_usdc
 
-            if kelly_dollars < 1.0:
+            if kelly_dollars < 1.05:
                 log.debug(
-                    "KELLY SKIP | %s  kelly=$%.2f strength=%.2f regime_mult=%.2f",
-                    mkt.question[:40], kelly_dollars, signal.strength, regime.multiplier,
+                    "KELLY SKIP | %s  kelly=$%.2f < $1.05 min",
+                    mkt.question[:40], kelly_dollars
                 )
                 continue
 

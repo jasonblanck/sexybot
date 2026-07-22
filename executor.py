@@ -372,8 +372,8 @@ class ClobExecutor:
         # Convert: tokens = USDC_amount / price_per_token.
         clob_side  = BUY if side == OrderSide.BUY else SELL
         token_size = round(size_pmusd / price, 4)
-
-        # Guard: Polymarket rejects orders below $1 notional value
+        if token_size * price < 1.0:
+            token_size = round(1.05 / price, 4)
         if token_size * price < 1.0:
             return OrderResult(
                 success=False,
