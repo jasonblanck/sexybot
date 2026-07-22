@@ -1125,21 +1125,17 @@ async def estimate_true_probability(
             strength = min(0.6, spike.confidence / 85.0 * 0.6)
         confidence = spike.confidence
     else:
-        # Pure-OBI fallback — tightest threshold, smallest sizing.
-        if abs(obi) < OBI_SOLO_MIN:
-            _shadow(
-                "obi_solo_below",
-                spike_has=spike.has_spike,
-                spike_dominant_side=spike.dominant_side,
-                spike_confidence=spike.confidence,
-                spike_ratio=spike.spike_ratio,
-            )
-            return None
-        dominant_side = "YES" if obi > 0 else "NO"
-        source        = "obi"
-        # Map |obi| from [OBI_SOLO_MIN, 1.0] → strength [0.15, 0.30].
-        strength      = 0.15 + 0.15 * (abs(obi) - OBI_SOLO_MIN) / max(1e-6, 1.0 - OBI_SOLO_MIN)
-        confidence    = abs(obi) * 100
+        # Pure-OBI without trade volume spike is orderbook noise from passive market makers.
+        # Require trade volume verification (spike.has_spike) to prevent ghost entries.
+        log.debug("PURE OBI SKIP | %s  obi=%+.3f (lacks trade volume spike)", market.question[:40], obi)
+        _shadow(
+            "pure_obi_lacks_volume_spike",
+            spike_has=spike.has_spike,
+            spike_dominant_side=spike.dominant_side,
+            spike_confidence=spike.confidence,
+            spike_ratio=spike.spike_ratio,
+        )
+        return None
 
     # 4. Sports Confidence Band Filter: Skip unprofitable 40-59 band (inclusive)
     is_sports = classify_internal_category(market.question or "") == "sports"
