@@ -656,6 +656,8 @@ body[data-theme="light"] .mover-row{border-bottom-color:var(--border);}
       <span><span style="color:var(--text3)">NDQ </span><span id="hndq">—</span></span>
     </span>
     <span id="clock">—</span>
+    <button onclick="toggleVictorySound(this)" id="sound-toggle-btn" class="view-toggle" style="background:#143020;color:#00cc66;border:1px solid #00cc6640;margin-right:4px;" title="Toggle Victory Sound Effects">🔔 SOUND: ON</button>
+    <span id="streak-badge" class="chip" style="background:rgba(255,170,0,0.15);color:#ffaa00;border:1px solid #ffaa0040;display:none;font-weight:600;margin-right:4px;">🔥 0 WINS</span>
     <button onclick="toggleTradingState(this)" id="trading-toggle-btn" class="view-toggle" style="background:#3d141d;color:#ff3355;border:1px solid #ff335540;margin-right:8px" title="Pause or Resume bot trading">⏸ PAUSE TRADING</button>
     <span class="chip chip-paused" id="status-chip" title="Bot status">
       <span class="chip-dot" id="sdot"></span>
@@ -1442,6 +1444,85 @@ if (location.protocol === 'file:') {
 }
 
 const BOT = location.protocol === 'file:' ? 'http://localhost:8000' : `${location.protocol}//${location.host}`;
+
+// ─── Victory Bell Sound & Confetti Effects ─────────────────────
+let victorySoundEnabled = true;
+
+function toggleVictorySound(btn) {
+  victorySoundEnabled = !victorySoundEnabled;
+  if (victorySoundEnabled) {
+    btn.innerHTML = '🔔 SOUND: ON';
+    btn.style.background = '#143020';
+    btn.style.color = '#00cc66';
+    btn.style.borderColor = '#00cc6640';
+    playChaChingSound();
+  } else {
+    btn.innerHTML = '🔕 SOUND: OFF';
+    btn.style.background = '#222';
+    btn.style.color = '#888';
+    btn.style.borderColor = '#444';
+  }
+}
+
+function playChaChingSound() {
+  if (!victorySoundEnabled) return;
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const now = ctx.currentTime;
+    
+    // Note 1: E5 (659.25 Hz)
+    const osc1 = ctx.createOscillator();
+    const gain1 = ctx.createGain();
+    osc1.type = 'sine';
+    osc1.frequency.setValueAtTime(659.25, now);
+    gain1.gain.setValueAtTime(0.15, now);
+    gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+    osc1.connect(gain1);
+    gain1.connect(ctx.destination);
+    osc1.start(now);
+    osc1.stop(now + 0.25);
+
+    // Note 2: B5 (987.77 Hz)
+    const osc2 = ctx.createOscillator();
+    const gain2 = ctx.createGain();
+    osc2.type = 'triangle';
+    osc2.frequency.setValueAtTime(987.77, now + 0.1);
+    gain2.gain.setValueAtTime(0.25, now + 0.1);
+    gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
+    osc2.connect(gain2);
+    gain2.connect(ctx.destination);
+    osc2.start(now + 0.1);
+    osc2.stop(now + 0.5);
+  } catch (e) {
+    console.debug('WebAudio play failed:', e);
+  }
+}
+
+function triggerConfetti() {
+  for (let i = 0; i < 30; i++) {
+    const particle = document.createElement('div');
+    particle.style.position = 'fixed';
+    particle.style.top = '-10px';
+    particle.style.left = Math.random() * 100 + 'vw';
+    particle.style.width = Math.random() * 8 + 4 + 'px';
+    particle.style.height = Math.random() * 8 + 4 + 'px';
+    particle.style.backgroundColor = ['#00cc66', '#ffaa00', '#3399ff', '#ff3355', '#a855f7'][Math.floor(Math.random() * 5)];
+    particle.style.borderRadius = '50%';
+    particle.style.zIndex = '9999';
+    particle.style.pointerEvents = 'none';
+    particle.style.transition = 'transform 2.5s ease-out, opacity 2.5s ease-out';
+    document.body.appendChild(particle);
+    
+    setTimeout(() => {
+      particle.style.transform = `translate(${(Math.random() - 0.5) * 200}px, ${window.innerHeight + 20}px) rotate(${Math.random() * 720}deg)`;
+      particle.style.opacity = '0';
+    }, 20);
+
+    setTimeout(() => particle.remove(), 2600);
+  }
+}
 
 // ─── Auth gate ─────────────────────────────────────────────────
 // Server enforces the session cookie on every read endpoint; this

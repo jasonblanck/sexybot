@@ -909,6 +909,49 @@ def _get_trade_session() -> requests.Session:
     return _TRADE_SESSION
 
 
+WHALE_WALLETS = [
+    w.strip() for w in os.getenv(
+        "WHALE_WALLETS",
+        "0xdb24f6057a66b965ae7a8106209673a3aa5825d1,0x2b84236a287a915998f8d55a6d5952d765fae348,0x712a44d03e5c9f52f8dd0e11893c5d63f0bb7cf9"
+    ).split(",") if w.strip()
+]
+
+_WHALE_CACHE: dict[str, tuple[int, float]] = {}
+
+async def check_whale_consensus(token_id: str) -> int:
+    """Queries top whale wallets for token_id. Returns count of whales holding position."""
+    if not WHALE_WALLETS:
+        return 0
+    now = time.time()
+    if token_id in _WHALE_CACHE:
+        cnt, ts = _WHALE_CACHE[token_id]
+        if now - ts < 600:
+            return cnt
+
+    def _query_whales_sync() -> int:
+        count = 0
+        for whale in WHALE_WALLETS[:5]:
+            try:
+                session = _get_trade_session()
+                resp = session.get(
+                    f"{DATA_API_BASE}/positions",
+                    params={"user": whale, "asset": token_id},
+                    timeout=3
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    positions = data if isinstance(data, list) else data.get("data", [])
+                    if any(float(p.get("size", 0) or 0) > 10.0 for p in positions):
+                        count += 1
+            except Exception:
+                pass
+        return count
+
+    cnt = await asyncio.to_thread(_query_whales_sync)
+    _WHALE_CACHE[token_id] = (cnt, now)
+    return cnt
+
+
 def _get_recent_trades_sync(token_id: str) -> list[dict]:
     """Synchronous trade fetch — always call via asyncio.to_thread().
     Uses connection pooling via requests.Session() to eliminate TCP/TLS latency."""
@@ -1272,6 +1315,12 @@ async def estimate_true_probability(
     if any(league in q_lower for league in ("nba", "nfl", "tennis")):
         conf_boost += 0.05
         log.info("TRADER FAVORITE LEAGUE BOOST | %s (+5%% confidence boost applied)", market.question[:40])
+
+    # Whale Consensus Boost: Check if top whale wallets hold position in this token
+    whales_holding = await check_whale_consensus(book.token_id)
+    if whales_holding >= 2:
+        conf_boost += 0.05
+        log.info("WHALE CONSENSUS BOOST 🐋 | %s: %d whale wallets holding (+5%% confidence boost applied)", market.question[:40], whales_holding)
 
     if dominant_side == "YES":
         raw_true_prob = min(yes_price + conf_boost, 0.97)
