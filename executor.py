@@ -518,11 +518,13 @@ class ClobExecutor:
 
         # Same neg-risk detection as place_limit_order — closing a position
         # on a neg-risk market also requires the right exchange contract.
-        try:
-            neg_risk_flag = bool(self._client.get_neg_risk(token_id_str))
-        except Exception as nr_exc:
-            log.warning("close_position get_neg_risk failed (token=%s…): %s; defaulting False", token_id_str[:14], nr_exc)
-            neg_risk_flag = False
+        if token_id_str not in self._neg_risk_cache:
+            try:
+                self._neg_risk_cache[token_id_str] = bool(self._client.get_neg_risk(token_id_str))
+            except Exception as nr_exc:
+                log.warning("close_position get_neg_risk failed (token=%s…): %s; defaulting False", token_id_str[:14], nr_exc)
+                self._neg_risk_cache[token_id_str] = False
+        neg_risk_flag = self._neg_risk_cache[token_id_str]
 
         try:
             args = OrderArgs(
