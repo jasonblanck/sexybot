@@ -70,18 +70,10 @@ REQUEST_TIMEOUT = 8
 
 # Momentum thresholds
 SPIKE_WINDOW_SEC = 60     # look-back window for recent trades
-SPIKE_RATIO_MIN  = 2.5    # recent rate must be 2.5× the baseline
+SPIKE_RATIO_MIN  = 3.5    # recent rate must be 3.5× the baseline for real volume confirmation
 OBI_CONFIRM_MIN  = 0.20   # OBI must agree with signal direction
-# OBI-only fallback is statistically weaker than a trade-volume spike, so
-# require a MUCH larger imbalance before trading on it alone. This blocks
-# the quiet-market false positives the 0.35 threshold used to allow.
 OBI_SOLO_MIN     = float(os.getenv("OBI_SOLO_MIN", "0.55"))
-# Minimum |estimated_prob − fill_price| edge to take a trade. Lower → more
-# trades but more noise; higher → cleaner signals but fewer fires. 0.03 (3%)
-# is conservative; the calibrator-corrected probabilities should be more
-# trustworthy than this raw bar suggests, so 0.025 may be reasonable once
-# calibration is active.
-MIN_EDGE         = float(os.getenv("MIN_EDGE", "0.03"))
+MIN_EDGE         = float(os.getenv("MIN_EDGE", "0.05"))   # 5.0% minimum edge required to eliminate noise
 MIN_EDGE_YES     = float(os.getenv("MIN_EDGE_YES", "0.07"))
 MIN_BOOK_DEPTH_USDC = float(os.getenv("MIN_BOOK_DEPTH_USDC", "200"))  # skip threadbare books
 # Hard ceiling on the *side we're buying*. At fills ≥ MAX_ENTRY_PRICE the
@@ -1121,20 +1113,14 @@ async def estimate_true_probability(
             source   = "spike+obi"
             strength = min(1.0, spike.confidence / 85.0)   # 85% conf → strength 1.0
         else:
-            source   = "spike"
-            strength = min(0.6, spike.confidence / 85.0 * 0.6)
+            log.debug("UNALIGNED SPIKE SKIP | %s (volume spike lacks OBI alignment)", market.question[:40])
+            _shadow("unaligned_spike_skip", spike_has=spike.has_spike, spike_confidence=spike.confidence)
+            return None
         confidence = spike.confidence
     else:
         # Pure-OBI without trade volume spike is orderbook noise from passive market makers.
-        # Require trade volume verification (spike.has_spike) to prevent ghost entries.
         log.debug("PURE OBI SKIP | %s  obi=%+.3f (lacks trade volume spike)", market.question[:40], obi)
-        _shadow(
-            "pure_obi_lacks_volume_spike",
-            spike_has=spike.has_spike,
-            spike_dominant_side=spike.dominant_side,
-            spike_confidence=spike.confidence,
-            spike_ratio=spike.spike_ratio,
-        )
+        _shadow("pure_obi_skip", spike_has=spike.has_spike)
         return None
 
     # 4. Sports Confidence Band Filter: Skip unprofitable 40-59 band (inclusive)
