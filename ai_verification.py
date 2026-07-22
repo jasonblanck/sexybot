@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 # Load keys
 THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 CLAUDE_FAST_MODEL = os.getenv("CLAUDE_FAST_MODEL", "claude-haiku-4-5")
 
@@ -150,8 +151,8 @@ class PretradeVerifier:
         Query AI (Anthropic/Gemini) to perform pre-trade vetting.
         Returns: (proceed: bool, reason: str)
         """
-        if not ANTHROPIC_API_KEY:
-            return True, "Pretrade check skipped: ANTHROPIC_API_KEY missing"
+        if not ANTHROPIC_API_KEY and not GEMINI_API_KEY:
+            return True, "Pretrade check skipped: ANTHROPIC_API_KEY and GEMINI_API_KEY missing"
 
         question = market.question
         category = market.category or ""
@@ -225,23 +226,36 @@ Reply ONLY with a JSON object in this format:
 }}"""
 
         try:
-            if not hasattr(self, "_anthropic_client") or self._anthropic_client is None:
-                import anthropic
-                self._anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            
-            message = await asyncio.to_thread(
-                self._anthropic_client.messages.create,
-                model=CLAUDE_FAST_MODEL,
-                max_tokens=200,
-                temperature=0.0,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            # Parse response
-            resp_text = message.content[0].text.strip()
+            resp_text = ""
+            if ANTHROPIC_API_KEY:
+                if not hasattr(self, "_anthropic_client") or self._anthropic_client is None:
+                    import anthropic
+                    self._anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+                
+                message = await asyncio.to_thread(
+                    self._anthropic_client.messages.create,
+                    model=CLAUDE_FAST_MODEL,
+                    max_tokens=200,
+                    temperature=0.0,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                resp_text = message.content[0].text.strip()
+            elif GEMINI_API_KEY:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+                payload = {"contents": [{"parts": [{"text": prompt}]}]}
+                r = await asyncio.to_thread(requests.post, url, json=payload, timeout=8)
+                if r.status_code == 200:
+                    gdata = r.json()
+                    resp_text = gdata["candidates"][0]["content"]["parts"][0]["text"].strip()
+                else:
+                    return True, f"Gemini API returned status {r.status_code}"
+
             if resp_text.startswith("```json"):
                 resp_text = resp_text.replace("```json", "").replace("```", "").strip()
+            if resp_text.startswith("```"):
+                resp_text = resp_text.replace("```", "").strip()
             res = json.loads(resp_text)
             
             proceed = res.get("proceed", True)
