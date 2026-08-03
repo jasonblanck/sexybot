@@ -1171,16 +1171,35 @@ async def estimate_true_probability(
 
     # Thin books → skip. Liquidity-starved markets produce erratic signals and
     # can't absorb even a $1 Kelly order without slippage blowing the edge.
-    if book.book_depth_usdc is None or book.book_depth_usdc < MIN_BOOK_DEPTH_USDC:
+    # Enhancement #4: Higher $500 depth requirement on Esports/Tennis/niche sports to avoid thin-book slippage
+    required_min_depth = MIN_BOOK_DEPTH_USDC
+    internal_cat = classify_internal_category(market.question or "")
+    q_lower = (market.question or "").lower()
+    if internal_cat in ("esports", "other") or any(k in q_lower for k in ("lck", "open:", "atp", "wta")):
+        required_min_depth = max(required_min_depth, 500.0)
+
+    if book.book_depth_usdc is None or book.book_depth_usdc < required_min_depth:
         log.debug("DEPTH SKIP | %s  depth=%s < $%.0f",
                   market.question[:40],
                   f"${book.book_depth_usdc:.0f}" if book.book_depth_usdc else "None",
-                  MIN_BOOK_DEPTH_USDC)
+                  required_min_depth)
         _shadow("depth_skip")
         return None
 
     # 2. Volume spike (non-blocking)
     trades = await _get_recent_trades(book.token_id)
+
+    # Enhancement #1: Volatility Floor Filter — Skip flat, stagnant orderbooks with <1.5c price movement
+    if trades and len(trades) >= 5:
+        t_prices = [float(t.get("price", 0)) for t in trades if float(t.get("price", 0)) > 0]
+        if t_prices:
+            p_range = max(t_prices) - min(t_prices)
+            if p_range < 0.015:
+                log.debug("VOLATILITY FLOOR SKIP | %s (stagnant orderbook: recent trade range %.4f < 0.0150)",
+                          market.question[:40], p_range)
+                _shadow("vol_floor_skip")
+                return None
+
     spike  = _detect_volume_spike(trades)
 
     obi = book.obi
@@ -1877,10 +1896,24 @@ async def strategy_loop(
             profit_band = pos.profit_target or PROFIT_TARGET
             stop_band   = pos.stop_loss     or STOP_LOSS
 
+            # Enhancement #2: Trailing Stop / Profit Ratchet
+            max_gain_reached = (
+                (pos.peak_bid - pos.entry_price) / pos.entry_price
+                if (pos.peak_bid and pos.entry_price > 0)
+                else gain
+            )
+            trailing_stop_reason = None
+            if max_gain_reached >= 0.15 and gain <= 0.08:
+                trailing_stop_reason = f"trailing-stop-ratchet +15% hit, locked +8% (now {gain * 100:+.1f}%)"
+            elif max_gain_reached >= 0.08 and gain <= 0.0:
+                trailing_stop_reason = f"trailing-stop-breakeven +8% hit, breakeven locked (now {gain * 100:+.1f}%)"
+
             expiry_reason = evaluate_expiry_matrix(pos, book, getattr(pos, "end_date", None))
 
             if gain >= profit_band:
                 reason = f"profit {gain * 100:.1f}% (target {profit_band * 100:.1f}%)"
+            elif trailing_stop_reason is not None:
+                reason = trailing_stop_reason
             elif gain <= -stop_band:
                 reason = f"stop-loss {gain * 100:.1f}% (band {stop_band * 100:.1f}%)"
             elif held_s >= MAX_HOLD_SEC and gain <= TIME_STOP_MIN_GAIN:
