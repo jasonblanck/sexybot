@@ -89,9 +89,10 @@ TRADE_COOLDOWN_SEC    = 300   # seconds before re-buying the same token
 MARKET_REFRESH_CYCLES = 20   # re-discover markets every N scan cycles
 PROFIT_TARGET         = float(os.getenv("PROFIT_TARGET", "0.12"))   # 12% gain → close (base; dynamic)
 STOP_LOSS             = float(os.getenv("STOP_LOSS",     "0.08"))   # 8% loss → close (base; dynamic)
-KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.25"))  # Quarter Kelly
-MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", os.getenv("MAX_OPEN_POSITIONS", "3")))  # Max open positions to limit correlated risk
-MAX_POSITION_COST_PCT    = float(os.getenv("MAX_POSITION_COST_PCT", "0.15"))  # Max 15% of wallet balance per position
+KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.50"))  # Half-Kelly for concentrated conviction
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", os.getenv("MAX_OPEN_POSITIONS", "2")))  # Max 2 open positions to concentrate bankroll
+MAX_POSITION_COST_PCT    = float(os.getenv("MAX_POSITION_COST_PCT", "0.25"))  # Max 25% of wallet balance per position (~$20 on $80 bankroll)
+USE_PASSIVE_MAKER_ENTRY  = os.getenv("USE_PASSIVE_MAKER_ENTRY", "1").lower() in ("1", "true", "yes")
 # Time-based exit: if a position doesn't hit profit/stop within this window,
 # close at current bid rather than continuing to hold dead inventory. Helps
 # recycle capital into fresher signals and caps "slow bleed" losses that
@@ -2168,6 +2169,13 @@ async def strategy_loop(
                 log.warning("CIRCUIT BREAKER ACTIVE — skipping order placement this cycle")
                 break
 
+            # Calculate Passive Maker Price (Best Bid + 0.1c, staying strictly below Best Ask)
+            maker_price = None
+            if USE_PASSIVE_MAKER_ENTRY and trade_book and trade_book.best_bid and trade_book.best_ask:
+                maker_price = round(min(trade_book.best_bid + 0.001, trade_book.best_ask - 0.001), 4)
+                log.info("MAKER ENTRY 🏛️ | %s: placing passive limit bid at %.4f (vs ask %.4f)",
+                         mkt.question[:40], maker_price, trade_book.best_ask)
+
             try:
                 result = await asyncio.to_thread(
                     executor.place_limit_order,
@@ -2176,6 +2184,7 @@ async def strategy_loop(
                     trade_prob,
                     kelly_dollars,
                     cached_balance=cycle_balance,
+                    price_override=maker_price,
                 )
             except Exception as exc:
                 log.error("Order error for %s: %s", mkt.question[:40], exc)
