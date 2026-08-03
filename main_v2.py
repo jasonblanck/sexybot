@@ -1682,8 +1682,47 @@ async def strategy_loop(
 
                 info = await asyncio.to_thread(executor.get_order, pos.exit_order_id)
                 if not isinstance(info, dict):
-                    log.warning("Exit order monitoring: get_order for %s failed. Retrying next cycle.", pos.exit_order_id)
-                    continue
+                    elapsed = time.time() - (pos.exit_order_time or time.time())
+                    if elapsed >= 60:
+                        log.warning(
+                            "Exit order monitoring: get_order for %s returned None after %.0fs. Cleaning up completed position...",
+                            pos.exit_order_id, elapsed
+                        )
+                        try:
+                            exit_p = pos.trough_bid if (pos.trough_bid and pos.trough_bid > 0) else pos.entry_price
+                            realized = ((exit_p - pos.entry_price) / pos.entry_price) * 100 if pos.entry_price > 0 else 0.0
+                            await asyncio.to_thread(
+                                record_postmortem,
+                                token_id              = token_id,
+                                market                = pos.market_question,
+                                entry_price           = pos.entry_price,
+                                entry_time            = datetime.fromtimestamp(pos.entry_time, tz=timezone.utc).isoformat(),
+                                exit_price            = exit_p,
+                                exit_time             = datetime.now(timezone.utc).isoformat(),
+                                held_seconds          = int(time.time() - pos.entry_time),
+                                peak_bid              = pos.peak_bid,
+                                trough_bid            = pos.trough_bid,
+                                max_gain_pct          = ((pos.peak_bid - pos.entry_price) / pos.entry_price * 100) if (pos.peak_bid and pos.entry_price > 0) else 0.0,
+                                min_gain_pct          = ((pos.trough_bid - pos.entry_price) / pos.entry_price * 100) if (pos.trough_bid and pos.entry_price > 0) else 0.0,
+                                realized_gain_pct     = realized,
+                                exit_reason           = pos.exit_reason or "exit_order_closed",
+                                entry_signal_source   = pos.entry_signal_source,
+                                entry_signal_strength = pos.entry_signal_strength,
+                                profit_target         = pos.profit_target,
+                                stop_loss             = pos.stop_loss,
+                                exit_order_id         = pos.exit_order_id,
+                                exit_status           = "cleaned_up",
+                            )
+                        except Exception as exc:
+                            log.debug("record_postmortem cleanup failed: %s", exc)
+
+                        del open_positions[token_id]
+                        save_open_positions(open_positions)
+                        last_traded[token_id] = time.time()
+                        continue
+                    else:
+                        log.warning("Exit order monitoring: get_order for %s failed. Retrying next cycle.", pos.exit_order_id)
+                        continue
 
                 status = (info.get("status") or "").lower()
                 try:
