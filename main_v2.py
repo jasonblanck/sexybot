@@ -35,6 +35,8 @@ from observability import (
 from orderbook_ws import BookManager, BookSnapshot, Level
 from redeemer import PositionRedeemer
 from ai_verification import PretradeVerifier
+from odds_arbitrage import OddsArbitrageEngine
+from negrisk_arb import NegRiskArbitrageScanner
 from risk import (
     BalanceErrorCircuitBreaker,
     BalanceInfo,
@@ -48,6 +50,9 @@ from risk import (
 from signing import OrderSide
 
 log = logging.getLogger(__name__)
+
+odds_engine = OddsArbitrageEngine(api_key=os.getenv("ODDS_API_KEY", "5de376180beea7063706c8abd03097a5"))
+negrisk_scanner = NegRiskArbitrageScanner()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -1199,12 +1204,15 @@ async def estimate_true_probability(
                 _shadow("vol_floor_skip")
                 return None
 
-    spike  = _detect_volume_spike(trades)
-
-    obi = book.obi
-
-    # 3. Classify tier
-    if spike.has_spike and spike.dominant_side is not None:
+    # Check 1: Sharp Sportsbook Arbitrage Engine (The Odds API)
+    sharp_edge = odds_engine.get_sharp_edge(market.question, book.best_ask or yes_price)
+    if sharp_edge is not None:
+        source   = "sharp_arb"
+        strength = 1.0
+        confidence = 95.0
+        dominant_side = "YES"
+        log.info("SHARP ARBITRAGE SIGNAL ⚡ | %s: Sharp Edge=+%.2f%%", market.question[:45], sharp_edge * 100)
+    elif spike.has_spike and spike.dominant_side is not None:
         dominant_side = spike.dominant_side
         # OBI alignment: positive OBI supports YES, negative supports NO.
         obi_aligned = (
@@ -1224,6 +1232,16 @@ async def estimate_true_probability(
         log.debug("PURE OBI SKIP | %s  obi=%+.3f (lacks trade volume spike)", market.question[:40], obi)
         _shadow("pure_obi_skip", spike_has=spike.has_spike)
         return None
+
+    # Check 2: Whale Copy-Trading Consensus Engine Boost
+    try:
+        whales_active = await check_whale_consensus(book.token_id)
+        if whales_active >= 2:
+            log.info("WHALE CONSENSUS CONFIRMED 🐋 | %s: %d whale wallets holding", market.question[:45], whales_active)
+            strength = min(1.0, strength + 0.20)
+            confidence = min(99.0, confidence + 10.0)
+    except Exception as whale_exc:
+        log.debug("Whale consensus check non-fatal error: %s", whale_exc)
 
     # 4. Sports Confidence Band Filter: Skip unprofitable 40-59 band (inclusive)
     is_sports = classify_internal_category(market.question or "") == "sports"
