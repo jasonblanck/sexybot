@@ -1204,6 +1204,9 @@ async def estimate_true_probability(
                 _shadow("vol_floor_skip")
                 return None
 
+    spike  = _detect_volume_spike(trades)
+    obi    = book.obi
+
     # Check 1: Sharp Sportsbook Arbitrage Engine (The Odds API)
     sharp_edge = odds_engine.get_sharp_edge(market.question, book.best_ask or yes_price)
     if sharp_edge is not None:
