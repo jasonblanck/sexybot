@@ -53,6 +53,8 @@ log = logging.getLogger(__name__)
 
 odds_engine = OddsArbitrageEngine(api_key=os.getenv("ODDS_API_KEY", "5de376180beea7063706c8abd03097a5"))
 negrisk_scanner = NegRiskArbitrageScanner()
+weather_oracle = WeatherOracle()
+econ_engine = EconCalendarEngine()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -1226,9 +1228,17 @@ async def estimate_true_probability(
     spike  = _detect_volume_spike(trades)
     obi    = book.obi
 
+    # Check 0: NOAA Weather Oracle Engine (100% Deterministic Settlement)
+    weather_eval = weather_oracle.evaluate_weather_question(market.question, book.best_ask or yes_price)
+    if weather_eval is not None:
+        prob_oracle, reason_oracle = weather_eval
+        source   = "weather_oracle"
+        strength = 1.0
+        confidence = 99.0
+        dominant_side = "YES"
+        log.info("NOAA ORACLE SIGNAL 🌡️ | %s", reason_oracle)
     # Check 1: Sharp Sportsbook Arbitrage Engine (The Odds API)
-    sharp_edge = odds_engine.get_sharp_edge(market.question, book.best_ask or yes_price)
-    if sharp_edge is not None:
+    elif (sharp_edge := odds_engine.get_sharp_edge(market.question, book.best_ask or yes_price)) is not None:
         source   = "sharp_arb"
         strength = 1.0
         confidence = 95.0
@@ -2153,12 +2163,16 @@ async def strategy_loop(
                     current_fraction = 0.15  # Scale down to minimize risk
 
             sharpe_mult = get_rolling_sharpe_multiplier()
+            current_bal = cycle_balance.balance if cycle_balance else 80.0
+            # Dynamic Compound Interest Sizing Engine: Base max $20.00, +$2.50 for every $10 balance > $80
+            dynamic_max_order_size = 20.0 + max(0.0, ((current_bal - 80.0) / 10.0) * 2.50)
+
             kelly_dollars = kelly_size(
                 trade_prob, trade_price,
-                cycle_balance.balance if cycle_balance else MAX_ORDER_SIZE,
+                current_bal,
                 # Regime scale & rolling Sharpe multiplier throttle/boost sizing dynamically
                 kelly_fraction  = current_fraction * regime_kelly_scale * sharpe_mult,
-                max_size        = MAX_ORDER_SIZE,
+                max_size        = dynamic_max_order_size,
                 max_pct_of_balance = MAX_POSITION_COST_PCT,
                 signal_strength = signal.strength,
                 regime          = regime,
