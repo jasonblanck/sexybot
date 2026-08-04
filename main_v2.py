@@ -87,7 +87,7 @@ MAX_ENTRY_PRICE  = float(os.getenv("MAX_ENTRY_PRICE", "0.80"))
 # Position management
 TRADE_COOLDOWN_SEC    = 300   # seconds before re-buying the same token
 MARKET_REFRESH_CYCLES = 20   # re-discover markets every N scan cycles
-PROFIT_TARGET         = float(os.getenv("PROFIT_TARGET", "0.12"))   # 12% gain → close (base; dynamic)
+PROFIT_TARGET         = float(os.getenv("PROFIT_TARGET", "0.10"))   # 10% gain → close (base; dynamic)
 STOP_LOSS             = float(os.getenv("STOP_LOSS",     "0.08"))   # 8% loss → close (base; dynamic)
 KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.50"))  # Half-Kelly for concentrated conviction
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", os.getenv("MAX_OPEN_POSITIONS", "2")))  # Max 2 open positions to concentrate bankroll
@@ -1170,20 +1170,18 @@ async def estimate_true_probability(
         _shadow("no_vamp")
         return None
 
-    # Thin books → skip. Liquidity-starved markets produce erratic signals and
-    # can't absorb even a $1 Kelly order without slippage blowing the edge.
-    # Enhancement #4: Higher $500 depth requirement on Esports/Tennis/niche sports to avoid thin-book slippage
-    required_min_depth = MIN_BOOK_DEPTH_USDC
-    internal_cat = classify_internal_category(market.question or "")
+    # Exclude erratic live tennis qualifiers & niche esports matches — direct 100% of capital into Crypto, Macro & Major Sports
     q_lower = (market.question or "").lower()
-    if internal_cat in ("esports", "other") or any(k in q_lower for k in ("lck", "open:", "atp", "wta")):
-        required_min_depth = max(required_min_depth, 500.0)
+    if any(k in q_lower for k in ("open:", "atp ", "wta ", "challenger", "itf ", "lck", "lcs", "lec", "counter-strike")):
+        log.debug("NICHE SPORT EXCLUSION | %s (focusing capital on Crypto, Macro & Major Sports)", market.question[:40])
+        _shadow("niche_sport_skip")
+        return None
 
-    if book.book_depth_usdc is None or book.book_depth_usdc < required_min_depth:
+    if book.book_depth_usdc is None or book.book_depth_usdc < MIN_BOOK_DEPTH_USDC:
         log.debug("DEPTH SKIP | %s  depth=%s < $%.0f",
                   market.question[:40],
                   f"${book.book_depth_usdc:.0f}" if book.book_depth_usdc else "None",
-                  required_min_depth)
+                  MIN_BOOK_DEPTH_USDC)
         _shadow("depth_skip")
         return None
 
