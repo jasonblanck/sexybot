@@ -120,47 +120,54 @@ def fetch_markets(
     tag_slug:      Optional[str]= None,
 ) -> list[PolyMarket]:
     results: list[PolyMarket] = []
-    offset = 0
+    seen_ids: set[str] = set()
 
-    for page in range(max_pages):
-        params: dict = {
-            "active":    str(active).lower(),
-            "closed":    str(closed).lower(),
-            "limit":     limit,
-            "offset":    offset,
-            "order":     order_by,
-            "ascending": str(ascending).lower(),
-        }
-        if tag_slug:
-            params["tag_slug"] = tag_slug
+    tags_to_fetch = [tag_slug] if tag_slug else [None, "weather"]
 
-        try:
-            resp = _SESSION.get(f"{GAMMA_BASE}/markets", params=params, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            log.error("Gamma /markets request failed (page %d): %s", page, exc)
-            break
+    for tag in tags_to_fetch:
+        offset = 0
+        pages = max_pages if tag is None else 2
+        for page in range(pages):
+            params: dict = {
+                "active":    str(active).lower(),
+                "closed":    str(closed).lower(),
+                "limit":     limit,
+                "offset":    offset,
+                "order":     order_by,
+                "ascending": str(ascending).lower(),
+            }
+            if tag:
+                params["tag_slug"] = tag
 
-        batch: list[dict] = resp.json()
-        if not batch:
-            break
+            try:
+                resp = _SESSION.get(f"{GAMMA_BASE}/markets", params=params, timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                log.error("Gamma /markets request failed (page %d): %s", page, exc)
+                break
 
-        for raw in batch:
-            mkt = _parse_market(raw)
-            if mkt is None:
-                continue
-            if mkt.liquidity < min_liquidity:
-                continue
-            if mkt.volume_24h < min_volume:
-                continue
-            if mkt.yes_price <= 0.02 or mkt.yes_price >= 0.98:
-                continue
-            results.append(mkt)
+            batch: list[dict] = resp.json()
+            if not batch:
+                break
 
-        if len(batch) < limit:
-            break
-        offset += limit
-        time.sleep(0.1)
+            for raw in batch:
+                mkt = _parse_market(raw)
+                if mkt is None or mkt.id in seen_ids:
+                    continue
+                min_liq_req = 200.0 if (tag == "weather" or "weather" in (mkt.category or "").lower()) else min_liquidity
+                if mkt.liquidity < min_liq_req:
+                    continue
+                if mkt.volume_24h < min_volume:
+                    continue
+                if mkt.yes_price <= 0.02 or mkt.yes_price >= 0.98:
+                    continue
+                seen_ids.add(mkt.id)
+                results.append(mkt)
+
+            if len(batch) < limit:
+                break
+            offset += limit
+            time.sleep(0.1)
 
     log.info("fetch_markets → %d tradeable markets found", len(results))
     return results

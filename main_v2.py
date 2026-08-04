@@ -891,8 +891,27 @@ def _audit_discovery(raw_markets: list[PolyMarket]) -> list[dict]:
             continue
         survivors.append((m, base))
 
-    # Top-20 by volume_24h with category diversity applied.
-    survivors.sort(key=lambda pair: pair[0].volume_24h, reverse=True)
+    # Prioritize Fast-Resolving (resolving < 48 hours or weather) + Top Volume
+    def _market_priority(pair):
+        m = pair[0]
+        q_lower = (m.question or "").lower()
+        is_weather_or_fast = classify_internal_category(m.question or "") == "weather" or any(
+            k in q_lower for k in ("weather", "temperature", "rain", "degrees", "today", "climate", "heatwave")
+        )
+        time_to_end = 999999.0
+        if m.end_date:
+            try:
+                end_str = m.end_date.replace("Z", "")
+                if "+" in end_str:
+                    end_str = end_str.split("+")[0]
+                end_ts = datetime.fromisoformat(end_str).timestamp()
+                time_to_end = (end_ts - time.time()) / 3600.0   # hours
+            except Exception:
+                pass
+        fast_bonus = 1000000.0 if (time_to_end <= 48.0 or is_weather_or_fast) else 0.0
+        return m.volume_24h + fast_bonus
+
+    survivors.sort(key=_market_priority, reverse=True)
     survivor_markets = [pair[0] for pair in survivors]
     diverse_selection = enforce_category_diversity(survivor_markets, max_per_category=8, total=40)
     diverse_ids = {m.yes_token_id for m in diverse_selection}
