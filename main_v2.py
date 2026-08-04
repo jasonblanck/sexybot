@@ -34,6 +34,7 @@ from observability import (
 )
 from orderbook_ws import BookManager, BookSnapshot, Level
 from redeemer import PositionRedeemer
+from ai_verification import PretradeVerifier
 from odds_arbitrage import OddsArbitrageEngine
 from negrisk_arb import NegRiskArbitrageScanner
 from weather_oracle import WeatherOracle
