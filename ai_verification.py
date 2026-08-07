@@ -228,21 +228,23 @@ Reply ONLY with a JSON object in this format:
         try:
             resp_text = ""
             if ANTHROPIC_API_KEY:
-                if not hasattr(self, "_anthropic_client") or self._anthropic_client is None:
-                    import anthropic
-                    self._anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-                
-                message = await asyncio.to_thread(
-                    self._anthropic_client.messages.create,
-                    model=CLAUDE_FAST_MODEL,
-                    max_tokens=200,
-                    temperature=0.0,
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                resp_text = message.content[0].text.strip()
-            elif GEMINI_API_KEY:
+                try:
+                    if not hasattr(self, "_anthropic_client") or self._anthropic_client is None:
+                        import anthropic
+                        self._anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+                    
+                    message = await asyncio.to_thread(
+                        self._anthropic_client.messages.create,
+                        model=CLAUDE_FAST_MODEL,
+                        max_tokens=200,
+                        temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    resp_text = message.content[0].text.strip()
+                except Exception as anthropic_err:
+                    log.debug("Anthropic verification failed (%s), attempting Gemini fallback...", anthropic_err)
+
+            if not resp_text and GEMINI_API_KEY:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
                 payload = {"contents": [{"parts": [{"text": prompt}]}]}
                 r = await asyncio.to_thread(requests.post, url, json=payload, timeout=8)
@@ -250,7 +252,10 @@ Reply ONLY with a JSON object in this format:
                     gdata = r.json()
                     resp_text = gdata["candidates"][0]["content"]["parts"][0]["text"].strip()
                 else:
-                    return True, f"Gemini API returned status {r.status_code}"
+                    log.debug("Gemini API returned status %d", r.status_code)
+
+            if not resp_text:
+                return True, "Pretrade check passed (AI verification bypassed/failed open)"
 
             if resp_text.startswith("```json"):
                 resp_text = resp_text.replace("```json", "").replace("```", "").strip()

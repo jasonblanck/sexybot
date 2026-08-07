@@ -2422,6 +2422,14 @@ async def main() -> None:
     book_manager = BookManager()
     for mkt in markets:
         book_manager.add_market(mkt.yes_token_id, mkt.no_token_id)
+    if os.path.exists("/root/polybot/open_positions.json"):
+        try:
+            with open("/root/polybot/open_positions.json", "r") as f:
+                pos_data = json.load(f)
+                for tid in pos_data.keys():
+                    book_manager.add_market(tid, tid)
+        except Exception:
+            pass
 
     # 3. Executor
     executor = ClobExecutor(
