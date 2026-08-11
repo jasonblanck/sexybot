@@ -115,27 +115,41 @@ class OddsArbitrageEngine:
 
     def get_sharp_edge(self, question: str, polymarket_price: float) -> Optional[float]:
         """
-        Match question against sharp sportsbook probabilities.
+        Match question against sharp sportsbook probabilities across MLB, NFL, NBA, Soccer, and Tennis.
         Returns positive edge if sharp prob > polymarket_price + min_threshold, else None.
         """
         q_lower = question.lower()
 
-        # Determine relevant sport key
-        sport_key = "baseball_mlb" if ("vs" in q_lower or "vs." in q_lower) else None
-        if not sport_key:
+        # Determine relevant sport keys dynamically
+        sport_keys = []
+        if any(w in q_lower for w in ("mlb", "mets", "braves", "yankees", "reds", "dodgers", "cubs", "red sox", "white sox", "baseball", "athletics", "angels", "orioles", "phillies", "guardians", "astros", "mariners", "rangers", "padres", "giants", "diamondbacks", "brewers", "twins")):
+            sport_keys.append("baseball_mlb")
+        if any(w in q_lower for w in ("nfl", "super bowl", "touchdown", "quarterback", "patriots", "chiefs", "eagles", "cowboys", "49ers", "packers")):
+            sport_keys.append("americanfootball_nfl")
+        if any(w in q_lower for w in ("nba", "wnba", "basketball", "celtics", "lakers", "warriors", "bucks", "heat")):
+            sport_keys.extend(["basketball_nba", "basketball_wnba"])
+        if any(w in q_lower for w in ("soccer", "epl", "premier league", "champions league", "mls", "real madrid", "barcelona")):
+            sport_keys.extend(["soccer_epl", "soccer_usa_mls"])
+        if any(w in q_lower for w in ("tennis", "us open", "wimbledon", "atp", "wta", "djokovic", "alcaraz", "sinner", "swiatek", "gauff")):
+            sport_keys.extend(["tennis_atp", "tennis_wta"])
+
+        if not sport_keys and ("vs" in q_lower or "vs." in q_lower):
+            sport_keys = ["baseball_mlb", "americanfootball_nfl", "soccer_epl"]
+
+        if not sport_keys:
             return None
 
-        sharp_probs = self.fetch_sharp_probabilities(sport_key)
-        if not sharp_probs:
-            return None
+        for sk in sport_keys:
+            sharp_probs = self.fetch_sharp_probabilities(sk)
+            if not sharp_probs:
+                continue
 
-        # Search for team name in question
-        for team, prob in sharp_probs.items():
-            if len(team) > 3 and team in q_lower:
-                edge = prob - polymarket_price
-                if edge >= 0.04:  # At least 4% sharp edge
-                    log.info("SHARP EDGE DETECTED ⚡ | %s: Sharp Prob=%.4f vs Poly Ask=%.4f (Edge=%+.2f%%)",
-                             question[:40], prob, polymarket_price, edge * 100)
-                    return edge
+            for team, prob in sharp_probs.items():
+                if len(team) > 3 and team in q_lower:
+                    edge = prob - polymarket_price
+                    if edge >= 0.04:  # At least 4% sharp edge
+                        log.info("SHARP EDGE DETECTED ⚡ [%s] | %s: Sharp Prob=%.4f vs Poly Ask=%.4f (Edge=%+.2f%%)",
+                                 sk, question[:40], prob, polymarket_price, edge * 100)
+                        return edge
 
         return None
