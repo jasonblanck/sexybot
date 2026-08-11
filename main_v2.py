@@ -39,6 +39,7 @@ from odds_arbitrage import OddsArbitrageEngine
 from negrisk_arb import NegRiskArbitrageScanner
 from weather_oracle import WeatherOracle
 from econ_calendar import EconCalendarEngine
+from whale_copier import WhaleCopierEngine
 from risk import (
     BalanceErrorCircuitBreaker,
     BalanceInfo,
@@ -57,6 +58,7 @@ odds_engine = OddsArbitrageEngine(api_key=os.getenv("ODDS_API_KEY", "5de376180be
 negrisk_scanner = NegRiskArbitrageScanner()
 weather_oracle = WeatherOracle()
 econ_engine = EconCalendarEngine()
+whale_engine = WhaleCopierEngine()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -1246,6 +1248,13 @@ async def estimate_true_probability(
         confidence = 95.0
         dominant_side = "YES"
         log.info("SHARP ARBITRAGE SIGNAL ⚡ | %s: Sharp Edge=+%.2f%%", market.question[:45], sharp_edge * 100)
+    # Check 1.5: Whale Copy-Trading & Smart Money Sentiment Engine
+    elif (whale_boost := whale_engine.get_whale_boost(market.yes_token_id)) > 0:
+        source   = "whale_consensus"
+        strength = 1.0
+        confidence = 90.0
+        dominant_side = "YES"
+        log.info("WHALE CONSENSUS SIGNAL 🐋 | %s: Smart Money Boost=+%.2f%%", market.question[:45], whale_boost * 100)
     elif spike.has_spike and spike.dominant_side is not None:
         dominant_side = spike.dominant_side
         # OBI alignment: positive OBI supports YES, negative supports NO.
