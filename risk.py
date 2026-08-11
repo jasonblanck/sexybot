@@ -233,8 +233,8 @@ class DrawdownGuard:
         self.window       = window
         self.hourly_loss_limit = float(os.getenv("HOURLY_LOSS_LIMIT", "8.0"))
         self.daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "15.0"))
-        self.max_hourly_trades = int(os.getenv("MAX_HOURLY_TRADES", "10"))
-        self.max_daily_trades  = int(os.getenv("MAX_DAILY_TRADES", "50"))
+        self.max_hourly_trades = int(os.getenv("MAX_HOURLY_TRADES", "30"))
+        self.max_daily_trades  = int(os.getenv("MAX_DAILY_TRADES", "100"))
         
         self._history:     list[tuple[float, float]] = []   # (ts, balance)
         self._history_1h:  list[tuple[float, float]] = []   # (ts, balance) rolling 1h
