@@ -1848,7 +1848,6 @@ async def strategy_loop(
                         log.debug("record_postmortem in monitoring failed: %s", exc)
 
                     try:
-                        fill_price = float(info.get("price", 0) or pos.entry_price)
                         await asyncio.to_thread(
                             record_trade,
                             market       = pos.market_question or "",
@@ -2195,13 +2194,13 @@ async def strategy_loop(
                              mkt.question[:40], kelly_dollars, max_pos_dollars, int(MAX_POSITION_COST_PCT * 100))
                     kelly_dollars = max_pos_dollars
 
-            # Best-Ask Size Capping (Prevent walking the book / eating slippage)
-            if trade_book and trade_book.best_ask and trade_book.asks:
+            # Best-Ask Size Capping (Prevent walking the book / eating slippage on taker orders)
+            if not USE_PASSIVE_MAKER_ENTRY and trade_book and trade_book.best_ask and trade_book.asks:
                 best_ask_price = trade_book.best_ask
                 best_ask_size = trade_book.asks[0].size
                 available_usdc = best_ask_price * best_ask_size
                 if kelly_dollars > available_usdc:
-                    log.info("LIQUIDITY CAPPING | %s: capped size from $%.2f to $%.2f to match top-of-book volume (%f tokens @ %.4f)",
+                    log.info("LIQUIDITY CAPPING | %s: capped taker size from $%.2f to $%.2f to match top-of-book ask volume (%f tokens @ %.4f)",
                              mkt.question[:40], kelly_dollars, available_usdc, best_ask_size, best_ask_price)
                     kelly_dollars = available_usdc
 
