@@ -100,8 +100,8 @@ TRADE_COOLDOWN_SEC    = 300   # seconds before re-buying the same token
 MARKET_REFRESH_CYCLES = 20   # re-discover markets every N scan cycles
 PROFIT_TARGET         = float(os.getenv("PROFIT_TARGET", "0.10"))   # 10% gain → close (base; dynamic)
 STOP_LOSS             = float(os.getenv("STOP_LOSS",     "0.08"))   # 8% loss → close (base; dynamic)
-KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.50"))  # Half-Kelly for concentrated conviction
-MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", os.getenv("MAX_OPEN_POSITIONS", "2")))  # Max 2 open positions to concentrate bankroll
+KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.80"))  # High-conviction sizing fraction
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", os.getenv("MAX_OPEN_POSITIONS", "4")))  # Max 4 concurrent positions across categories
 MAX_POSITION_COST_PCT    = float(os.getenv("MAX_POSITION_COST_PCT", "0.25"))  # Max 25% of wallet balance per position (~$20 on $80 bankroll)
 USE_PASSIVE_MAKER_ENTRY  = os.getenv("USE_PASSIVE_MAKER_ENTRY", "1").lower() in ("1", "true", "yes")
 # Time-based exit: if a position doesn't hit profit/stop within this window,
@@ -1419,7 +1419,10 @@ async def estimate_true_probability(
     else:
         edge = (book.best_bid or yes_price) - true_prob
 
-    required_edge = MIN_EDGE_YES if dominant_side == "YES" else MIN_EDGE
+    if source in ("sharp_arb", "weather_oracle", "whale_consensus"):
+        required_edge = 0.035   # 3.5% edge threshold for proven sharp sources
+    else:
+        required_edge = MIN_EDGE_YES if dominant_side == "YES" else MIN_EDGE
     if edge < required_edge:
         _shadow(
             "edge_below",
@@ -2162,15 +2165,15 @@ async def strategy_loop(
             # weaker / noisier signals in thinner books take smaller bets.
             trade_price = (trade_book.best_ask if trade_book and trade_book.best_ask
                            else trade_prob)
-            # Dynamic Kelly Fraction based on historical profitability bands
+            # Dynamic Kelly Fraction based on signal source conviction
             current_fraction = KELLY_FRACTION
-            if signal.is_sports:
+            if signal.source in ("sharp_arb", "weather_oracle", "whale_consensus"):
+                current_fraction = 0.80  # Full High-Conviction Kelly (up to 20%-25% per trade)
+            elif signal.is_sports:
                 if 60.0 <= signal.confidence <= 79.9:
-                    # Historically highly profitable cohort (+ $8.95 expected P&L)
-                    current_fraction = 0.50  # Half-Kelly to maximize recovery
+                    current_fraction = 0.60
                 elif signal.confidence < 40.0:
-                    # Lower conviction signals
-                    current_fraction = 0.15  # Scale down to minimize risk
+                    current_fraction = 0.20
 
             sharpe_mult = get_rolling_sharpe_multiplier()
             current_bal = cycle_balance.balance if cycle_balance else 80.0
