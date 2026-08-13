@@ -1544,21 +1544,19 @@ function triggerConfetti() {
     if (url.startsWith('/')) {
       url = `${BOT}${url}`;
     }
-    if (location.protocol === 'file:') {
-      const key = sessionStorage.getItem('sb_key');
-      if (key) {
-        if (!options.headers) {
-          options.headers = {};
+    const key = sessionStorage.getItem('sb_key');
+    if (key) {
+      if (!options.headers) {
+        options.headers = {};
+      }
+      if (options.headers instanceof Headers) {
+        options.headers.set('X-API-Key', key);
+      } else if (Array.isArray(options.headers)) {
+        if (!options.headers.some(h => h[0].toLowerCase() === 'x-api-key')) {
+          options.headers.push(['X-API-Key', key]);
         }
-        if (options.headers instanceof Headers) {
-          options.headers.set('X-API-Key', key);
-        } else if (Array.isArray(options.headers)) {
-          if (!options.headers.some(h => h[0].toLowerCase() === 'x-api-key')) {
-            options.headers.push(['X-API-Key', key]);
-          }
-        } else {
-          options.headers['X-API-Key'] = key;
-        }
+      } else {
+        options.headers['X-API-Key'] = key;
       }
     }
     const finalResource = typeof resource === 'string' ? url : resource;
@@ -1839,9 +1837,10 @@ async function fetchBot(){
     let chipState='active',chipText='live';
     if(rt&&rt.balance_halted){chipState='error';chipText='balance halted';}
     else if(rt&&rt.new_trades_paused){chipState='paused';chipText='daily-loss pause';}
-    else if(d.trading_disabled){chipState='paused';chipText='operator paused';}
-    else if(d.losses_breaker_tripped){chipState='paused';chipText='whipsaw cooldown';}
-    else if(!d.running){chipState='paused';chipText='stopped';}
+    else if(d&&d.trading_disabled){chipState='paused';chipText='operator paused';}
+    else if(d&&d.losses_breaker_tripped){chipState='paused';chipText='whipsaw cooldown';}
+    else if(d&&d.running===false && (!rt || !rt.bot_running)){chipState='paused';chipText='stopped';}
+    else if(rt&&rt.bot_running){chipState='active';chipText='live';}
     setBotStatus(chipState,chipText);
 
     // Update Whipsaw Cooldown Row

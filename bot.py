@@ -3550,7 +3550,7 @@ class PolymarketBot:
             await asyncio.sleep(600)
         except asyncio.CancelledError:
             return
-        while self.running:
+        while self.running or getattr(self, "_server_active", False):
             try:
                 await self.resolve_brier_predictions(limit=BRIER_RESOLVE_LIMIT)
                 await self.resolve_trade_outcomes(limit=100)
@@ -3580,7 +3580,7 @@ class PolymarketBot:
             return
         interval_s = int(os.getenv("ARB_SCAN_INTERVAL_S", "300"))
         scan_limit = int(os.getenv("ARB_SCAN_LIMIT", "50"))
-        while self.running:
+        while self.running or getattr(self, "_server_active", False):
             try:
                 if not ARB_ALERT_ENABLED:
                     await asyncio.sleep(interval_s)
@@ -3641,7 +3641,7 @@ class PolymarketBot:
         except asyncio.CancelledError:
             return
         SNAPSHOT_INTERVAL_S = 3600
-        while self.running:
+        while self.running or getattr(self, "_server_active", False):
             try:
                 cash = await asyncio.to_thread(self.get_balance, True)
                 positions = await asyncio.to_thread(self.get_positions_value, True)
@@ -3685,7 +3685,7 @@ class PolymarketBot:
             await asyncio.sleep(1800)
         except asyncio.CancelledError:
             return
-        while self.running:
+        while self.running or getattr(self, "_server_active", False):
             try:
                 pruned = 0
                 with self.db:
@@ -7275,7 +7275,7 @@ class PolymarketBot:
             await asyncio.sleep(30)
         except asyncio.CancelledError:
             return
-        while self.running:
+        while self.running or getattr(self, "_server_active", False):
             try:
                 claimed = await asyncio.to_thread(self._redeemer.run_once)
                 if claimed:
@@ -7313,7 +7313,7 @@ class PolymarketBot:
             await asyncio.sleep(300)
         except asyncio.CancelledError:
             return
-        while self.running:
+        while self.running or getattr(self, "_server_active", False):
             try:
                 today_str = datetime.utcnow().strftime("%Y-%m-%d")
                 # Reset the latch at UTC rollover
@@ -7383,7 +7383,7 @@ class PolymarketBot:
             await asyncio.sleep(NO_TRADE_ALERT_HOURS * 3600)
         except asyncio.CancelledError:
             return
-        while self.running:
+        while self.running or getattr(self, "_server_active", False):
             try:
                 now = time.time()
                 uptime = now - self._service_start_at
@@ -7436,7 +7436,7 @@ class PolymarketBot:
         if not DAILY_SUMMARY_ENABLED or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             return
         from datetime import timedelta
-        while self.running:
+        while self.running or getattr(self, "_server_active", False):
             try:
                 now = datetime.utcnow()
                 target = now.replace(
@@ -7463,7 +7463,7 @@ class PolymarketBot:
         """Background task — waits until ~00:05 UTC each day, runs the review."""
         if not NIGHTLY_REVIEW_ENABLED:
             return
-        while self.running:
+        while self.running or getattr(self, "_server_active", False):
             try:
                 now = datetime.utcnow()
                 # Next run = next 00:05 UTC
@@ -7491,7 +7491,7 @@ class PolymarketBot:
         if not BACKTEST_WEEKLY_ENABLED or not ANTHROPIC_API_KEY:
             return
         from datetime import timedelta
-        while self.running:
+        while self.running or getattr(self, "_server_active", False):
             try:
                 now = datetime.utcnow()
                 # weekday(): Monday=0, ..., Sunday=6
@@ -9632,6 +9632,7 @@ async def lifespan(app_: FastAPI):
                 # Don't block startup on a reconcile failure; log loudly.
                 log.warning(f"[STARTUP RECONCILE] cancel_all failed: {e}")
         bot.running = False
+        bot._server_active = True
         log.info("Bot trading loop disabled on startup (SEXYBOT_TRADING_DISABLED=1). Running purely as API/Dashboard server.")
         # Background cache warmer — keeps balance/positions_value caches hot
         # so the /status handler never has to do a blocking urllib fetch.
@@ -9708,6 +9709,7 @@ async def lifespan(app_: FastAPI):
     yield
     # shutdown
     bot.running = False
+    bot._server_active = False
     if bot._paper_oracle_task and not bot._paper_oracle_task.done():
         bot._paper_oracle_task.cancel()
     if bot._nightly_review_task and not bot._nightly_review_task.done():
