@@ -127,7 +127,8 @@ EXCLUDE_KEYWORDS      = [
         "EXCLUDE_KEYWORDS",
         "iran,uranium,ukraine,russia,taiwan,diplomatic,nuclear,sanctions,"
         "trump,newsom,desantis,election,impeach,supreme court,fed chair,"
-        "hormuz,houthi,tehran,kremlin,gaza,israel,hamas,hezbollah"
+        "hormuz,houthi,tehran,kremlin,gaza,israel,hamas,hezbollah,"
+        "president,presidential,nominee,white house,2028,2026 election"
     ).split(",") if k.strip()
 ]
 # Comma-separated list of *internal* coarse-category buckets to skip at
@@ -847,6 +848,27 @@ def enforce_category_diversity(markets: list[PolyMarket], max_per_category: int 
     return selected
 
 
+def _market_priority(item) -> float:
+    """Prioritize Fast-Resolving (resolving <= 48 hours, weather, or today's matches) + Top Volume"""
+    m = item[0] if isinstance(item, (tuple, list)) else item
+    q_lower = (m.question or "").lower()
+    is_weather_or_fast = classify_internal_category(m.question or "") == "weather" or any(
+        k in q_lower for k in ("weather", "temperature", "rain", "degrees", "today", "climate", "heatwave")
+    )
+    time_to_end = 999999.0
+    if m.end_date:
+        try:
+            end_str = m.end_date.replace("Z", "")
+            if "+" in end_str:
+                end_str = end_str.split("+")[0]
+            end_ts = datetime.fromisoformat(end_str).timestamp()
+            time_to_end = (end_ts - time.time()) / 3600.0   # hours
+        except Exception:
+            pass
+    fast_bonus = 1000000.0 if (time_to_end <= 48.0 or is_weather_or_fast) else 0.0
+    return m.volume_24h + fast_bonus
+
+
 def _audit_discovery(raw_markets: list[PolyMarket]) -> list[dict]:
     """
     Mirror the MarketFilter chain used in main() / strategy_loop and tag each
@@ -896,26 +918,6 @@ def _audit_discovery(raw_markets: list[PolyMarket]) -> list[dict]:
             rows.append({**base, "excluded_by": "internal_category"})
             continue
         survivors.append((m, base))
-
-    # Prioritize Fast-Resolving (resolving < 48 hours or weather) + Top Volume
-    def _market_priority(pair):
-        m = pair[0]
-        q_lower = (m.question or "").lower()
-        is_weather_or_fast = classify_internal_category(m.question or "") == "weather" or any(
-            k in q_lower for k in ("weather", "temperature", "rain", "degrees", "today", "climate", "heatwave")
-        )
-        time_to_end = 999999.0
-        if m.end_date:
-            try:
-                end_str = m.end_date.replace("Z", "")
-                if "+" in end_str:
-                    end_str = end_str.split("+")[0]
-                end_ts = datetime.fromisoformat(end_str).timestamp()
-                time_to_end = (end_ts - time.time()) / 3600.0   # hours
-            except Exception:
-                pass
-        fast_bonus = 1000000.0 if (time_to_end <= 48.0 or is_weather_or_fast) else 0.0
-        return m.volume_24h + fast_bonus
 
     survivors.sort(key=_market_priority, reverse=True)
     survivor_markets = [pair[0] for pair in survivors]
@@ -2399,7 +2401,7 @@ async def main() -> None:
         .exclude_internal_categories(BLOCK_INTERNAL_CATEGORIES)
         .results()
     )
-    candidate_markets.sort(key=lambda m: m.volume_24h, reverse=True)
+    candidate_markets.sort(key=_market_priority, reverse=True)
     markets = enforce_category_diversity(candidate_markets, max_per_category=8, total=40)
     if is_sports_only_active():
         markets = [m for m in markets if classify_internal_category(m.question) == "sports"]

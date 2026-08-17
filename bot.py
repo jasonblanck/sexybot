@@ -100,7 +100,8 @@ NEAR_DECIDED_BAND = float(os.getenv("NEAR_DECIDED_BAND", "0.08"))
 _EXCLUDE_KEYWORDS_DEFAULT = (
     "iran,uranium,ukraine,russia,taiwan,diplomatic,nuclear,sanctions,"
     "trump,newsom,desantis,election,impeach,supreme court,fed chair,"
-    "hormuz,houthi,tehran,kremlin,gaza,israel,hamas,hezbollah"
+    "hormuz,houthi,tehran,kremlin,gaza,israel,hamas,hezbollah,"
+    "president,presidential,nominee,white house,2028,2026 election"
 )
 EXCLUDE_KEYWORDS = [
     k.strip() for k in os.getenv("EXCLUDE_KEYWORDS", _EXCLUDE_KEYWORDS_DEFAULT).split(",")
