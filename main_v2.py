@@ -1531,10 +1531,11 @@ async def strategy_loop(
                     .exclude_internal_categories(BLOCK_INTERNAL_CATEGORIES)
                     .results()
                 )
-                fresh_candidates.sort(key=lambda m: m.volume_24h, reverse=True)
-                fresh = enforce_category_diversity(fresh_candidates, max_per_category=5, total=20)
+                fresh_candidates.sort(key=_market_priority, reverse=True)
                 if is_sports_only_active():
-                    fresh = [m for m in fresh if classify_internal_category(m.question) == "sports"]
+                    fresh = [m for m in fresh_candidates if classify_internal_category(m.question) == "sports"][:20]
+                else:
+                    fresh = enforce_category_diversity(fresh_candidates, max_per_category=5, total=20)
                 # Drop any new markets — only keep already-subscribed ones
                 still_active = [m for m in fresh if m.yes_token_id in subscribed_yes_ids]
                 if still_active:
@@ -2431,12 +2432,14 @@ async def main() -> None:
         .results()
     )
     candidate_markets.sort(key=_market_priority, reverse=True)
-    markets = enforce_category_diversity(candidate_markets, max_per_category=8, total=40)
     if is_sports_only_active():
-        markets = [m for m in markets if classify_internal_category(m.question) == "sports"]
+        sports_candidates = [m for m in candidate_markets if classify_internal_category(m.question) == "sports"]
+        markets = sports_candidates[:40]
         log.info("SEXYBOT_SPORTS_ONLY is active (expires %s): filtered watch list down to %d sports markets",
                  datetime.fromtimestamp(SPORTS_ONLY_CUTOFF_TS, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                  len(markets))
+    else:
+        markets = enforce_category_diversity(candidate_markets, max_per_category=8, total=40)
     log.info(
         "Watching %d markets (excluding categories: %s; keywords: %s; internal: %s)",
         len(markets), EXCLUDE_CATEGORIES or "none", EXCLUDE_KEYWORDS or "none",
