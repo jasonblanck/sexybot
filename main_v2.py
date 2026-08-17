@@ -31,6 +31,7 @@ from observability import (
     record_postmortem,
     record_shadow_batch,
     record_trade,
+    send_telegram_alert,
 )
 from orderbook_ws import BookManager, BookSnapshot, Level
 from redeemer import PositionRedeemer
@@ -2007,6 +2008,18 @@ async def strategy_loop(
                 continue
 
             if exit_result and exit_result.success:
+                try:
+                    exit_pnl = (book.best_bid - pos.entry_price) * pos.token_qty
+                    exit_alert = (
+                        f"🏆 *POSITION EXIT*\n"
+                        f"• *Market*: {(pos.market_question or token_id)[:50]}\n"
+                        f"• *Reason*: {reason}\n"
+                        f"• *Entry*: {pos.entry_price:.4f} → *Exit*: {book.best_bid:.4f}\n"
+                        f"• *Realized PnL*: ${exit_pnl:+.2f}"
+                    )
+                    asyncio.create_task(asyncio.to_thread(send_telegram_alert, exit_alert))
+                except Exception as _tg_e:
+                    log.debug("Exit Telegram alert error: %s", _tg_e)
                 if drawdown_guard is not None:
                     drawdown_guard.record_trade()
                 pos.exit_order_id = exit_result.order_id
@@ -2284,6 +2297,22 @@ async def strategy_loop(
                 # Exit bands are computed at entry using the entry regime so they
                 # scale with the book's volatility at the time the position was taken.
                 if result.fill_price is not None and result.token_qty is not None:
+                    if market_maker is not None:
+                        fill_side = "yes" if trade_token_id == mkt.yes_token_id else "no"
+                        market_maker.record_fill(trade_token_id, fill_side, result.token_qty)
+
+                    try:
+                        alert_msg = (
+                            f"🎯 *ORDER EXECUTED*\n"
+                            f"• *Market*: {mkt.question[:50]}\n"
+                            f"• *Side*: {trade_side} ({'YES' if trade_token_id == mkt.yes_token_id else 'NO'})\n"
+                            f"• *Price*: {result.fill_price:.4f} | *Qty*: {result.token_qty:.2f}\n"
+                            f"• *Notional*: ${result.fill_price * result.token_qty:.2f} | *Src*: {signal.source}"
+                        )
+                        asyncio.create_task(asyncio.to_thread(send_telegram_alert, alert_msg))
+                    except Exception as _tg_e:
+                        log.debug("Trade execution Telegram alert error: %s", _tg_e)
+
                     if drawdown_guard is not None:
                         drawdown_guard.record_trade()
                     pt, sl = dynamic_exit_levels(

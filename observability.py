@@ -547,3 +547,29 @@ def prune_telemetry(db_path: str = DEFAULT_DB_PATH, retention_days: int = 2) -> 
         log.debug("prune_telemetry failed: %s", exc)
     finally:
         conn.close()
+
+
+_TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+_TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+def send_telegram_alert(msg: str) -> bool:
+    """
+    Send a non-blocking alert to Telegram if credentials exist.
+    Best-effort: returns True if sent, False if missing config or error occurs.
+    """
+    token = os.getenv("TELEGRAM_TOKEN", _TELEGRAM_TOKEN)
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", _TELEGRAM_CHAT_ID)
+    if not token or not chat_id:
+        log.debug("Telegram alert skipped — TELEGRAM_TOKEN or TELEGRAM_CHAT_ID missing")
+        return False
+    try:
+        import urllib.request
+        import json
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = json.dumps({"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status == 200
+    except Exception as exc:
+        log.warning("Telegram alert dispatch failed: %s", exc)
+        return False
