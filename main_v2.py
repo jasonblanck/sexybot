@@ -94,7 +94,8 @@ MIN_BOOK_DEPTH_USDC = float(os.getenv("MIN_BOOK_DEPTH_USDC", "200"))  # skip thr
 # almost no upside to buying at 0.99 — best case ~1c, worst case −99c.
 # Default lowered from 0.80 to 0.70 to prevent asymmetric, negative-EV entries.
 # 80-100c and 70-80c regions were assessed, and the lower ceiling caps capital bleedout.
-MAX_ENTRY_PRICE  = float(os.getenv("MAX_ENTRY_PRICE", "0.80"))
+MIN_ENTRY_PRICE  = float(os.getenv("MIN_ENTRY_PRICE", "0.25"))   # Filter out toxic longshots (<0.25)
+MAX_ENTRY_PRICE  = float(os.getenv("MAX_ENTRY_PRICE", "0.75"))   # Filter out toxic heavy favorites (>0.75)
 
 # Position management
 TRADE_COOLDOWN_SEC    = 300   # seconds before re-buying the same token
@@ -118,9 +119,6 @@ EXCLUDE_CATEGORIES    = [
     c.strip() for c in os.getenv("EXCLUDE_CATEGORIES", "").split(",") if c.strip()
 ]
 # Comma-separated substrings to skip on the market QUESTION (not category),
-# because Polymarket's category field puts most political markets under
-# "other". Empirically the bot's worst losses (Iran diplomatic-meeting
-# −87%, uranium −78%) all came from this bucket.
 EXCLUDE_KEYWORDS      = [
     k.strip() for k in os.getenv(
         "EXCLUDE_KEYWORDS",
@@ -130,18 +128,11 @@ EXCLUDE_KEYWORDS      = [
         "president,presidential,nominee,white house,2028,2026 election"
     ).split(",") if k.strip()
 ]
-# Comma-separated list of *internal* coarse-category buckets to skip at
-# discovery (politics, crypto, sports, macro, legal, weather, other). This
-# uses bot.classify_market's rule-based classifier so the blocklist matches
-# the same buckets the dashboard's category-attribution P&L is keyed on.
-# Distinct from EXCLUDE_CATEGORIES, which filters Polymarket's raw category
-# field. The 2026-05-07 backtest flagged "other" as a chronic loser
-# (-$50.63 over 137 trades, 73.7% win rate but $5 losses dominate); set
-# BLOCK_INTERNAL_CATEGORIES=other to act on that finding.
 BLOCK_INTERNAL_CATEGORIES = [
-    c.strip().lower() for c in os.getenv("BLOCK_INTERNAL_CATEGORIES", "").split(",")
+    c.strip().lower() for c in os.getenv("BLOCK_INTERNAL_CATEGORIES", "other,crypto").split(",")
     if c.strip()
 ]
+
 # Sports-only mandate active for exactly 10 days.
 # Started: 2026-05-21T15:05:48-04:00 (Unix: 1779390348.0)
 # Expires: 2026-05-31T15:05:48-04:00 (Unix: 1780254348.0)
@@ -1360,20 +1351,22 @@ async def estimate_true_probability(
         if dominant_side == "YES"
         else (1.0 - book.best_bid if book.best_bid is not None else 1.0 - yes_price)
     )
-    if side_fill_price >= MAX_ENTRY_PRICE:
-        log.info("PRICE CEILING [signal] | %s  side=%s  fill=%.4f >= %.2f — skip",
-                 market.question[:40], dominant_side, side_fill_price, MAX_ENTRY_PRICE)
-        _shadow(
-            "price_ceiling",
-            spike_has=spike.has_spike,
-            spike_dominant_side=spike.dominant_side,
-            spike_confidence=spike.confidence,
-            spike_ratio=spike.spike_ratio,
-            signal_source=source,
-            signal_strength=strength,
-            fill_price=side_fill_price,
-        )
-        return None
+    if source not in ("sharp_arb", "weather_oracle", "whale_consensus"):
+        if side_fill_price >= MAX_ENTRY_PRICE or side_fill_price < MIN_ENTRY_PRICE:
+            log.info("PRICE BOUNDS SKIP [signal] | %s  side=%s  fill=%.4f (allowed %.2f-%.2f) — skip",
+                     market.question[:40], dominant_side, side_fill_price, MIN_ENTRY_PRICE, MAX_ENTRY_PRICE)
+            _shadow(
+                "price_bounds_skip",
+                spike_has=spike.has_spike,
+                spike_dominant_side=spike.dominant_side,
+                spike_confidence=spike.confidence,
+                spike_ratio=spike.spike_ratio,
+                signal_source=source,
+                signal_strength=strength,
+                fill_price=side_fill_price,
+            )
+            return None
+
 
     # 5. Estimate true probability + edge check
     conf_boost = (confidence / 100.0) * 0.12
@@ -2179,15 +2172,18 @@ async def strategy_loop(
             # weaker / noisier signals in thinner books take smaller bets.
             trade_price = (trade_book.best_ask if trade_book and trade_book.best_ask
                            else trade_prob)
-            # Dynamic Kelly Fraction based on signal source conviction
+            # Dynamic Kelly Fraction based on signal source conviction & empirical price brackets
             current_fraction = KELLY_FRACTION
             if signal.source in ("sharp_arb", "weather_oracle", "whale_consensus"):
-                current_fraction = 0.80  # Full High-Conviction Kelly (up to 20%-25% per trade)
+                current_fraction = 0.80  # Full High-Conviction Kelly
+            elif 0.25 <= trade_price <= 0.45:
+                current_fraction = max(current_fraction, 0.65)  # Underdog Sweet-Spot Boost (PF = 1.57)
             elif signal.is_sports:
                 if 60.0 <= signal.confidence <= 79.9:
                     current_fraction = 0.60
                 elif signal.confidence < 40.0:
                     current_fraction = 0.20
+
 
             sharpe_mult = get_rolling_sharpe_multiplier()
             current_bal = cycle_balance.balance if cycle_balance else 80.0
