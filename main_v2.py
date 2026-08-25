@@ -101,20 +101,18 @@ TRADE_COOLDOWN_SEC    = 300   # seconds before re-buying the same token
 MARKET_REFRESH_CYCLES = 20   # re-discover markets every N scan cycles
 PROFIT_TARGET         = float(os.getenv("PROFIT_TARGET", "0.10"))   # 10% gain → close (base; dynamic)
 STOP_LOSS             = float(os.getenv("STOP_LOSS",     "0.08"))   # 8% loss → close (base; dynamic)
-KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.80"))  # High-conviction sizing fraction
+KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.50"))  # High-conviction sizing fraction (50% base Kelly)
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", os.getenv("MAX_OPEN_POSITIONS", "4")))  # Max 4 concurrent positions across categories
-MAX_POSITION_COST_PCT    = float(os.getenv("MAX_POSITION_COST_PCT", "0.25"))  # Max 25% of wallet balance per position (~$20 on $80 bankroll)
+MAX_POSITION_COST_PCT    = float(os.getenv("MAX_POSITION_COST_PCT", "0.35"))  # Max 35% of wallet balance per position
 USE_PASSIVE_MAKER_ENTRY  = os.getenv("USE_PASSIVE_MAKER_ENTRY", "1").lower() in ("1", "true", "yes")
 # Time-based exit: if a position doesn't hit profit/stop within this window,
-# close at current bid rather than continuing to hold dead inventory. Helps
-# recycle capital into fresher signals and caps "slow bleed" losses that
-# never quite trigger a stop.
-MAX_HOLD_SEC          = int(os.getenv("MAX_HOLD_SEC", "7200"))   # 2 h default (120m)
+# close at current bid rather than continuing to hold dead inventory.
+MAX_HOLD_SEC          = int(os.getenv("MAX_HOLD_SEC", "28800"))   # 8 h default (480m)
 # Below this absolute (not relative) loss, the time-stop will exit even if
-# the standard percentage stop hasn't triggered. Prevents being stuck in a
-# chronically drifting-lower position.
-TIME_STOP_MIN_GAIN    = float(os.getenv("TIME_STOP_MIN_GAIN", "-0.01"))
+# the standard percentage stop hasn't triggered.
+TIME_STOP_MIN_GAIN    = float(os.getenv("TIME_STOP_MIN_GAIN", "-0.03"))
 MIN_EXIT_PRICE        = float(os.getenv("MIN_EXIT_PRICE", "0.05"))
+
 # Comma-separated list of category substrings to skip at discovery.
 EXCLUDE_CATEGORIES    = [
     c.strip() for c in os.getenv("EXCLUDE_CATEGORIES", "").split(",") if c.strip()
@@ -2193,8 +2191,9 @@ async def strategy_loop(
 
             sharpe_mult = get_rolling_sharpe_multiplier()
             current_bal = cycle_balance.balance if cycle_balance else 80.0
-            # Dynamic Compound Interest Sizing Engine: Base max $20.00, +$2.50 for every $10 balance > $80
-            dynamic_max_order_size = 20.0 + max(0.0, ((current_bal - 80.0) / 10.0) * 2.50)
+            # Dynamic Compound Interest Sizing Engine: Base max MAX_ORDER_SIZE (default $25.00), +$2.50 for every $10 balance > $80
+            dynamic_max_order_size = max(MAX_ORDER_SIZE, 25.0 + max(0.0, ((current_bal - 80.0) / 10.0) * 2.50))
+
 
             kelly_dollars = kelly_size(
                 trade_prob, trade_price,

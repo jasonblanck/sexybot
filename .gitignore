@@ -13,3 +13,6 @@ trades.db
 *.db-shm
 *.db-wal
 open_positions.json
+*.tgz
+backups/
+
