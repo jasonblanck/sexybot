@@ -217,11 +217,11 @@ _INTERNAL_CATEGORY_KEYWORDS = {
     "sports":   ["super bowl","world cup","world series","nba","nfl","mlb","nhl","mls",
                  "champions league","playoffs","tournament","olympics","formula 1","f1 ",
                  "boxing","mma","ufc","grand slam","open championship","masters","fifa",
-                 "quarterback","qb ","team ",
+                 "quarterback","qb ","team ","football","baseball","us open",
                  # Game-format markets ("Team A vs. Team B", "Spread: …")
                  " vs.", " vs ", "spread:", "moneyline", "o/u ", "over/under",
                  # Tennis
-                 "tennis","atp ","wta ",
+                 "tennis","atp ","wta ","us open",
                  # Golf
                  "pga","golf","scheffler",
                  # Hockey

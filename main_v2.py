@@ -133,18 +133,11 @@ BLOCK_INTERNAL_CATEGORIES = [
     if c.strip()
 ]
 
-# Sports-only mandate active for exactly 10 days.
-# Started: 2026-05-21T15:05:48-04:00 (Unix: 1779390348.0)
-# Expires: 2026-05-31T15:05:48-04:00 (Unix: 1780254348.0)
-_SEXYBOT_SPORTS_ONLY_ENV = os.getenv("SEXYBOT_SPORTS_ONLY", "0") == "1"
-SPORTS_ONLY_CUTOFF_TS = 1780254348.0
+# Sports-only mandate toggle
+_SEXYBOT_SPORTS_ONLY_ENV = os.getenv("SEXYBOT_SPORTS_ONLY", "0") in ("1", "true", "True")
 
 def is_sports_only_active() -> bool:
-    if not _SEXYBOT_SPORTS_ONLY_ENV:
-        return False
-    if time.time() > SPORTS_ONLY_CUTOFF_TS:
-        return False
-    return True
+    return _SEXYBOT_SPORTS_ONLY_ENV
 
 # Strategy selection
 # STRATEGY=momentum  (default) — directional momentum + OBI signals
@@ -2430,9 +2423,7 @@ async def main() -> None:
     if is_sports_only_active():
         sports_candidates = [m for m in candidate_markets if classify_internal_category(m.question) == "sports"]
         markets = sports_candidates[:40]
-        log.info("SEXYBOT_SPORTS_ONLY is active (expires %s): filtered watch list down to %d sports markets",
-                 datetime.fromtimestamp(SPORTS_ONLY_CUTOFF_TS, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                 len(markets))
+        log.info("SEXYBOT_SPORTS_ONLY is active: filtered watch list down to %d sports markets", len(markets))
     else:
         markets = enforce_category_diversity(candidate_markets, max_per_category=8, total=40)
     log.info(
