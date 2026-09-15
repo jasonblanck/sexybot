@@ -2025,13 +2025,13 @@ async function fetchMarketData(){
   try{
     const r=await fetch('/api/market-data');const d=await r.json();_mktDataCache=d;
     const fmtChg=c=>{if(c==null)return '';const s=parseFloat(c).toFixed(2);return` <span style="font-size:10px;color:${c>=0?'#00cc66':'#ff3355'}">${c>=0?'+':''}${s}%</span>`;};
-    if(d.vix){const v=d.vix;document.getElementById('mkt-vix').innerHTML=parseFloat(v.price).toFixed(2)+fmtChg(v.change);document.getElementById('wm-vix').innerHTML=parseFloat(v.price).toFixed(2)+fmtChg(v.change);}
-    if(d.oil){const o=d.oil;const oilPrice='$'+parseFloat(o.price).toFixed(2);document.getElementById('mkt-oil').innerHTML=oilPrice+fmtChg(o.change);
+    if(d.vix){const v=d.vix;const vp=v.price!=null?parseFloat(v.price).toFixed(2):'--';document.getElementById('mkt-vix').innerHTML=vp+fmtChg(v.change);document.getElementById('wm-vix').innerHTML=vp+fmtChg(v.change);}
+    if(d.oil){const o=d.oil;const oilPrice=o.price!=null?'$'+parseFloat(o.price).toFixed(2):'--';document.getElementById('mkt-oil').innerHTML=oilPrice+fmtChg(o.change);
       // INDEXES panel — OIL price + change %
       const oilEl=document.getElementById('ioil'),oilC=document.getElementById('ioilc');
       if(oilEl)oilEl.textContent=oilPrice;
       if(oilC&&o.change!=null){const c=parseFloat(o.change);oilC.innerHTML=`<span class="${c>=0?'g':'r'}">${c>=0?'+':''}${c.toFixed(2)}%</span>`;}}
-    if(d.t10y){const t=d.t10y;const yieldStr=parseFloat(t.price).toFixed(3)+'%';document.getElementById('mkt-t10y').innerHTML=yieldStr+fmtChg(t.change);document.getElementById('wm-t10y').innerHTML=yieldStr+fmtChg(t.change);
+    if(d.t10y){const t=d.t10y;const yieldStr=t.price!=null?parseFloat(t.price).toFixed(3)+'%':'--';document.getElementById('mkt-t10y').innerHTML=yieldStr+fmtChg(t.change);document.getElementById('wm-t10y').innerHTML=yieldStr+fmtChg(t.change);
       // INDEXES panel — US 10Y yield + bp change
       const ty=document.getElementById('i10y'),tyC=document.getElementById('i10yc');
       if(ty)ty.textContent=yieldStr;
