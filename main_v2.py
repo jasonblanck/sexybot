@@ -1904,6 +1904,7 @@ async def strategy_loop(
 
             book = book_manager.get_book(token_id)
             if book is None or book.is_stale or book.best_bid is None:
+                book_manager.ensure_subscribed(token_id)
                 try:
                     log.warning("Exit check: live WS book for %s is %s. Attempting REST fallback fetch...",
                                 token_id[:14], "missing" if book is None else ("stale" if book.is_stale else "lacks best bid"))
@@ -2453,14 +2454,13 @@ async def main() -> None:
     book_manager = BookManager()
     for mkt in markets:
         book_manager.add_market(mkt.yes_token_id, mkt.no_token_id)
-    if os.path.exists("/root/polybot/open_positions.json"):
-        try:
-            with open("/root/polybot/open_positions.json", "r") as f:
-                pos_data = json.load(f)
-                for tid in pos_data.keys():
-                    book_manager.add_market(tid, tid)
-        except Exception:
-            pass
+    try:
+        initial_open = load_open_positions()
+        for tid in initial_open.keys():
+            book_manager.add_market(tid, tid)
+            log.info("BookManager pre-registered open position token: %s…", tid[:14])
+    except Exception as exc:
+        log.debug("Pre-registering open positions in BookManager failed: %s", exc)
 
     # 3. Executor
     executor = ClobExecutor(

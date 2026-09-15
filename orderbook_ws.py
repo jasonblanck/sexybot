@@ -276,6 +276,20 @@ class ClobWebSocket:
         await ws.send(payload)
         log.debug("WS subscribed: %s", payload[:120])
 
+    async def subscribe_token(self, token_id: str) -> None:
+        """Dynamically add and subscribe a single token_id to an active WebSocket connection."""
+        if token_id not in self._books:
+            self.token_ids.append(token_id)
+            self._books[token_id] = OrderBook(token_id)
+        if self._ws is not None:
+            try:
+                payload = json.dumps({"assets_ids": [token_id], "type": "market"})
+                await self._ws.send(payload)
+                log.info("WS dynamically subscribed token: %s…", token_id[:14])
+            except Exception as e:
+                log.warning("WS dynamic subscribe failed for %s: %s", token_id[:14], e)
+
+
     async def _dispatch(self, msg: dict | list) -> None:
         if isinstance(msg, list):
             for item in msg:
@@ -354,6 +368,29 @@ class BookManager:
             if snap is not None:
                 return snap
         return None
+
+    def ensure_subscribed(self, token_id: str) -> None:
+        """Ensure a token ID is subscribed. If not present in token map, adds to pending or active client."""
+        if not hasattr(self, "_token_map"):
+            self._token_map = {}
+        if token_id in self._token_map:
+            return
+        if token_id not in self._pending:
+            self._pending.append(token_id)
+
+        if self._clients:
+            target_client = self._clients[0]
+            for client in self._clients:
+                if len(client.token_ids) < self.TOKENS_PER_CONN:
+                    target_client = client
+                    break
+            self._token_map[token_id] = target_client
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(target_client.subscribe_token(token_id))
+            except RuntimeError:
+                pass
+
 
     async def run(self) -> None:
         """
