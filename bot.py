@@ -9421,6 +9421,19 @@ class PolymarketBot:
 
     def is_v2_running(self) -> bool:
         try:
+            status_file = "/root/polybot/engine_status.json" if os.path.exists("/root/polybot/engine_status.json") else "engine_status.json"
+            if os.path.exists(status_file):
+                with open(status_file, "r") as f:
+                    st = json.load(f)
+                if st.get("halted", False):
+                    return False
+                ts = st.get("ts", 0)
+                if time.time() - ts > 300:  # No cycle update for 5 minutes (process stalled)
+                    return False
+                return bool(st.get("running", False))
+        except Exception as e:
+            log.debug("engine_status read error: %s", e)
+        try:
             import subprocess
             res = subprocess.run(["systemctl", "is-active", "sexybot-v2"], capture_output=True, text=True, timeout=1.0)
             return res.stdout.strip() == "active"
@@ -9492,8 +9505,21 @@ class PolymarketBot:
         positions = self._positions_cache if self._positions_cache else 0.0
         now = time.time()
         active_cooldowns = sum(1 for ts in self._error_cooldown.values() if ts > now)
+
+        engine_st = {}
+        status_file = "/root/polybot/engine_status.json" if os.path.exists("/root/polybot/engine_status.json") else "engine_status.json"
+        if os.path.exists(status_file):
+            try:
+                with open(status_file, "r") as f:
+                    engine_st = json.load(f)
+            except Exception:
+                pass
+
         d = {
             "running": self.is_v2_running(),
+            "drawdown_halted": engine_st.get("halted", False),
+            "halt_reason": engine_st.get("halt_reason"),
+            "engine_status": engine_st,
             "trading_disabled": trading_disabled,
             "losses_breaker_tripped": losses_tripped,
             "losses_breaker_cooldown_until": cooldown_until,
@@ -10912,9 +10938,21 @@ def runtime_health():
                 return row[0] if row and row[0] is not None else default
             except Exception:
                 return default
+
+        engine_st = {}
+        status_file = "/root/polybot/engine_status.json" if os.path.exists("/root/polybot/engine_status.json") else "engine_status.json"
+        if os.path.exists(status_file):
+            try:
+                with open(status_file, "r") as f:
+                    engine_st = json.load(f)
+            except Exception:
+                pass
+
         return {
             "ts":                  datetime.utcnow().isoformat(),
             "bot_running":         bot.is_v2_running(),
+            "drawdown_halted":     engine_st.get("halted", False),
+            "halt_reason":         engine_st.get("halt_reason"),
             "new_trades_paused":   bot._new_trades_paused,
             "balance_halted":      bot._balance_halt_tripped,
             "strategy":            STRATEGY,

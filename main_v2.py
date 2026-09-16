@@ -352,6 +352,26 @@ def load_open_positions() -> dict[str, Position]:
         return {}
 
 
+def write_engine_status(running: bool, halted: bool = False, halt_reason: Optional[str] = None, cycle_count: int = 0) -> None:
+    def _write():
+        try:
+            status_data = {
+                "ts": time.time(),
+                "running": running,
+                "halted": halted,
+                "halt_reason": halt_reason,
+                "cycle_count": cycle_count,
+                "pid": os.getpid(),
+            }
+            status_file = "/root/polybot/engine_status.json" if os.path.exists("/root/polybot") else "engine_status.json"
+            with open(status_file, "w") as f:
+                json.dump(status_data, f, indent=2)
+        except Exception as e:
+            log.warning("Failed to save engine_status.json: %s", e)
+
+    threading.Thread(target=_write, daemon=True).start()
+
+
 def run_inline_reconciliation() -> None:
     """Run reconcile_closed_out.main() inline.
     Since main_v2.py runs an async loop, this is run inside asyncio.to_thread
@@ -1555,10 +1575,24 @@ async def strategy_loop(
             continue
 
         # ── Drawdown kill-switch check ────────────────────────────────────────
-        # DrawdownHalt propagates up — _strategy_with_restart will NOT restart
-        # after a drawdown halt (unlike normal crashes).
+        # Compute total portfolio value (cash + open positions mark value) so deploying cash
+        # into positions does NOT falsely trigger the drawdown kill-switch.
+        positions_val = 0.0
+        for pos in open_positions.values():
+            qty = getattr(pos, "token_qty", 0.0) or 0.0
+            price = getattr(pos, "peak_bid", None) or getattr(pos, "entry_price", 0.0) or 0.0
+            positions_val += qty * price
+
+        total_portfolio_val = (cycle_balance.balance if cycle_balance else 0.0) + positions_val
+
         if drawdown_guard is not None and cycle_balance is not None:
-            drawdown_guard.record_and_check(cycle_balance.balance)
+            try:
+                drawdown_guard.record_and_check(total_portfolio_val)
+            except DrawdownHalt as dh:
+                write_engine_status(running=False, halted=True, halt_reason=str(dh), cycle_count=cycle_count[0] if cycle_count else 0)
+                raise
+
+        write_engine_status(running=True, halted=False, cycle_count=cycle_count[0] if cycle_count else 0)
 
         # ── Claim resolved positions / merge back-to-back positions ────────────
         if redeemer is not None:
@@ -2561,6 +2595,7 @@ async def main() -> None:
                     "  Fix: investigate balance drop, then restart the service manually.",
                     exc,
                 )
+                write_engine_status(running=False, halted=True, halt_reason=str(exc))
                 return   # exit restart wrapper — bot stops quoting, dashboard stays up
             except asyncio.CancelledError:
                 raise

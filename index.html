@@ -1901,7 +1901,8 @@ async function fetchBot(){
     const modeCls=d.paper_mode?'p':(d.dry_run?'o':'g');
     document.getElementById('mode').textContent=modeStr;
     document.getElementById('mode').className='stat-val '+modeCls;
-    document.getElementById('bstatus').innerHTML=d.running?'<span class="g">● RUNNING</span>':'<span class="r">○ STOPPED</span>';
+    const isHalted = d.drawdown_halted || (d.engine_status && d.engine_status.halted);
+    document.getElementById('bstatus').innerHTML = isHalted ? '<span class="r">⛔ HALTED</span>' : (d.running ? '<span class="g">● RUNNING</span>' : '<span class="r">○ STOPPED</span>');
     if(d.paper&&d.paper.balance!=null){document.getElementById('paper-mode-row').style.display='';document.getElementById('paper-bal-mini').textContent=fmt$(d.paper.balance);}else if(!d.paper_mode){document.getElementById('paper-mode-row').style.display='none';}
     const trades=d.trades||[];
     const filled=trades.filter(t=>t.status==='matched'||t.status==='simulated');
@@ -2279,11 +2280,12 @@ function connectWS(){
   ws.onerror=()=>ws.close();
 }
 function applyState(d){
-  setBotStatus(d.running?'active':'paused',d.running?'live':'stopped');
+  const isHalted = d.drawdown_halted || (d.engine_status && d.engine_status.halted);
+  setBotStatus(isHalted ? 'paused' : (d.running ? 'active' : 'paused'), isHalted ? 'halted' : (d.running ? 'live' : 'stopped'));
   document.getElementById('strat').textContent=(d.strategy||'-').toUpperCase();
   const modeStr=d.paper_mode?'PAPER':(d.dry_run?'DRY RUN':'LIVE');const modeCls=d.paper_mode?'p':(d.dry_run?'o':'g');
   document.getElementById('mode').textContent=modeStr;document.getElementById('mode').className='stat-val '+modeCls;
-  document.getElementById('bstatus').innerHTML=d.running?'<span class="g">● RUNNING</span>':'<span class="r">○ STOPPED</span>';
+  document.getElementById('bstatus').innerHTML=isHalted?'<span class="r">⛔ HALTED</span>':(d.running?'<span class="g">● RUNNING</span>':'<span class="r">○ STOPPED</span>');
   if(d.paper&&d.paper.balance!=null){document.getElementById('paper-mode-row').style.display='';document.getElementById('paper-bal-mini').textContent=fmt$(d.paper.balance);}else if(!d.paper_mode){document.getElementById('paper-mode-row').style.display='none';}
   const trades=d.trades||[];const filled=trades.filter(t=>t.status==='matched'||t.status==='simulated');
   const invested=filled.reduce((s,t)=>s+(t.amount_usdc||t.amount||0),0);
