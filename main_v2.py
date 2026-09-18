@@ -1209,7 +1209,7 @@ async def estimate_true_probability(
 
     # Exclude erratic live tennis qualifiers & niche esports matches — direct 100% of capital into Crypto, Macro & Major Sports
     q_lower = (market.question or "").lower()
-    if any(k in q_lower for k in ("open:", "atp ", "wta ", "challenger", "itf ", "lck", "lcs", "lec", "counter-strike")):
+    if any(k in q_lower for k in ("open:", "atp ", "wta ", "challenger", "itf ", "lck ", "lcs ", "lec ", "counter-strike")):
         log.debug("NICHE SPORT EXCLUSION | %s (focusing capital on Crypto, Macro & Major Sports)", market.question[:40])
         _shadow("niche_sport_skip")
         return None
